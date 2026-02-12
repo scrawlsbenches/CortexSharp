@@ -386,6 +386,7 @@ public sealed class SDR : IEquatable<SDR>
 //   - DateTimeEncoder: multi-resolution temporal components
 //   - CategoryEncoder: one-hot-style with configurable overlap
 //   - GeospatialEncoder: lat/lon with multi-scale spatial hashing
+//   - DeltaEncoder: stateful change-between-values encoding
 //   - CompositeEncoder: concatenates multiple encoders
 // ============================================================================
 
@@ -751,6 +752,44 @@ public sealed class GeospatialEncoder : IEncoder<(double Latitude, double Longit
             result = result.Union(Encode(n));
 
         return result;
+    }
+}
+
+/// Delta encoder: encodes the *change* between consecutive values rather than
+/// the absolute value. Important for time-series where patterns appear in
+/// derivatives (e.g., temperature change patterns repeating regardless of baseline).
+/// This is the first stateful encoder — it maintains the previous value across calls.
+public sealed class DeltaEncoder : IEncoder<double>
+{
+    public int OutputSize { get; }
+
+    private readonly ScalarEncoder _deltaEncoder;
+    private double? _previousValue;
+
+    /// <param name="size">SDR width for the encoded delta</param>
+    /// <param name="activeBits">Number of active bits</param>
+    /// <param name="minDelta">Minimum expected delta (most negative change)</param>
+    /// <param name="maxDelta">Maximum expected delta (most positive change)</param>
+    /// <param name="clipInput">Clip deltas outside [minDelta, maxDelta]</param>
+    public DeltaEncoder(
+        int size, int activeBits, double minDelta, double maxDelta,
+        bool clipInput = true)
+    {
+        _deltaEncoder = new ScalarEncoder(size, activeBits, minDelta, maxDelta, clipInput: clipInput);
+        OutputSize = size;
+    }
+
+    public SDR Encode(double value)
+    {
+        double delta = _previousValue.HasValue ? value - _previousValue.Value : 0.0;
+        _previousValue = value;
+        return _deltaEncoder.Encode(delta);
+    }
+
+    /// Reset the encoder's temporal state, treating the next input as the first value.
+    public void Reset()
+    {
+        _previousValue = null;
     }
 }
 
@@ -1976,6 +2015,123 @@ public sealed class TemporalMemoryMetrics
         $"avgAnomaly={AvgAnomaly:P1}, avgBurst={AvgBurstFraction:P1}, " +
         $"activeCells={LastActiveCells}, predictiveCells={LastPredictiveCells}, " +
         $"prunedSynapses={TotalPrunedSynapses}, removedSegments={TotalRemovedSegments}";
+}
+
+
+// ============================================================================
+// SECTION 5b: Temporal Pooling
+// ============================================================================
+// Temporal pooling produces stable representations over time — outputs that
+// remain constant while an expected sequence plays out, and change only on
+// sequence transitions (anomaly spikes). This is the bridge between sequence
+// memory (TM) and hierarchy: the pooled SDR feeds the next level's spatial
+// pooler, giving it a slowly-changing input that represents "which sequence
+// is currently playing" rather than "which element is active right now."
+//
+// Algorithm:
+//   1. Accumulate evidence for each predictive cell observed over time.
+//   2. When anomaly exceeds the reset threshold, clear accumulated evidence
+//      (sequence boundary detected).
+//   3. Decay evidence each step so stale cells eventually drop out.
+//   4. Project the highest-evidence cells to a fixed-size output SDR via
+//      consistent hashing. The output is deterministic for a given evidence
+//      state, ensuring stability within a sequence.
+// ============================================================================
+
+public sealed class TemporalPoolerConfig
+{
+    public int OutputSize { get; init; } = 2048;            // Output SDR width
+    public int OutputActiveBits { get; init; } = 40;        // Target ON bits in output
+    public float AnomalyResetThreshold { get; init; } = 0.5f; // Anomaly above this resets pool
+    public float DecayRate { get; init; } = 0.01f;           // Per-step evidence decay
+    public int ProjectionSeed { get; init; } = 42;           // Hash seed for cell→bit mapping
+}
+
+public record TemporalPoolerOutput
+{
+    public SDR PooledRepresentation { get; init; }
+    public bool IsStable { get; init; }       // Output overlaps previous by ≥70%
+    public bool WasReset { get; init; }       // Pool was cleared this step (sequence boundary)
+    public int PooledCellCount { get; init; } // Number of cells with active evidence
+}
+
+/// Temporal pooler: unions predicted cell activity across timesteps to
+/// form stable sequence-level representations. Resets at sequence boundaries
+/// detected via anomaly score.
+public sealed class TemporalPooler
+{
+    private readonly TemporalPoolerConfig _config;
+    private readonly Dictionary<int, float> _cellEvidence = new();
+    private SDR _previousOutput;
+
+    public TemporalPooler(TemporalPoolerConfig config)
+    {
+        _config = config;
+        _previousOutput = new SDR(config.OutputSize);
+    }
+
+    /// Process one TM output and produce a pooled SDR.
+    public TemporalPoolerOutput Compute(TemporalMemoryOutput tmOutput)
+    {
+        // Step 1: Reset on sequence boundary (anomaly spike)
+        bool wasReset = tmOutput.Anomaly > _config.AnomalyResetThreshold;
+        if (wasReset)
+            _cellEvidence.Clear();
+
+        // Step 2: Accumulate evidence from predictive cells
+        foreach (int cell in tmOutput.PredictiveCells)
+        {
+            _cellEvidence.TryGetValue(cell, out float existing);
+            _cellEvidence[cell] = existing + 1.0f;
+        }
+
+        // Step 3: Decay all evidence, remove dead entries
+        var toRemove = new List<int>();
+        foreach (int cell in _cellEvidence.Keys.ToArray())
+        {
+            float decayed = _cellEvidence[cell] - _config.DecayRate;
+            if (decayed <= 0f)
+                toRemove.Add(cell);
+            else
+                _cellEvidence[cell] = decayed;
+        }
+        foreach (int cell in toRemove)
+            _cellEvidence.Remove(cell);
+
+        // Step 4: Project top-evidence cells to output SDR
+        // Take cells in descending evidence order. Each cell maps to one output bit
+        // via consistent hashing. Stop once we have enough unique output bits.
+        var outputBits = new HashSet<int>();
+        foreach (var kv in _cellEvidence.OrderByDescending(kv => kv.Value))
+        {
+            int hash = HashCode.Combine(kv.Key, _config.ProjectionSeed);
+            outputBits.Add((hash & 0x7FFFFFFF) % _config.OutputSize);
+            if (outputBits.Count >= _config.OutputActiveBits)
+                break;
+        }
+
+        var output = new SDR(_config.OutputSize, outputBits);
+
+        // Step 5: Stability = high overlap with previous output
+        bool isStable = _previousOutput.ActiveCount > 0
+            && output.Overlap(_previousOutput) >= (int)(_config.OutputActiveBits * 0.7f);
+        _previousOutput = output;
+
+        return new TemporalPoolerOutput
+        {
+            PooledRepresentation = output,
+            IsStable = isStable,
+            WasReset = wasReset,
+            PooledCellCount = _cellEvidence.Count,
+        };
+    }
+
+    /// Reset pooling state for sequence boundary.
+    public void Reset()
+    {
+        _cellEvidence.Clear();
+        _previousOutput = new SDR(_config.OutputSize);
+    }
 }
 
 

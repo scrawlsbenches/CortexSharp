@@ -84,21 +84,21 @@ These work at a basic level but have gaps that limit correctness, robustness, or
 
 These are algorithms or concepts that BAMI describes but the implementation does not yet include. They extend the system's capabilities without fixing existing breakage.
 
-### 3.1 Add a Delta Encoder (§2) **[S]**
+### 3.1 ~~Add a Delta Encoder (§2)~~ **[S]** — DONE
 
-BAMI describes a delta encoder that encodes the *change* in a value rather than the absolute value. This is important for time-series applications where patterns appear in derivatives (e.g., temperature change patterns that repeat regardless of baseline).
+- Implemented `DeltaEncoder : IEncoder<double>` as a stateful encoder wrapping an internal `ScalarEncoder` configured for the delta range `[minDelta, maxDelta]`.
+- First-call edge case: when `_previousValue` is null, encodes delta as 0.0 (zero-centered).
+- `Reset()` method clears temporal state, treating the next input as the first value.
+- Composable via `CompositeEncoder.AddEncoder<double>("delta", deltaEncoder)` — same `IEncoder<double>` interface as `ScalarEncoder`.
 
-- Implement `DeltaEncoder : IEncoder<double>` that maintains the previous value and encodes `current - previous` using an internal `ScalarEncoder`.
-- Handle the first-call edge case (no previous value) by returning a zero-centered encoding.
-- Register as a composable encoder via `CompositeEncoder`.
+### 3.2 ~~Add a Temporal Pooling layer (§5b)~~ **[L]** — DONE
 
-### 3.2 Add a Temporal Pooling layer (§5 or new section) **[L]**
-
-BAMI references temporal pooling as a mechanism for forming stable representations over time — outputs that remain constant while an expected sequence plays out, and change only on sequence transitions. This is the bridge between sequence memory and hierarchy.
-
-- Implement as a post-TM processing step that unions predicted cell activity over a stability window.
-- The output SDR should be stable during a correctly predicted sequence and change sharply at sequence boundaries or anomalies.
-- This is architecturally necessary for meaningful hierarchical multi-region configurations.
+- Implemented `TemporalPooler` as a post-TM processing step (new §5b between TM and Anomaly Likelihood).
+- Evidence-based pooling: each predictive cell accumulates floating-point evidence on each observation, decays by `DecayRate` per step, and is removed when evidence reaches zero.
+- Sequence boundary detection: when `tmOutput.Anomaly > AnomalyResetThreshold`, all evidence is cleared and pooling restarts.
+- Output projection: top-evidence cells are projected to a fixed-size SDR via consistent hashing (`HashCode.Combine(cell, ProjectionSeed)`), deterministic for a given evidence state.
+- Stability tracking: output SDR is flagged `IsStable` when overlap with previous output exceeds 70% of target active bits.
+- `Reset()` clears all state for explicit sequence boundaries.
 
 ### 3.3 Build a hierarchical multi-region example (§13, §18) **[M]**
 
