@@ -929,6 +929,18 @@ public sealed class DendriteSegment
         _synapses.RemoveRange(maxSynapses, _synapses.Count - maxSynapses);
     }
 
+    /// Bump all synapse permanences by a given amount (clamped to [0, 1]).
+    /// Used by the Spatial Pooler to rescue dead columns.
+    public void BumpAllPermanences(float amount)
+    {
+        var span = CollectionsMarshal.AsSpan(_synapses);
+        for (int i = 0; i < span.Length; i++)
+        {
+            ref var syn = ref span[i];
+            syn.Permanence = Math.Min(1.0f, syn.Permanence + amount);
+        }
+    }
+
     /// Check if this segment has a synapse to the given presynaptic cell
     public bool HasSynapseTo(int presynapticIndex)
         => _synapses.Any(s => s.PresynapticIndex == presynapticIndex);
@@ -989,6 +1001,14 @@ public sealed class CellSegmentManager
         foreach (var seg in _segments)
             seg.EnforceMaxSynapses(_maxSynapsesPerSegment);
     }
+
+    // --- Serialization Support ---
+
+    /// Clear all segments (used during deserialization to restore state)
+    public void ClearSegments() => _segments.Clear();
+
+    /// Add a pre-built segment (used during deserialization)
+    public void RestoreSegment(DendriteSegment segment) => _segments.Add(segment);
 
     /// Full lifecycle maintenance pass
     public SegmentMaintenanceResult Maintain(float pruneThreshold, int minSynapses)
@@ -1296,19 +1316,52 @@ public sealed class SpatialPooler
         {
             if (_overlapDutyCycles[col] < _config.MinPctOverlapDutyCycles)
             {
-                // Bump all permanences toward connected threshold
-                var segment = _proximalDendrites[col];
-                var span = CollectionsMarshal.AsSpan((List<Synapse>)
-                    typeof(DendriteSegment).GetField("_synapses",
-                        System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!
-                    .GetValue(segment)!);
-
-                // Pseudocode: bump permanences (in production, expose via method)
-                for (int i = 0; i < segment.SynapseCount; i++)
-                {
-                    // segment.BumpPermanence(i, 0.01f * ConnectedThreshold)
-                }
+                // Bump all permanences toward connected threshold (BAMI: 0.1 * connectedPerm)
+                _proximalDendrites[col].BumpAllPermanences(0.1f * _config.ConnectedThreshold);
             }
+        }
+    }
+
+    // --- Serialization ---
+
+    /// Serialize all mutable SP state: proximal dendrites, boost factors, duty cycles, iteration.
+    public void SerializeState(BinaryWriter bw)
+    {
+        bw.Write(_config.ColumnCount);
+        bw.Write(_config.InputSize);
+        bw.Write(_iteration);
+
+        for (int col = 0; col < _config.ColumnCount; col++)
+            HtmSerializer.WriteSegment(bw, _proximalDendrites[col]);
+
+        for (int col = 0; col < _config.ColumnCount; col++)
+        {
+            bw.Write(_boostFactors[col]);
+            bw.Write(_activeDutyCycles[col]);
+            bw.Write(_overlapDutyCycles[col]);
+        }
+    }
+
+    /// Restore SP state from serialized data. Must be called on an SP with matching config.
+    public void DeserializeState(BinaryReader br)
+    {
+        int columnCount = br.ReadInt32();
+        int inputSize = br.ReadInt32();
+        if (columnCount != _config.ColumnCount || inputSize != _config.InputSize)
+            throw new FormatException(
+                $"SP config mismatch: expected ({_config.ColumnCount}, {_config.InputSize}), " +
+                $"got ({columnCount}, {inputSize})");
+
+        _iteration = br.ReadInt32();
+
+        for (int col = 0; col < _config.ColumnCount; col++)
+            _proximalDendrites[col] = HtmSerializer.ReadSegment(br);
+
+        for (int col = 0; col < _config.ColumnCount; col++)
+        {
+            _boostFactors[col] = br.ReadSingle();
+            _activeDutyCycles[col] = br.ReadSingle();
+            _overlapDutyCycles[col] = br.ReadSingle();
         }
     }
 }
@@ -1783,6 +1836,72 @@ public sealed class TemporalMemory
 
     public int TotalSynapseCount
         => _cellSegments.Sum(cs => cs.Segments.Sum(s => s.SynapseCount));
+
+    // --- Serialization ---
+
+    /// Serialize all mutable TM state: cell segments, current cell sets, iteration.
+    public void SerializeState(BinaryWriter bw)
+    {
+        bw.Write(_config.ColumnCount);
+        bw.Write(_config.CellsPerColumn);
+        bw.Write(_iteration);
+
+        // Cell segments
+        for (int i = 0; i < _cellSegments.Length; i++)
+        {
+            bw.Write(_cellSegments[i].SegmentCount);
+            foreach (var seg in _cellSegments[i].Segments)
+                HtmSerializer.WriteSegment(bw, seg);
+        }
+
+        // Current cell state (becomes prev on next Compute call)
+        WriteHashSet(bw, _activeCells);
+        WriteHashSet(bw, _winnerCells);
+        WriteHashSet(bw, _predictiveCells);
+    }
+
+    /// Restore TM state from serialized data. Must be called on a TM with matching config.
+    public void DeserializeState(BinaryReader br)
+    {
+        int columnCount = br.ReadInt32();
+        int cellsPerColumn = br.ReadInt32();
+        if (columnCount != _config.ColumnCount || cellsPerColumn != _config.CellsPerColumn)
+            throw new FormatException(
+                $"TM config mismatch: expected ({_config.ColumnCount}, {_config.CellsPerColumn}), " +
+                $"got ({columnCount}, {cellsPerColumn})");
+
+        _iteration = br.ReadInt32();
+
+        // Cell segments
+        for (int i = 0; i < _cellSegments.Length; i++)
+        {
+            _cellSegments[i].ClearSegments();
+            int segCount = br.ReadInt32();
+            for (int s = 0; s < segCount; s++)
+                _cellSegments[i].RestoreSegment(HtmSerializer.ReadSegment(br));
+        }
+
+        // Current cell state
+        _activeCells = ReadHashSet(br);
+        _winnerCells = ReadHashSet(br);
+        _predictiveCells = ReadHashSet(br);
+    }
+
+    private static void WriteHashSet(BinaryWriter bw, HashSet<int> set)
+    {
+        bw.Write(set.Count);
+        foreach (int val in set)
+            bw.Write(val);
+    }
+
+    private static HashSet<int> ReadHashSet(BinaryReader br)
+    {
+        int count = br.ReadInt32();
+        var set = new HashSet<int>(count);
+        for (int i = 0; i < count; i++)
+            set.Add(br.ReadInt32());
+        return set;
+    }
 }
 
 public record TemporalMemoryOutput
@@ -2708,6 +2827,12 @@ public sealed class ThousandBrainsEngine
 
     // Known objects for recognition
     private readonly Dictionary<string, SDR> _objectLibrary = new();
+    // Learned object structure: object label → list of (displacement SDR) for predicting next location
+    private readonly Dictionary<string, List<SDR>> _objectDisplacements = new();
+    // Current object's displacement sequence being accumulated during learning
+    private readonly List<SDR> _currentDisplacements = new();
+    // Previous grid cell locations for displacement computation
+    private SDR[]? _prevGridLocations;
     private int _explorationSteps;
 
     public ThousandBrainsEngine(ThousandBrainsConfig config)
@@ -2787,12 +2912,36 @@ public sealed class ThousandBrainsEngine
 
         // 5. Compute displacement predictions if enabled
         SDR? predictedNextLocation = null;
-        if (_displacementModule != null && _explorationSteps > 1)
+        if (_displacementModule != null && _explorationSteps > 1 && _prevGridLocations != null)
         {
             var currentLoc = _gridModules[0].GetCurrentLocation();
-            // Displacement cells could predict what we'll sense next
-            // based on learned object structure
+            var prevLoc = _prevGridLocations[0];
+
+            // Compute the displacement from previous to current location
+            var displacement = _displacementModule.ComputeDisplacement(prevLoc, currentLoc);
+
+            if (learn)
+            {
+                // During learning: accumulate displacements for the current object
+                _currentDisplacements.Add(displacement);
+            }
+
+            if (recognizedObject != null
+                && _objectDisplacements.TryGetValue(recognizedObject, out var learnedDisps)
+                && learnedDisps.Count > 0)
+            {
+                // During recognition: use the most recently matched displacement
+                // to predict the next location based on learned object structure
+                int nextIdx = (_explorationSteps - 1) % learnedDisps.Count;
+                predictedNextLocation = _displacementModule.PredictTarget(
+                    currentLoc, learnedDisps[nextIdx]);
+            }
         }
+
+        // Save current grid locations for next step's displacement computation
+        _prevGridLocations = new SDR[_config.ColumnCount];
+        for (int i = 0; i < _config.ColumnCount; i++)
+            _prevGridLocations[i] = _gridModules[i].GetCurrentLocation();
 
         return new ThousandBrainsOutput
         {
@@ -2803,6 +2952,7 @@ public sealed class ThousandBrainsEngine
             RecognitionConfidence = bestMatch,
             ColumnOutputs = columnOutputs,
             AvgAnomaly = columnOutputs.Average(o => o.Anomaly),
+            PredictedNextLocation = predictedNextLocation,
         };
     }
 
@@ -2812,12 +2962,18 @@ public sealed class ThousandBrainsEngine
         var votes = _columns.Select(c => c.GetObjectRepresentation()).ToList();
         var consensus = _voting.ComputeConsensus(votes);
         _objectLibrary[label] = consensus;
+
+        // Store learned displacement sequence for this object
+        if (_displacementModule != null && _currentDisplacements.Count > 0)
+            _objectDisplacements[label] = new List<SDR>(_currentDisplacements);
     }
 
     /// Reset all columns for exploring a new object
     public void StartNewObject()
     {
         _explorationSteps = 0;
+        _prevGridLocations = null;
+        _currentDisplacements.Clear();
         foreach (var column in _columns)
             column.ResetObjectRepresentation();
     }
@@ -2841,6 +2997,7 @@ public record ThousandBrainsOutput
     public float RecognitionConfidence { get; init; }
     public CorticalColumnOutput[] ColumnOutputs { get; init; }
     public float AvgAnomaly { get; init; }
+    public SDR? PredictedNextLocation { get; init; }
 }
 
 
@@ -2890,6 +3047,7 @@ public record RegionLink(
 public sealed class SPRegion : IRegion
 {
     public string Name { get; }
+    private readonly SpatialPoolerConfig _config;
     private readonly SpatialPooler _sp;
     private SDR _input;
     private SDR _output;
@@ -2907,6 +3065,7 @@ public sealed class SPRegion : IRegion
     public SPRegion(string name, SpatialPoolerConfig config)
     {
         Name = name;
+        _config = config;
         _sp = new SpatialPooler(config);
     }
 
@@ -2925,14 +3084,82 @@ public sealed class SPRegion : IRegion
         => _output = _sp.Compute(_input, learn);
 
     public void Reset() { }
-    public byte[] Serialize() => Array.Empty<byte>(); // Placeholder
-    public void Deserialize(byte[] data) { }
+
+    public byte[] Serialize()
+    {
+        using var ms = new MemoryStream();
+        using var bw = new BinaryWriter(ms);
+        WriteSPConfig(bw, _config);
+        _sp.SerializeState(bw);
+        return ms.ToArray();
+    }
+
+    public void Deserialize(byte[] data)
+    {
+        if (data.Length == 0) return;
+        using var ms = new MemoryStream(data);
+        using var br = new BinaryReader(ms);
+        ReadSPConfig(br); // Skip config (already constructed with matching config)
+        _sp.DeserializeState(br);
+    }
+
+    /// Reconstruct an SPRegion from a serialized blob (used by LoadNetwork)
+    public static SPRegion CreateFromData(string name, byte[] data)
+    {
+        using var ms = new MemoryStream(data);
+        using var br = new BinaryReader(ms);
+        var config = ReadSPConfig(br);
+        var region = new SPRegion(name, config);
+        region._sp.DeserializeState(br);
+        return region;
+    }
+
+    internal static void WriteSPConfig(BinaryWriter bw, SpatialPoolerConfig c)
+    {
+        bw.Write(c.InputSize);
+        bw.Write(c.ColumnCount);
+        bw.Write(c.TargetSparsity);
+        bw.Write(c.ConnectedThreshold);
+        bw.Write(c.PermanenceIncrement);
+        bw.Write(c.PermanenceDecrement);
+        bw.Write(c.StimulusThreshold);
+        bw.Write(c.PotentialRadius);
+        bw.Write(c.PotentialPct);
+        bw.Write((int)c.Inhibition);
+        bw.Write(c.InhibitionRadius);
+        bw.Write((int)c.Boosting);
+        bw.Write(c.BoostStrength);
+        bw.Write(c.MinPctOverlapDutyCycles);
+        bw.Write(c.DutyCyclePeriod);
+        bw.Write(c.Seed);
+    }
+
+    internal static SpatialPoolerConfig ReadSPConfig(BinaryReader br) => new()
+    {
+        InputSize = br.ReadInt32(),
+        ColumnCount = br.ReadInt32(),
+        TargetSparsity = br.ReadSingle(),
+        ConnectedThreshold = br.ReadSingle(),
+        PermanenceIncrement = br.ReadSingle(),
+        PermanenceDecrement = br.ReadSingle(),
+        StimulusThreshold = br.ReadSingle(),
+        PotentialRadius = br.ReadInt32(),
+        PotentialPct = br.ReadSingle(),
+        Inhibition = (InhibitionMode)br.ReadInt32(),
+        InhibitionRadius = br.ReadInt32(),
+        Boosting = (BoostingStrategy)br.ReadInt32(),
+        BoostStrength = br.ReadSingle(),
+        MinPctOverlapDutyCycles = br.ReadSingle(),
+        DutyCyclePeriod = br.ReadInt32(),
+        Seed = br.ReadInt32(),
+    };
 }
 
 /// Wraps the Temporal Memory as a NetworkAPI region
 public sealed class TMRegion : IRegion
 {
     public string Name { get; }
+    private readonly TemporalMemoryConfig _config;
     private readonly TemporalMemory _tm;
     private SDR _input;
     private TemporalMemoryOutput _lastOutput;
@@ -2952,6 +3179,7 @@ public sealed class TMRegion : IRegion
     public TMRegion(string name, TemporalMemoryConfig config)
     {
         Name = name;
+        _config = config;
         _tm = new TemporalMemory(config);
     }
 
@@ -2972,8 +3200,75 @@ public sealed class TMRegion : IRegion
         => _lastOutput = _tm.Compute(_input, learn);
 
     public void Reset() { }
-    public byte[] Serialize() => Array.Empty<byte>();
-    public void Deserialize(byte[] data) { }
+
+    public byte[] Serialize()
+    {
+        using var ms = new MemoryStream();
+        using var bw = new BinaryWriter(ms);
+        WriteTMConfig(bw, _config);
+        _tm.SerializeState(bw);
+        return ms.ToArray();
+    }
+
+    public void Deserialize(byte[] data)
+    {
+        if (data.Length == 0) return;
+        using var ms = new MemoryStream(data);
+        using var br = new BinaryReader(ms);
+        ReadTMConfig(br); // Skip config (already constructed with matching config)
+        _tm.DeserializeState(br);
+    }
+
+    /// Reconstruct a TMRegion from a serialized blob (used by LoadNetwork)
+    public static TMRegion CreateFromData(string name, byte[] data)
+    {
+        using var ms = new MemoryStream(data);
+        using var br = new BinaryReader(ms);
+        var config = ReadTMConfig(br);
+        var region = new TMRegion(name, config);
+        region._tm.DeserializeState(br);
+        return region;
+    }
+
+    internal static void WriteTMConfig(BinaryWriter bw, TemporalMemoryConfig c)
+    {
+        bw.Write(c.ColumnCount);
+        bw.Write(c.CellsPerColumn);
+        bw.Write(c.ActivationThreshold);
+        bw.Write(c.MinThreshold);
+        bw.Write(c.MaxNewSynapseCount);
+        bw.Write(c.MaxSegmentsPerCell);
+        bw.Write(c.MaxSynapsesPerSegment);
+        bw.Write(c.ConnectedThreshold);
+        bw.Write(c.InitialPermanence);
+        bw.Write(c.PermanenceIncrement);
+        bw.Write(c.PermanenceDecrement);
+        bw.Write(c.PredictedDecrement);
+        bw.Write(c.SynapsePruneThreshold);
+        bw.Write(c.SegmentCleanupInterval);
+        bw.Write(c.MinSynapsesForViableSegment);
+        bw.Write(c.Seed);
+    }
+
+    internal static TemporalMemoryConfig ReadTMConfig(BinaryReader br) => new()
+    {
+        ColumnCount = br.ReadInt32(),
+        CellsPerColumn = br.ReadInt32(),
+        ActivationThreshold = br.ReadInt32(),
+        MinThreshold = br.ReadInt32(),
+        MaxNewSynapseCount = br.ReadInt32(),
+        MaxSegmentsPerCell = br.ReadInt32(),
+        MaxSynapsesPerSegment = br.ReadInt32(),
+        ConnectedThreshold = br.ReadSingle(),
+        InitialPermanence = br.ReadSingle(),
+        PermanenceIncrement = br.ReadSingle(),
+        PermanenceDecrement = br.ReadSingle(),
+        PredictedDecrement = br.ReadSingle(),
+        SynapsePruneThreshold = br.ReadSingle(),
+        SegmentCleanupInterval = br.ReadInt32(),
+        MinSynapsesForViableSegment = br.ReadInt32(),
+        Seed = br.ReadInt32(),
+    };
 }
 
 /// The NetworkAPI computation graph: manages regions, links, and execution order
@@ -3183,17 +3478,30 @@ public static class HtmSerializer
         return segment;
     }
 
-    /// Save a full network state to a file
+    // --- Region Factory for deserialization ---
+    // Maps fully qualified type names to factory functions: (name, blob) → IRegion
+    private static readonly Dictionary<string, Func<string, byte[], IRegion>> _regionFactory = new()
+    {
+        [typeof(SPRegion).FullName!] = (name, data) => SPRegion.CreateFromData(name, data),
+        [typeof(TMRegion).FullName!] = (name, data) => TMRegion.CreateFromData(name, data),
+    };
+
+    /// Register a custom region type for deserialization
+    public static void RegisterRegionFactory(string typeName, Func<string, byte[], IRegion> factory)
+        => _regionFactory[typeName] = factory;
+
+    /// Save a full network state to a file (with checksum)
     public static void SaveNetwork(Network network, string filePath)
     {
-        using var fs = File.Create(filePath);
-        using var bw = new BinaryWriter(fs);
+        // Write to memory first so we can compute the checksum
+        using var buffer = new MemoryStream();
+        using var bw = new BinaryWriter(buffer);
 
         bw.Write(MagicNumber);
         bw.Write((byte)FormatVersion);
         bw.Write((byte)0x10); // Type: Network
 
-        // Write region count and names
+        // Write region count and data
         var regions = network.Regions;
         bw.Write(regions.Count);
         foreach (var (name, region) in regions)
@@ -3214,9 +3522,82 @@ public static class HtmSerializer
             bw.Write(link.TargetRegion);
             bw.Write(link.TargetPort);
         }
+
+        // Append checksum
+        var payload = buffer.ToArray();
+        uint checksum = ComputeChecksum(payload);
+        bw.Write(checksum);
+
+        // Write to file
+        File.WriteAllBytes(filePath, buffer.ToArray());
     }
 
-    /// Compute a checksum for integrity verification
+    /// Load a full network state from a file
+    public static Network LoadNetwork(string filePath)
+    {
+        var allBytes = File.ReadAllBytes(filePath);
+        if (allBytes.Length < 10) // magic(4) + version(1) + type(1) + checksum(4) minimum
+            throw new FormatException("File too small to be a valid HTM network");
+
+        // Verify checksum: last 4 bytes are the checksum of everything before them
+        var payloadLength = allBytes.Length - 4;
+        var payload = allBytes.AsSpan(0, payloadLength).ToArray();
+        uint storedChecksum = BitConverter.ToUInt32(allBytes, payloadLength);
+        uint computedChecksum = ComputeChecksum(payload);
+        if (storedChecksum != computedChecksum)
+            throw new FormatException(
+                $"Checksum mismatch: expected 0x{storedChecksum:X8}, computed 0x{computedChecksum:X8}");
+
+        using var ms = new MemoryStream(payload);
+        using var br = new BinaryReader(ms);
+
+        // Header
+        uint magic = br.ReadUInt32();
+        if (magic != MagicNumber)
+            throw new FormatException("Invalid HTM format: bad magic number");
+
+        byte version = br.ReadByte();
+        if (version != FormatVersion)
+            throw new FormatException($"Unsupported format version: {version}");
+
+        byte type = br.ReadByte();
+        if (type != 0x10)
+            throw new FormatException($"Expected Network type (0x10), got 0x{type:X2}");
+
+        var network = new Network();
+
+        // Read regions
+        int regionCount = br.ReadInt32();
+        for (int i = 0; i < regionCount; i++)
+        {
+            string name = br.ReadString();
+            string typeName = br.ReadString();
+            int dataLength = br.ReadInt32();
+            byte[] regionData = br.ReadBytes(dataLength);
+
+            if (!_regionFactory.TryGetValue(typeName, out var factory))
+                throw new FormatException(
+                    $"Unknown region type '{typeName}'. Register it with HtmSerializer.RegisterRegionFactory().");
+
+            var region = factory(name, regionData);
+            network.AddRegion(region);
+        }
+
+        // Read and re-wire links
+        int linkCount = br.ReadInt32();
+        for (int i = 0; i < linkCount; i++)
+        {
+            string sourceRegion = br.ReadString();
+            string sourcePort = br.ReadString();
+            string targetRegion = br.ReadString();
+            string targetPort = br.ReadString();
+            network.Link(sourceRegion, sourcePort, targetRegion, targetPort);
+        }
+
+        return network;
+    }
+
+    /// Compute a checksum for integrity verification (FNV-1a)
     public static uint ComputeChecksum(byte[] data)
     {
         uint hash = 0x811c9dc5; // FNV-1a offset basis

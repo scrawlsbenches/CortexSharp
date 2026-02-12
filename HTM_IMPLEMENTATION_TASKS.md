@@ -10,38 +10,35 @@ Tasks are grouped into four tiers by impact and dependency order. Within each ti
 
 These are things that exist in the code right now as non-functional placeholders. Anything downstream of them silently produces wrong results or no-ops.
 
-### 1.1 Add `DendriteSegment.BumpPermanences()` and remove the reflection hack (§3, §4) **[S]**
+### 1.1 ~~Add `DendriteSegment.BumpPermanences()` and remove the reflection hack (§3, §4)~~ **[S]** — DONE
 
-`SpatialPooler.BumpWeakColumns()` (line 1293) uses `typeof(DendriteSegment).GetField("_synapses", ...)` via reflection to access the private synapse list, then the actual bump loop body is commented out. This means dead-column rescue never fires — columns that fall below `MinPctOverlapDutyCycles` stay dead forever.
+- Added `BumpAllPermanences(float amount)` to `DendriteSegment` using `CollectionsMarshal.AsSpan` for zero-copy mutation, consistent with `AdaptSynapses`/`PunishSynapses`.
+- Replaced reflection hack in `BumpWeakColumns` with: `_proximalDendrites[col].BumpAllPermanences(0.1f * _config.ConnectedThreshold)`.
+- Bump amount corrected to BAMI's `0.1 * connectedPerm` (the stub had `0.01f`, an order of magnitude too low).
 
-- Add a public `BumpAllPermanences(float amount)` method to `DendriteSegment` that increments every synapse's permanence by the given amount (clamped to 1.0).
-- Replace the reflection hack in `BumpWeakColumns` with a direct call: `_proximalDendrites[col].BumpAllPermanences(0.01f * _config.ConnectedThreshold)`.
-- Verify the bump amount matches BAMI's recommendation: `0.1 * connectedPerm`.
+### 1.2 ~~Implement `SPRegion.Serialize()` / `Deserialize()` (§13)~~ **[M]** — DONE
 
-### 1.2 Implement `SPRegion.Serialize()` / `Deserialize()` (§13) **[M]**
+- Added `SerializeState(BinaryWriter)` / `DeserializeState(BinaryReader)` to `SpatialPooler` (proximal dendrites via `WriteSegment`/`ReadSegment`, boost factors, duty cycles, iteration; validated against config dimensions).
+- Added `SerializeState(BinaryWriter)` / `DeserializeState(BinaryReader)` to `TemporalMemory` (all `CellSegmentManager` contents, current cell sets, iteration).
+- Added `ClearSegments()` / `RestoreSegment()` to `CellSegmentManager` for deserialization support.
+- SPRegion/TMRegion now store config, serialize config + state into self-describing blobs, and provide static `CreateFromData()` factory methods for reconstruction.
+- Region blobs include full config so deserialization is self-contained (no external config needed).
 
-Both `SPRegion` and `TMRegion` return `Array.Empty<byte>()` from `Serialize()` and silently ignore `Deserialize()`. This means `HtmSerializer.SaveNetwork()` writes a structurally valid file with zero region state — loading it back produces an untrained network. This breaks any checkpoint/restore workflow.
+### 1.3 ~~Implement `HtmSerializer.LoadNetwork()` (§14)~~ **[M]** — DONE
 
-- Serialize SP state: proximal dendrite permanences, boost factors, duty cycles, iteration count.
-- Serialize TM state: all `CellSegmentManager` contents (segments + synapses), prev/current cell sets, iteration count. The existing `HtmSerializer.WriteSegment()`/`ReadSegment()` helpers already handle segment-level serialization — wire them into the region serializers.
-- Add type byte constants (e.g., `0x04` for SP, `0x05` for TM) to the serialization format table.
+- Implemented `LoadNetwork(string filePath)` that reads the `SaveNetwork` format: magic, version, type, regions (with factory reconstruction), links.
+- Added a static `_regionFactory` dictionary mapping type names to `Func<string, byte[], IRegion>` factories. Pre-registered `SPRegion` and `TMRegion`.
+- Added `RegisterRegionFactory()` for user-registered custom region types.
+- Updated `SaveNetwork` to write FNV-1a checksum at end of file. `LoadNetwork` verifies it before parsing.
+- Regions are reconstructed via `CreateFromData()` static factories (reads config from blob, constructs region, restores learned state).
 
-### 1.3 Implement `HtmSerializer.LoadNetwork()` (§14) **[M]**
+### 1.4 ~~Wire displacement cell predictions into `ThousandBrainsEngine.Process()` (§12)~~ **[M]** — DONE
 
-`SaveNetwork()` exists but there is no corresponding `LoadNetwork()`. Without it, serialization is write-only.
-
-- Read back the format written by `SaveNetwork`: magic, version, type, region count, per-region (name, type string, data blob), link count, per-link (4 strings).
-- Use the type string to instantiate regions. This requires either a type registry or `Activator.CreateInstance` with a convention for default-config constructors.
-- Call `region.Deserialize(blob)` for each region, then re-wire links and re-trigger topological sort.
-- Add checksum verification using the existing `ComputeChecksum()` (which is defined but never called during save or load).
-
-### 1.4 Wire displacement cell predictions into `ThousandBrainsEngine.Process()` (§12) **[M]**
-
-Lines 2788–2795 contain a stub comment: "Displacement cells could predict what we'll sense next based on learned object structure." The `DisplacementCellModule` itself is fully implemented (compute displacement, predict target, predict source), but nothing calls it during the processing loop.
-
-- During learning: after each `Process()` call, compute the displacement between the previous and current grid cell locations for each module. Store these learned displacements keyed by object label.
-- During recognition: use stored displacements + current location to predict the next expected location. Pass the prediction to the `ThousandBrainsOutput` as `PredictedNextLocation`.
-- This closes the loop on the Thousand Brains object structure learning — without it, displacement cells are unused dead code.
+- During `Process()` with learning: computes displacement SDR between previous and current grid cell locations via `DisplacementCellModule.ComputeDisplacement()`, accumulates into `_currentDisplacements`.
+- `LearnObject()` now stores the displacement sequence in `_objectDisplacements[label]`.
+- During recognition: if the recognized object has stored displacements, uses `PredictTarget()` to predict the next expected grid cell location.
+- `StartNewObject()` resets displacement state (`_prevGridLocations`, `_currentDisplacements`).
+- Added `PredictedNextLocation` field to `ThousandBrainsOutput` record.
 
 ---
 
