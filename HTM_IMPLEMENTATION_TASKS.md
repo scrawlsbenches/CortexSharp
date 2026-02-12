@@ -101,13 +101,10 @@ These are algorithms or concepts that BAMI describes but the implementation does
 - `Reset()` clears all state for explicit sequence boundaries.
 - **Integrated into `HtmEngine`** (§17) as a standard pipeline step: Encoder → SP → TM → **TP** → Predictor → Anomaly. TP config exposed via `HtmEngineConfig` (`TpAnomalyResetThreshold`, `TpDecayRate`, `TpOutputActiveBits`, `TpProjectionSeed`). `HtmResult` now includes `TpOutput` with the stable pooled SDR, stability flag, and reset indicator.
 
-### 3.3 Build a hierarchical multi-region example (§13, §18) **[M]**
+### 3.3 ~~Build a hierarchical multi-region example (§13, §18)~~ **[M]** — DONE
 
-The `Network` class supports DAG topologies and the `CreateStandardPipeline` factory builds SP→TM, but there is no example of actual hierarchy (e.g., SP→TM→TemporalPooler→SP→TM at a higher level). BAMI's core thesis is hierarchical processing.
-
-- Add a `Network.CreateHierarchicalPipeline()` factory that wires at least two levels.
-- Add a corresponding example in `HtmExamples` demonstrating that the higher level learns slower, more abstract patterns.
-- This depends on 3.2 (temporal pooling) to produce meaningful inter-level representations.
+- Added `Network.CreateHierarchicalPipeline()` factory that wires a two-level hierarchy: `L1_SP → L1_TM → L1_TP → L2_SP → L2_TM`. Accepts per-level column/cell counts and an optional `TemporalPoolerConfig`. The `TemporalPoolerRegion` bridges levels by consuming L1 TM's `predictiveCells` + `anomaly` and outputting a stable pooled SDR to L2's SP.
+- Added `RunHierarchicalDemo()` (Example 5) in `HtmExamples` using nested temporal structure: 3 subsequences (A, B, C) in a repeating supersequence. Demonstrates that Level 1 anomaly drops quickly (element-level transitions) while Level 2 anomaly drops more slowly (sequence-of-sequences patterns), with TP stability within subsequences and reset at boundaries.
 
 ### 3.4 ~~Implement `Network` support for recurrent connections (§13)~~ **[L]** — DONE
 
