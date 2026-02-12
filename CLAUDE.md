@@ -32,6 +32,7 @@ Every change you make must preserve this pipeline's data flow contract:
 | §3 | 802–1008 | `Synapse`, `DendriteSegment`, `CellSegmentManager` | Synaptic infrastructure + lifecycle |
 | §4 | 1011–1351 | `SpatialPooler`, `SpatialPoolerConfig`, `SpatialPoolerMetrics` | Competitive learning with local/global inhibition |
 | §5 | 1352–1848 | `TemporalMemory`, `TemporalMemoryConfig`, `TemporalMemoryOutput`, `TemporalMemoryMetrics` | Sequence memory + prediction |
+| §5b | — | `TemporalPooler`, `TemporalPoolerConfig`, `TemporalPoolerOutput` | Stable sequence-level pooling for hierarchy |
 | §6 | 1849–1949 | `AnomalyLikelihood` | Statistical anomaly scoring (Welford + Gaussian tail) |
 | §7 | 1950–2052 | `SdrPredictor`, `SdrPrediction` | Multi-step value prediction from cell activity |
 | §8 | 2053–2199 | `GridCellModule`, `GridCellModuleConfig` | Allocentric location via toroidal grid |
