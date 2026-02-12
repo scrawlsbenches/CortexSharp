@@ -84,13 +84,12 @@ These work at a basic level but have gaps that limit correctness, robustness, or
 
 These are algorithms or concepts that BAMI describes but the implementation does not yet include. They extend the system's capabilities without fixing existing breakage.
 
-### 3.1 Add a Delta Encoder (§2) **[S]**
+### 3.1 ~~Add a Delta Encoder (§2)~~ **[S]** — DONE
 
-BAMI describes a delta encoder that encodes the *change* in a value rather than the absolute value. This is important for time-series applications where patterns appear in derivatives (e.g., temperature change patterns that repeat regardless of baseline).
-
-- Implement `DeltaEncoder : IEncoder<double>` that maintains the previous value and encodes `current - previous` using an internal `ScalarEncoder`.
-- Handle the first-call edge case (no previous value) by returning a zero-centered encoding.
-- Register as a composable encoder via `CompositeEncoder`.
+- Implemented `DeltaEncoder : IEncoder<double>` as a stateful encoder wrapping an internal `ScalarEncoder` configured for the delta range `[minDelta, maxDelta]`.
+- First-call edge case: when `_previousValue` is null, encodes delta as 0.0 (zero-centered).
+- `Reset()` method clears temporal state, treating the next input as the first value.
+- Composable via `CompositeEncoder.AddEncoder<double>("delta", deltaEncoder)` — same `IEncoder<double>` interface as `ScalarEncoder`.
 
 ### 3.2 Add a Temporal Pooling layer (§5 or new section) **[L]**
 

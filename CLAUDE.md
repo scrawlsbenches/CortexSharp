@@ -28,7 +28,7 @@ Every change you make must preserve this pipeline's data flow contract:
 | Section | Lines | Key Types | Purpose |
 |---------|-------|-----------|---------|
 | §1 | 45–376 | `SDR` | SIMD bitvector ops, noise, subsampling, projection |
-| §2 | 377–801 | `ScalarEncoder`, `RDSE`, `DateTimeEncoder`, `CategoryEncoder`, `GeospatialEncoder`, `CompositeEncoder` | Raw data → SDR conversion |
+| §2 | 377–837 | `ScalarEncoder`, `RDSE`, `DateTimeEncoder`, `CategoryEncoder`, `GeospatialEncoder`, `DeltaEncoder`, `CompositeEncoder` | Raw data → SDR conversion |
 | §3 | 802–1008 | `Synapse`, `DendriteSegment`, `CellSegmentManager` | Synaptic infrastructure + lifecycle |
 | §4 | 1011–1351 | `SpatialPooler`, `SpatialPoolerConfig`, `SpatialPoolerMetrics` | Competitive learning with local/global inhibition |
 | §5 | 1352–1848 | `TemporalMemory`, `TemporalMemoryConfig`, `TemporalMemoryOutput`, `TemporalMemoryMetrics` | Sequence memory + prediction |

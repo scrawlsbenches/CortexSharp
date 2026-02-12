@@ -386,6 +386,7 @@ public sealed class SDR : IEquatable<SDR>
 //   - DateTimeEncoder: multi-resolution temporal components
 //   - CategoryEncoder: one-hot-style with configurable overlap
 //   - GeospatialEncoder: lat/lon with multi-scale spatial hashing
+//   - DeltaEncoder: stateful change-between-values encoding
 //   - CompositeEncoder: concatenates multiple encoders
 // ============================================================================
 
@@ -751,6 +752,44 @@ public sealed class GeospatialEncoder : IEncoder<(double Latitude, double Longit
             result = result.Union(Encode(n));
 
         return result;
+    }
+}
+
+/// Delta encoder: encodes the *change* between consecutive values rather than
+/// the absolute value. Important for time-series where patterns appear in
+/// derivatives (e.g., temperature change patterns repeating regardless of baseline).
+/// This is the first stateful encoder — it maintains the previous value across calls.
+public sealed class DeltaEncoder : IEncoder<double>
+{
+    public int OutputSize { get; }
+
+    private readonly ScalarEncoder _deltaEncoder;
+    private double? _previousValue;
+
+    /// <param name="size">SDR width for the encoded delta</param>
+    /// <param name="activeBits">Number of active bits</param>
+    /// <param name="minDelta">Minimum expected delta (most negative change)</param>
+    /// <param name="maxDelta">Maximum expected delta (most positive change)</param>
+    /// <param name="clipInput">Clip deltas outside [minDelta, maxDelta]</param>
+    public DeltaEncoder(
+        int size, int activeBits, double minDelta, double maxDelta,
+        bool clipInput = true)
+    {
+        _deltaEncoder = new ScalarEncoder(size, activeBits, minDelta, maxDelta, clipInput: clipInput);
+        OutputSize = size;
+    }
+
+    public SDR Encode(double value)
+    {
+        double delta = _previousValue.HasValue ? value - _previousValue.Value : 0.0;
+        _previousValue = value;
+        return _deltaEncoder.Encode(delta);
+    }
+
+    /// Reset the encoder's temporal state, treating the next input as the first value.
+    public void Reset()
+    {
+        _previousValue = null;
     }
 }
 
