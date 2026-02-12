@@ -3226,7 +3226,7 @@ public record ThousandBrainsOutput
 // ============================================================================
 
 /// Named input/output port for a region
-public enum PortType { SDR, Scalar, CellActivity, Anomaly }
+public enum PortType { SDR, Scalar, CellActivity, Anomaly, Predictions }
 
 public record RegionPort(string Name, PortType Type);
 
@@ -3485,6 +3485,199 @@ public sealed class TMRegion : IRegion
         MinSynapsesForViableSegment = br.ReadInt32(),
         Seed = br.ReadInt32(),
     };
+}
+
+/// Wraps any IEncoder<T> as a NetworkAPI region. Enables fully declarative
+/// pipelines starting from raw data: Encoder → SP → TM → ...
+/// The encoder is treated as stateless for serialization; stateful encoders
+/// (e.g. DeltaEncoder) will lose temporal state on deserialization.
+public sealed class EncoderRegion<T> : IRegion
+{
+    public string Name { get; }
+    private readonly IEncoder<T> _encoder;
+    private T _input;
+    private SDR _output;
+
+    public IReadOnlyList<RegionPort> InputPorts { get; } = new[]
+    {
+        new RegionPort("rawInput", PortType.Scalar),
+    };
+
+    public IReadOnlyList<RegionPort> OutputPorts { get; } = new[]
+    {
+        new RegionPort("bottomUpOut", PortType.SDR),
+    };
+
+    public EncoderRegion(string name, IEncoder<T> encoder)
+    {
+        Name = name;
+        _encoder = encoder;
+    }
+
+    public void SetInput(string portName, object value)
+    {
+        if (portName == "rawInput") _input = (T)value;
+    }
+
+    public object GetOutput(string portName) => portName switch
+    {
+        "bottomUpOut" => _output,
+        _ => throw new ArgumentException($"Unknown port: {portName}"),
+    };
+
+    public void Compute(bool learn = true)
+        => _output = _encoder.Encode(_input);
+
+    /// Encoders are generally stateless. Stateful encoders (DeltaEncoder) will
+    /// retain their internal state — call their Reset() directly if needed.
+    public void Reset() { }
+
+    /// Encoders have no learned state to serialize.
+    public byte[] Serialize() => Array.Empty<byte>();
+    public void Deserialize(byte[] data) { }
+}
+
+/// Wraps SdrPredictor as a NetworkAPI region. Takes active cells from TM
+/// and an optional actual value for learning; produces predictions.
+/// Predictor re-adapts quickly on resumed input, so state is not serialized.
+public sealed class PredictorRegion : IRegion
+{
+    public string Name { get; }
+    private readonly SdrPredictor _predictor;
+    private readonly int[] _steps;
+    private HashSet<int> _activeCells;
+    private double _actualValue;
+    private bool _hasActualValue;
+    private Dictionary<int, SdrPrediction> _predictions;
+
+    public IReadOnlyList<RegionPort> InputPorts { get; } = new[]
+    {
+        new RegionPort("activeCells", PortType.CellActivity),
+        new RegionPort("actualValue", PortType.Scalar),
+    };
+
+    public IReadOnlyList<RegionPort> OutputPorts { get; } = new[]
+    {
+        new RegionPort("predictions", PortType.Predictions),
+    };
+
+    public PredictorRegion(string name, int[] steps, float alpha = 0.001f, double resolution = 1.0)
+    {
+        Name = name;
+        _steps = steps;
+        _predictor = new SdrPredictor(steps, alpha, resolution);
+    }
+
+    public void SetInput(string portName, object value)
+    {
+        switch (portName)
+        {
+            case "activeCells": _activeCells = (HashSet<int>)value; break;
+            case "actualValue":
+                _actualValue = (double)value;
+                _hasActualValue = true;
+                break;
+        }
+    }
+
+    public object GetOutput(string portName) => portName switch
+    {
+        "predictions" => _predictions ?? new Dictionary<int, SdrPrediction>(),
+        _ => throw new ArgumentException($"Unknown port: {portName}"),
+    };
+
+    public void Compute(bool learn = true)
+    {
+        _predictions = _predictor.Infer(_activeCells);
+
+        if (learn && _hasActualValue)
+        {
+            foreach (int step in _steps)
+                _predictor.Learn(step, _activeCells, _actualValue);
+        }
+
+        _hasActualValue = false;
+    }
+
+    public void Reset()
+    {
+        _predictions = null;
+        _hasActualValue = false;
+    }
+
+    /// Predictor re-adapts quickly; no serialization needed.
+    public byte[] Serialize() => Array.Empty<byte>();
+    public void Deserialize(byte[] data) { }
+}
+
+/// Wraps TemporalPooler as a NetworkAPI region. Takes predictive cells and
+/// anomaly from TM; produces a stable pooled SDR suitable for feeding the
+/// next hierarchical level's SP.
+public sealed class TemporalPoolerRegion : IRegion
+{
+    public string Name { get; }
+    private readonly TemporalPoolerConfig _config;
+    private readonly TemporalPooler _tp;
+    private HashSet<int> _predictiveCells = new();
+    private float _anomaly;
+    private TemporalPoolerOutput _lastOutput;
+
+    public IReadOnlyList<RegionPort> InputPorts { get; } = new[]
+    {
+        new RegionPort("predictiveCells", PortType.CellActivity),
+        new RegionPort("anomaly", PortType.Anomaly),
+    };
+
+    public IReadOnlyList<RegionPort> OutputPorts { get; } = new[]
+    {
+        new RegionPort("bottomUpOut", PortType.SDR),
+    };
+
+    public TemporalPoolerRegion(string name, TemporalPoolerConfig config)
+    {
+        Name = name;
+        _config = config;
+        _tp = new TemporalPooler(config);
+    }
+
+    public void SetInput(string portName, object value)
+    {
+        switch (portName)
+        {
+            case "predictiveCells": _predictiveCells = (HashSet<int>)value; break;
+            case "anomaly": _anomaly = (float)value; break;
+        }
+    }
+
+    public object GetOutput(string portName) => portName switch
+    {
+        "bottomUpOut" => _lastOutput?.PooledRepresentation ?? new SDR(_config.OutputSize),
+        _ => throw new ArgumentException($"Unknown port: {portName}"),
+    };
+
+    public void Compute(bool learn = true)
+    {
+        // Construct a TemporalMemoryOutput with the fields TemporalPooler uses
+        var tmOutput = new TemporalMemoryOutput
+        {
+            PredictiveCells = _predictiveCells,
+            Anomaly = _anomaly,
+            // Fields unused by TemporalPooler — provide safe defaults
+            ActiveCells = new HashSet<int>(),
+            WinnerCells = new HashSet<int>(),
+        };
+        _lastOutput = _tp.Compute(tmOutput);
+    }
+
+    public void Reset()
+    {
+        _tp.Reset();
+        _lastOutput = null;
+    }
+
+    /// TemporalPooler evidence re-accumulates quickly; no serialization needed.
+    public byte[] Serialize() => Array.Empty<byte>();
+    public void Deserialize(byte[] data) { }
 }
 
 /// The NetworkAPI computation graph: manages regions, links, and execution order

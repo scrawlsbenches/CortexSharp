@@ -116,21 +116,29 @@ CLAUDE.md flags this: "Network does not support cycles (recurrent connections) �
 - Add a `MaxSettlingIterations` config and convergence detection (output stability across iterations).
 - Mark feedback links distinctly from feedforward links so the scheduler knows which edges to break.
 
-### 3.5 Add an Encoder Region for the NetworkAPI (§13) **[S]**
+### 3.5 ~~Add an Encoder Region for the NetworkAPI (§13)~~ **[S]** — DONE
 
-The NetworkAPI has `SPRegion` and `TMRegion` but no `EncoderRegion`. To build a complete pipeline in the NetworkAPI (raw data → encoder → SP → TM), the encoder must be wrappable as a region.
+- Implemented `EncoderRegion<T> : IRegion` wrapping any `IEncoder<T>`.
+- Input port: `rawInput` (boxed `T`, PortType.Scalar). Output port: `bottomUpOut` (SDR).
+- Encoders have no learned state, so `Serialize`/`Deserialize` are no-ops.
+- Stateful encoders (e.g. DeltaEncoder) retain internal state; their `Reset()` must be called directly.
 
-- Implement `EncoderRegion<T> : IRegion` that wraps any `IEncoder<T>`.
-- Input port: raw value (boxed `T`). Output port: SDR.
-- Enables fully declarative pipeline construction end-to-end.
+### 3.6 ~~Add a Classifier/Predictor Region for the NetworkAPI (§13)~~ **[S]** — DONE
 
-### 3.6 Add a Classifier/Predictor Region for the NetworkAPI (§13) **[S]**
+- Implemented `PredictorRegion : IRegion` wrapping `SdrPredictor`.
+- Input ports: `activeCells` (CellActivity) + `actualValue` (Scalar, for learning).
+- Output port: `predictions` (new PortType.Predictions).
+- Added `Predictions` value to the `PortType` enum.
+- Predictor re-adapts quickly on resumed input, so state is not serialized.
 
-Same gap as encoders — `SdrPredictor` has no region wrapper.
+### 3.7 Add a TemporalPooler Region for the NetworkAPI (§13) **[S]** — DONE
 
-- Implement `PredictorRegion : IRegion` wrapping `SdrPredictor`.
-- Input port: active cells (`HashSet<int>`). Output port: predictions.
-- Completes the full pipeline: Encoder → SP → TM → Predictor, all in NetworkAPI.
+- Implemented `TemporalPoolerRegion : IRegion` wrapping `TemporalPooler`.
+- Input ports: `predictiveCells` (CellActivity) + `anomaly` (Anomaly) — wires directly to TMRegion outputs.
+- Output port: `bottomUpOut` (SDR) — the stable pooled representation, suitable for feeding a higher-level SP.
+- Constructs a `TemporalMemoryOutput` internally from the two input ports.
+- Evidence re-accumulates quickly, so state is not serialized.
+- Together with 3.5 and 3.6, completes the full NetworkAPI pipeline: Encoder → SP → TM → TP → Predictor.
 
 ---
 
