@@ -4501,8 +4501,11 @@ public record MultiStreamStats
 // ============================================================================
 // SECTION 17: Full HTM Engine — Single-Stream Orchestrator
 // ============================================================================
-// Convenience wrapper that wires Encoder → SP → TM → Predictor → Anomaly
-// into a single call. For multi-stream, use MultiStreamProcessor instead.
+// Convenience wrapper that wires the full HTM pipeline into a single call:
+//   Encoder → SP → TM → TP → Predictor → Anomaly
+// The Temporal Pooler produces stable sequence-level representations that
+// bridge TM (per-element) to higher-level processing (per-sequence).
+// For multi-stream, use MultiStreamProcessor instead.
 // ============================================================================
 
 public sealed class HtmEngineConfig
@@ -4517,6 +4520,12 @@ public sealed class HtmEngineConfig
     public int InhibitionRadius { get; init; } = 50;
     public int MaxSegmentsPerCell { get; init; } = 128;
     public int MaxSynapsesPerSegment { get; init; } = 64;
+
+    // Temporal Pooler — produces stable sequence-level representations
+    public float TpAnomalyResetThreshold { get; init; } = 0.5f;
+    public float TpDecayRate { get; init; } = 0.01f;
+    public int TpOutputActiveBits { get; init; } = 40;
+    public int TpProjectionSeed { get; init; } = 42;
 }
 
 public record HtmResult
@@ -4524,6 +4533,7 @@ public record HtmResult
     public SDR EncodedInput { get; init; }
     public SDR ActiveColumns { get; init; }
     public TemporalMemoryOutput TmOutput { get; init; }
+    public TemporalPoolerOutput TpOutput { get; init; }
     public float AnomalyLikelihood { get; init; }
     public Dictionary<int, SdrPrediction> Predictions { get; init; }
     public int Iteration { get; init; }
@@ -4537,12 +4547,14 @@ public sealed class HtmEngine
     private readonly TemporalMemoryConfig _tmConfig;
     private SpatialPooler _sp;
     private TemporalMemory _tm;
+    private readonly TemporalPooler _tp;
     private readonly SdrPredictor _predictor;
     private readonly AnomalyLikelihood _anomalyLikelihood;
     private int _iteration;
 
     public SpatialPooler SP => _sp;
     public TemporalMemory TM => _tm;
+    public TemporalPooler TP => _tp;
 
     public HtmEngine(HtmEngineConfig config)
     {
@@ -4568,11 +4580,20 @@ public sealed class HtmEngine
 
         _sp = new SpatialPooler(_spConfig);
         _tm = new TemporalMemory(_tmConfig);
+        _tp = new TemporalPooler(new TemporalPoolerConfig
+        {
+            OutputSize = config.ColumnCount,
+            OutputActiveBits = config.TpOutputActiveBits,
+            AnomalyResetThreshold = config.TpAnomalyResetThreshold,
+            DecayRate = config.TpDecayRate,
+            ProjectionSeed = config.TpProjectionSeed,
+        });
         _predictor = new SdrPredictor(config.PredictionSteps, resolution: config.PredictorResolution);
         _anomalyLikelihood = new AnomalyLikelihood();
     }
 
-    /// Process one timestep through the full pipeline
+    /// Process one timestep through the full pipeline:
+    /// Encode → SP → TM → TP → Predictor → Anomaly
     public HtmResult Compute(Dictionary<string, object> inputData, bool learn = true)
     {
         _iteration++;
@@ -4582,10 +4603,13 @@ public sealed class HtmEngine
         SDR activeColumns = _sp.Compute(encoded, learn);
         var tmOutput = _tm.Compute(activeColumns, learn);
 
+        // Temporal Pooling — stable sequence-level representation
+        var tpOutput = _tp.Compute(tmOutput);
+
         // Anomaly likelihood
         float anomalyLikelihood = _anomalyLikelihood.Compute(tmOutput.Anomaly);
 
-        // Predictions
+        // Predictions (from TM active cells, not pooled — predictions are per-element)
         var predictions = _predictor.Infer(tmOutput.ActiveCells);
 
         // Train predictor
@@ -4600,6 +4624,7 @@ public sealed class HtmEngine
             EncodedInput = encoded,
             ActiveColumns = activeColumns,
             TmOutput = tmOutput,
+            TpOutput = tpOutput,
             AnomalyLikelihood = anomalyLikelihood,
             Predictions = predictions,
             Iteration = _iteration,

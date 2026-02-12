@@ -91,7 +91,7 @@ These are algorithms or concepts that BAMI describes but the implementation does
 - `Reset()` method clears temporal state, treating the next input as the first value.
 - Composable via `CompositeEncoder.AddEncoder<double>("delta", deltaEncoder)` — same `IEncoder<double>` interface as `ScalarEncoder`.
 
-### 3.2 ~~Add a Temporal Pooling layer (§5b)~~ **[L]** — DONE
+### 3.2 ~~Add a Temporal Pooling layer (§5b, §17)~~ **[L]** — DONE
 
 - Implemented `TemporalPooler` as a post-TM processing step (new §5b between TM and Anomaly Likelihood).
 - Evidence-based pooling: each predictive cell accumulates floating-point evidence on each observation, decays by `DecayRate` per step, and is removed when evidence reaches zero.
@@ -99,6 +99,7 @@ These are algorithms or concepts that BAMI describes but the implementation does
 - Output projection: top-evidence cells are projected to a fixed-size SDR via consistent hashing (`HashCode.Combine(cell, ProjectionSeed)`), deterministic for a given evidence state.
 - Stability tracking: output SDR is flagged `IsStable` when overlap with previous output exceeds 70% of target active bits.
 - `Reset()` clears all state for explicit sequence boundaries.
+- **Integrated into `HtmEngine`** (§17) as a standard pipeline step: Encoder → SP → TM → **TP** → Predictor → Anomaly. TP config exposed via `HtmEngineConfig` (`TpAnomalyResetThreshold`, `TpDecayRate`, `TpOutputActiveBits`, `TpProjectionSeed`). `HtmResult` now includes `TpOutput` with the stable pooled SDR, stability flag, and reset indicator.
 
 ### 3.3 Build a hierarchical multi-region example (§13, §18) **[M]**
 

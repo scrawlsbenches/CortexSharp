@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-This is a **Hierarchical Temporal Memory (HTM)** implementation in C# based on Numenta's BAMI theory and the Thousand Brains Framework. It is a single-file reference architecture (`HtmEnhanced.cs`, ~4850 lines, 18 sections) intended as high-level pseudocode that prioritizes algorithmic clarity while using real C# idioms, types, and patterns.
+This is a **Hierarchical Temporal Memory (HTM)** implementation in C# based on Numenta's BAMI theory and the Thousand Brains Framework. It is a single-file reference architecture (`HtmEnhanced.cs`, ~4875 lines, 18 sections) intended as high-level pseudocode that prioritizes algorithmic clarity while using real C# idioms, types, and patterns.
 
 **Namespace:** `HierarchicalTemporalMemory.Enhanced`
 **Target:** .NET 8+ (C# 12). Uses `System.Numerics`, `System.Runtime.Intrinsics`, `System.Threading.Channels`.
@@ -12,16 +12,18 @@ This is **not** a library you `dotnet build` out of the box — it is a design d
 ## Core HTM Pipeline
 
 ```
-Raw Data → Encoder → Spatial Pooler → Temporal Memory → Predictor
-                                           ↓
-                                    Anomaly Likelihood
+Raw Data → Encoder → Spatial Pooler → Temporal Memory → Temporal Pooler → Predictor
+                                           ↓                   ↓
+                                    Anomaly Likelihood    Stable SDR
+                                                      (sequence-level)
 ```
 
 Every change you make must preserve this pipeline's data flow contract:
 - Encoders produce `SDR` (sparse binary vectors)
 - Spatial Pooler consumes `SDR`, produces `SDR` (fixed sparsity)
 - Temporal Memory consumes `SDR` (columns), produces `TemporalMemoryOutput` (cells + anomaly)
-- Predictor consumes `HashSet<int>` (active cells), produces `Dictionary<int, SdrPrediction>`
+- Temporal Pooler consumes `TemporalMemoryOutput`, produces `TemporalPoolerOutput` (stable pooled SDR for hierarchy)
+- Predictor consumes `HashSet<int>` (active cells from TM), produces `Dictionary<int, SdrPrediction>`
 
 ## File Structure & Section Map
 
@@ -44,8 +46,8 @@ Every change you make must preserve this pipeline's data flow contract:
 | §14 | 3801–4154 | `HtmSerializer` | Binary serialization with magic number + versioning |
 | §15 | 4155–4277 | `HtmDiagnostics`, `SdrQualityReport`, `SystemHealthReport` | Monitoring + SDR quality analysis |
 | §16 | 4278–4501 | `MultiStreamProcessor`, `StreamPipeline`, `StreamConfig` | Concurrent multi-stream via Channels |
-| §17 | 4502–4630 | `HtmEngine`, `HtmEngineConfig`, `HtmResult` | Single-stream convenience orchestrator |
-| §18 | 4631–4849 | `HtmExamples` | Four runnable demo patterns |
+| §17 | 4502–4655 | `HtmEngine`, `HtmEngineConfig`, `HtmResult` | Single-stream convenience orchestrator |
+| §18 | 4656–4874 | `HtmExamples` | Four runnable demo patterns |
 
 ## Critical Invariants — Do Not Break
 
