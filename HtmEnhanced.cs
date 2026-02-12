@@ -3226,7 +3226,7 @@ public record ThousandBrainsOutput
 // ============================================================================
 
 /// Named input/output port for a region
-public enum PortType { SDR, Scalar, CellActivity, Anomaly }
+public enum PortType { SDR, Scalar, CellActivity, Anomaly, Predictions }
 
 public record RegionPort(string Name, PortType Type);
 
@@ -3247,10 +3247,12 @@ public interface IRegion
     void Deserialize(byte[] data);
 }
 
-/// Link between two region ports
+/// Link between two region ports. Feedback links create cycles in the graph
+/// and are handled via iterative settling rather than topological ordering.
 public record RegionLink(
     string SourceRegion, string SourcePort,
-    string TargetRegion, string TargetPort);
+    string TargetRegion, string TargetPort,
+    bool IsFeedback = false);
 
 /// Wraps the Spatial Pooler as a NetworkAPI region
 public sealed class SPRegion : IRegion
@@ -3487,50 +3489,288 @@ public sealed class TMRegion : IRegion
     };
 }
 
-/// The NetworkAPI computation graph: manages regions, links, and execution order
+/// Wraps any IEncoder<T> as a NetworkAPI region. Enables fully declarative
+/// pipelines starting from raw data: Encoder → SP → TM → ...
+/// The encoder is treated as stateless for serialization; stateful encoders
+/// (e.g. DeltaEncoder) will lose temporal state on deserialization.
+public sealed class EncoderRegion<T> : IRegion
+{
+    public string Name { get; }
+    private readonly IEncoder<T> _encoder;
+    private T _input;
+    private SDR _output;
+
+    public IReadOnlyList<RegionPort> InputPorts { get; } = new[]
+    {
+        new RegionPort("rawInput", PortType.Scalar),
+    };
+
+    public IReadOnlyList<RegionPort> OutputPorts { get; } = new[]
+    {
+        new RegionPort("bottomUpOut", PortType.SDR),
+    };
+
+    public EncoderRegion(string name, IEncoder<T> encoder)
+    {
+        Name = name;
+        _encoder = encoder;
+    }
+
+    public void SetInput(string portName, object value)
+    {
+        if (portName == "rawInput") _input = (T)value;
+    }
+
+    public object GetOutput(string portName) => portName switch
+    {
+        "bottomUpOut" => _output,
+        _ => throw new ArgumentException($"Unknown port: {portName}"),
+    };
+
+    public void Compute(bool learn = true)
+        => _output = _encoder.Encode(_input);
+
+    /// Encoders are generally stateless. Stateful encoders (DeltaEncoder) will
+    /// retain their internal state — call their Reset() directly if needed.
+    public void Reset() { }
+
+    /// Encoders have no learned state to serialize.
+    public byte[] Serialize() => Array.Empty<byte>();
+    public void Deserialize(byte[] data) { }
+}
+
+/// Wraps SdrPredictor as a NetworkAPI region. Takes active cells from TM
+/// and an optional actual value for learning; produces predictions.
+/// Predictor re-adapts quickly on resumed input, so state is not serialized.
+public sealed class PredictorRegion : IRegion
+{
+    public string Name { get; }
+    private readonly SdrPredictor _predictor;
+    private readonly int[] _steps;
+    private HashSet<int> _activeCells;
+    private double _actualValue;
+    private bool _hasActualValue;
+    private Dictionary<int, SdrPrediction> _predictions;
+
+    public IReadOnlyList<RegionPort> InputPorts { get; } = new[]
+    {
+        new RegionPort("activeCells", PortType.CellActivity),
+        new RegionPort("actualValue", PortType.Scalar),
+    };
+
+    public IReadOnlyList<RegionPort> OutputPorts { get; } = new[]
+    {
+        new RegionPort("predictions", PortType.Predictions),
+    };
+
+    public PredictorRegion(string name, int[] steps, float alpha = 0.001f, double resolution = 1.0)
+    {
+        Name = name;
+        _steps = steps;
+        _predictor = new SdrPredictor(steps, alpha, resolution);
+    }
+
+    public void SetInput(string portName, object value)
+    {
+        switch (portName)
+        {
+            case "activeCells": _activeCells = (HashSet<int>)value; break;
+            case "actualValue":
+                _actualValue = (double)value;
+                _hasActualValue = true;
+                break;
+        }
+    }
+
+    public object GetOutput(string portName) => portName switch
+    {
+        "predictions" => _predictions ?? new Dictionary<int, SdrPrediction>(),
+        _ => throw new ArgumentException($"Unknown port: {portName}"),
+    };
+
+    public void Compute(bool learn = true)
+    {
+        _predictions = _predictor.Infer(_activeCells);
+
+        if (learn && _hasActualValue)
+        {
+            foreach (int step in _steps)
+                _predictor.Learn(step, _activeCells, _actualValue);
+        }
+
+        _hasActualValue = false;
+    }
+
+    public void Reset()
+    {
+        _predictions = null;
+        _hasActualValue = false;
+    }
+
+    /// Predictor re-adapts quickly; no serialization needed.
+    public byte[] Serialize() => Array.Empty<byte>();
+    public void Deserialize(byte[] data) { }
+}
+
+/// Wraps TemporalPooler as a NetworkAPI region. Takes predictive cells and
+/// anomaly from TM; produces a stable pooled SDR suitable for feeding the
+/// next hierarchical level's SP.
+public sealed class TemporalPoolerRegion : IRegion
+{
+    public string Name { get; }
+    private readonly TemporalPoolerConfig _config;
+    private readonly TemporalPooler _tp;
+    private HashSet<int> _predictiveCells = new();
+    private float _anomaly;
+    private TemporalPoolerOutput _lastOutput;
+
+    public IReadOnlyList<RegionPort> InputPorts { get; } = new[]
+    {
+        new RegionPort("predictiveCells", PortType.CellActivity),
+        new RegionPort("anomaly", PortType.Anomaly),
+    };
+
+    public IReadOnlyList<RegionPort> OutputPorts { get; } = new[]
+    {
+        new RegionPort("bottomUpOut", PortType.SDR),
+    };
+
+    public TemporalPoolerRegion(string name, TemporalPoolerConfig config)
+    {
+        Name = name;
+        _config = config;
+        _tp = new TemporalPooler(config);
+    }
+
+    public void SetInput(string portName, object value)
+    {
+        switch (portName)
+        {
+            case "predictiveCells": _predictiveCells = (HashSet<int>)value; break;
+            case "anomaly": _anomaly = (float)value; break;
+        }
+    }
+
+    public object GetOutput(string portName) => portName switch
+    {
+        "bottomUpOut" => _lastOutput?.PooledRepresentation ?? new SDR(_config.OutputSize),
+        _ => throw new ArgumentException($"Unknown port: {portName}"),
+    };
+
+    public void Compute(bool learn = true)
+    {
+        // Construct a TemporalMemoryOutput with the fields TemporalPooler uses
+        var tmOutput = new TemporalMemoryOutput
+        {
+            PredictiveCells = _predictiveCells,
+            Anomaly = _anomaly,
+            // Fields unused by TemporalPooler — provide safe defaults
+            ActiveCells = new HashSet<int>(),
+            WinnerCells = new HashSet<int>(),
+        };
+        _lastOutput = _tp.Compute(tmOutput);
+    }
+
+    public void Reset()
+    {
+        _tp.Reset();
+        _lastOutput = null;
+    }
+
+    /// TemporalPooler evidence re-accumulates quickly; no serialization needed.
+    public byte[] Serialize() => Array.Empty<byte>();
+    public void Deserialize(byte[] data) { }
+}
+
+/// The NetworkAPI computation graph: manages regions, links, and execution order.
+/// Supports both feedforward DAGs (topological execution) and recurrent graphs
+/// (feedback links handled via iterative settling with convergence detection).
 public sealed class Network
 {
     private readonly Dictionary<string, IRegion> _regions = new();
     private readonly List<RegionLink> _links = new();
-    private List<string>? _executionOrder;  // Topologically sorted
+    private List<string>? _executionOrder;  // Topologically sorted (ignoring feedback)
+    private HashSet<string>? _feedbackTargets; // Regions that receive feedback input
 
     public IReadOnlyDictionary<string, IRegion> Regions => _regions;
     public IReadOnlyList<RegionLink> Links => _links;
 
+    /// Maximum settling iterations for resolving feedback connections.
+    /// Only used when the network contains feedback links.
+    public int MaxSettlingIterations { get; set; } = 10;
+
+    /// Convergence threshold for settling. For SDR outputs, this is the
+    /// minimum overlap ratio (overlap / activeBits) between successive
+    /// iterations. For other types, exact equality is required.
+    public float ConvergenceThreshold { get; set; } = 0.95f;
+
+    /// Number of settling iterations used in the last Compute() call.
+    /// 0 for pure feedforward networks.
+    public int LastSettlingIterations { get; private set; }
+
     public Network AddRegion(IRegion region)
     {
         _regions[region.Name] = region;
-        _executionOrder = null; // Invalidate
+        _executionOrder = null;
+        _feedbackTargets = null;
         return this;
     }
 
+    /// Add a feedforward link between two region ports.
     public Network Link(
         string sourceRegion, string sourcePort,
         string targetRegion, string targetPort)
     {
         _links.Add(new RegionLink(sourceRegion, sourcePort, targetRegion, targetPort));
         _executionOrder = null;
+        _feedbackTargets = null;
         return this;
     }
 
-    /// Compute one timestep: propagate data through all regions in topological order
+    /// Add a feedback (recurrent) link. Feedback links are excluded from
+    /// topological sort and resolved via iterative settling. Use these for
+    /// top-down predictions, lateral connections, or any cycle-creating edge.
+    public Network FeedbackLink(
+        string sourceRegion, string sourcePort,
+        string targetRegion, string targetPort)
+    {
+        _links.Add(new RegionLink(sourceRegion, sourcePort, targetRegion, targetPort, IsFeedback: true));
+        _executionOrder = null;
+        _feedbackTargets = null;
+        return this;
+    }
+
+    /// Compute one timestep. For pure feedforward networks, runs a single
+    /// topological pass. For networks with feedback links, runs an initial
+    /// feedforward pass followed by settling iterations until convergence
+    /// or MaxSettlingIterations is reached.
     public void Compute(bool learn = true)
     {
         _executionOrder ??= TopologicalSort();
+        _feedbackTargets ??= BuildFeedbackTargets();
 
-        foreach (string regionName in _executionOrder)
+        // Pass 1: feedforward — propagate all links, compute in topological order
+        ExecutePass(learn);
+
+        // Pass 2+: settling loop (only if feedback links exist)
+        if (_feedbackTargets.Count > 0)
         {
-            var region = _regions[regionName];
-
-            // Gather inputs from upstream regions
-            foreach (var link in _links.Where(l => l.TargetRegion == regionName))
+            LastSettlingIterations = 0;
+            for (int i = 0; i < MaxSettlingIterations; i++)
             {
-                var sourceRegion = _regions[link.SourceRegion];
-                var value = sourceRegion.GetOutput(link.SourcePort);
-                region.SetInput(link.TargetPort, value);
-            }
+                var snapshots = SnapshotFeedbackTargetOutputs();
 
-            region.Compute(learn);
+                // Settling passes don't learn — learning only on the initial pass
+                ExecutePass(learn: false);
+                LastSettlingIterations = i + 1;
+
+                if (HasConverged(snapshots))
+                    break;
+            }
+        }
+        else
+        {
+            LastSettlingIterations = 0;
         }
     }
 
@@ -3545,13 +3785,91 @@ public sealed class Network
         foreach (var region in _regions.Values) region.Reset();
     }
 
-    /// Topological sort of regions based on link dependencies
+    /// Execute one pass through all regions in topological order,
+    /// propagating data through ALL links (including feedback).
+    private void ExecutePass(bool learn)
+    {
+        foreach (string regionName in _executionOrder!)
+        {
+            var region = _regions[regionName];
+
+            // Gather inputs from all upstream links (feedforward and feedback)
+            foreach (var link in _links.Where(l => l.TargetRegion == regionName))
+            {
+                var sourceRegion = _regions[link.SourceRegion];
+                var value = sourceRegion.GetOutput(link.SourcePort);
+                region.SetInput(link.TargetPort, value);
+            }
+
+            region.Compute(learn);
+        }
+    }
+
+    /// Snapshot the current output of every output port on feedback-target regions.
+    private Dictionary<(string Region, string Port), object> SnapshotFeedbackTargetOutputs()
+    {
+        var snapshots = new Dictionary<(string, string), object>();
+        foreach (string regionName in _feedbackTargets!)
+        {
+            var region = _regions[regionName];
+            foreach (var port in region.OutputPorts)
+            {
+                var value = region.GetOutput(port.Name);
+                // Clone SDRs and cell sets so the snapshot isn't a reference to live state
+                object snapshot = value switch
+                {
+                    SDR sdr => sdr, // SDR is effectively immutable (new instance each Compute)
+                    HashSet<int> cells => new HashSet<int>(cells),
+                    _ => value,
+                };
+                snapshots[(regionName, port.Name)] = snapshot;
+            }
+        }
+        return snapshots;
+    }
+
+    /// Check if feedback-target outputs have converged compared to snapshots.
+    private bool HasConverged(Dictionary<(string Region, string Port), object> snapshots)
+    {
+        foreach (var ((regionName, portName), previous) in snapshots)
+        {
+            var current = _regions[regionName].GetOutput(portName);
+
+            bool portConverged = (previous, current) switch
+            {
+                (SDR prevSdr, SDR curSdr) =>
+                    prevSdr.ActiveCount > 0
+                    && curSdr.ActiveCount > 0
+                    && prevSdr.Overlap(curSdr) >= (int)(Math.Min(prevSdr.ActiveCount, curSdr.ActiveCount) * ConvergenceThreshold),
+
+                (HashSet<int> prevCells, HashSet<int> curCells) =>
+                    prevCells.SetEquals(curCells),
+
+                (float prevFloat, float curFloat) =>
+                    Math.Abs(prevFloat - curFloat) < 0.001f,
+
+                _ => Equals(previous, current),
+            };
+
+            if (!portConverged) return false;
+        }
+        return true;
+    }
+
+    /// Identify regions that are targets of feedback links.
+    private HashSet<string> BuildFeedbackTargets()
+        => _links.Where(l => l.IsFeedback).Select(l => l.TargetRegion).ToHashSet();
+
+    /// Topological sort ignoring feedback edges. Feedback links are excluded
+    /// so the feedforward subgraph forms a DAG. If the feedforward edges alone
+    /// contain cycles, that is still an error.
     private List<string> TopologicalSort()
     {
         var inDegree = _regions.Keys.ToDictionary(k => k, _ => 0);
         var adjacency = _regions.Keys.ToDictionary(k => k, _ => new List<string>());
 
-        foreach (var link in _links)
+        // Only count feedforward links for topological ordering
+        foreach (var link in _links.Where(l => !l.IsFeedback))
         {
             adjacency[link.SourceRegion].Add(link.TargetRegion);
             inDegree[link.TargetRegion]++;
@@ -3574,7 +3892,8 @@ public sealed class Network
         }
 
         if (sorted.Count != _regions.Count)
-            throw new InvalidOperationException("Cycle detected in network graph");
+            throw new InvalidOperationException(
+                "Cycle detected in feedforward links. Use FeedbackLink() for recurrent connections.");
 
         return sorted;
     }
@@ -3737,6 +4056,7 @@ public static class HtmSerializer
             bw.Write(link.SourcePort);
             bw.Write(link.TargetRegion);
             bw.Write(link.TargetPort);
+            bw.Write(link.IsFeedback);
         }
 
         // Append checksum
@@ -3807,7 +4127,11 @@ public static class HtmSerializer
             string sourcePort = br.ReadString();
             string targetRegion = br.ReadString();
             string targetPort = br.ReadString();
-            network.Link(sourceRegion, sourcePort, targetRegion, targetPort);
+            bool isFeedback = br.ReadBoolean();
+            if (isFeedback)
+                network.FeedbackLink(sourceRegion, sourcePort, targetRegion, targetPort);
+            else
+                network.Link(sourceRegion, sourcePort, targetRegion, targetPort);
         }
 
         return network;
@@ -4308,8 +4632,11 @@ public record MultiStreamStats
 // ============================================================================
 // SECTION 17: Full HTM Engine — Single-Stream Orchestrator
 // ============================================================================
-// Convenience wrapper that wires Encoder → SP → TM → Predictor → Anomaly
-// into a single call. For multi-stream, use MultiStreamProcessor instead.
+// Convenience wrapper that wires the full HTM pipeline into a single call:
+//   Encoder → SP → TM → TP → Predictor → Anomaly
+// The Temporal Pooler produces stable sequence-level representations that
+// bridge TM (per-element) to higher-level processing (per-sequence).
+// For multi-stream, use MultiStreamProcessor instead.
 // ============================================================================
 
 public sealed class HtmEngineConfig
@@ -4324,6 +4651,12 @@ public sealed class HtmEngineConfig
     public int InhibitionRadius { get; init; } = 50;
     public int MaxSegmentsPerCell { get; init; } = 128;
     public int MaxSynapsesPerSegment { get; init; } = 64;
+
+    // Temporal Pooler — produces stable sequence-level representations
+    public float TpAnomalyResetThreshold { get; init; } = 0.5f;
+    public float TpDecayRate { get; init; } = 0.01f;
+    public int TpOutputActiveBits { get; init; } = 40;
+    public int TpProjectionSeed { get; init; } = 42;
 }
 
 public record HtmResult
@@ -4331,6 +4664,7 @@ public record HtmResult
     public SDR EncodedInput { get; init; }
     public SDR ActiveColumns { get; init; }
     public TemporalMemoryOutput TmOutput { get; init; }
+    public TemporalPoolerOutput TpOutput { get; init; }
     public float AnomalyLikelihood { get; init; }
     public Dictionary<int, SdrPrediction> Predictions { get; init; }
     public int Iteration { get; init; }
@@ -4344,12 +4678,14 @@ public sealed class HtmEngine
     private readonly TemporalMemoryConfig _tmConfig;
     private SpatialPooler _sp;
     private TemporalMemory _tm;
+    private readonly TemporalPooler _tp;
     private readonly SdrPredictor _predictor;
     private readonly AnomalyLikelihood _anomalyLikelihood;
     private int _iteration;
 
     public SpatialPooler SP => _sp;
     public TemporalMemory TM => _tm;
+    public TemporalPooler TP => _tp;
 
     public HtmEngine(HtmEngineConfig config)
     {
@@ -4375,11 +4711,20 @@ public sealed class HtmEngine
 
         _sp = new SpatialPooler(_spConfig);
         _tm = new TemporalMemory(_tmConfig);
+        _tp = new TemporalPooler(new TemporalPoolerConfig
+        {
+            OutputSize = config.ColumnCount,
+            OutputActiveBits = config.TpOutputActiveBits,
+            AnomalyResetThreshold = config.TpAnomalyResetThreshold,
+            DecayRate = config.TpDecayRate,
+            ProjectionSeed = config.TpProjectionSeed,
+        });
         _predictor = new SdrPredictor(config.PredictionSteps, resolution: config.PredictorResolution);
         _anomalyLikelihood = new AnomalyLikelihood();
     }
 
-    /// Process one timestep through the full pipeline
+    /// Process one timestep through the full pipeline:
+    /// Encode → SP → TM → TP → Predictor → Anomaly
     public HtmResult Compute(Dictionary<string, object> inputData, bool learn = true)
     {
         _iteration++;
@@ -4389,10 +4734,13 @@ public sealed class HtmEngine
         SDR activeColumns = _sp.Compute(encoded, learn);
         var tmOutput = _tm.Compute(activeColumns, learn);
 
+        // Temporal Pooling — stable sequence-level representation
+        var tpOutput = _tp.Compute(tmOutput);
+
         // Anomaly likelihood
         float anomalyLikelihood = _anomalyLikelihood.Compute(tmOutput.Anomaly);
 
-        // Predictions
+        // Predictions (from TM active cells, not pooled — predictions are per-element)
         var predictions = _predictor.Infer(tmOutput.ActiveCells);
 
         // Train predictor
@@ -4407,6 +4755,7 @@ public sealed class HtmEngine
             EncodedInput = encoded,
             ActiveColumns = activeColumns,
             TmOutput = tmOutput,
+            TpOutput = tpOutput,
             AnomalyLikelihood = anomalyLikelihood,
             Predictions = predictions,
             Iteration = _iteration,

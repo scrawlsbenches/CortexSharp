@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-This is a **Hierarchical Temporal Memory (HTM)** implementation in C# based on Numenta's BAMI theory and the Thousand Brains Framework. It is a single-file reference architecture (`HtmEnhanced.cs`, ~3900 lines, 18 sections) intended as high-level pseudocode that prioritizes algorithmic clarity while using real C# idioms, types, and patterns.
+This is a **Hierarchical Temporal Memory (HTM)** implementation in C# based on Numenta's BAMI theory and the Thousand Brains Framework. It is a single-file reference architecture (`HtmEnhanced.cs`, ~5000 lines, 18 sections) intended as high-level pseudocode that prioritizes algorithmic clarity while using real C# idioms, types, and patterns.
 
 **Namespace:** `HierarchicalTemporalMemory.Enhanced`
 **Target:** .NET 8+ (C# 12). Uses `System.Numerics`, `System.Runtime.Intrinsics`, `System.Threading.Channels`.
@@ -12,40 +12,42 @@ This is **not** a library you `dotnet build` out of the box — it is a design d
 ## Core HTM Pipeline
 
 ```
-Raw Data → Encoder → Spatial Pooler → Temporal Memory → Predictor
-                                           ↓
-                                    Anomaly Likelihood
+Raw Data → Encoder → Spatial Pooler → Temporal Memory → Temporal Pooler → Predictor
+                                           ↓                   ↓
+                                    Anomaly Likelihood    Stable SDR
+                                                      (sequence-level)
 ```
 
 Every change you make must preserve this pipeline's data flow contract:
 - Encoders produce `SDR` (sparse binary vectors)
 - Spatial Pooler consumes `SDR`, produces `SDR` (fixed sparsity)
 - Temporal Memory consumes `SDR` (columns), produces `TemporalMemoryOutput` (cells + anomaly)
-- Predictor consumes `HashSet<int>` (active cells), produces `Dictionary<int, SdrPrediction>`
+- Temporal Pooler consumes `TemporalMemoryOutput`, produces `TemporalPoolerOutput` (stable pooled SDR for hierarchy)
+- Predictor consumes `HashSet<int>` (active cells from TM), produces `Dictionary<int, SdrPrediction>`
 
 ## File Structure & Section Map
 
 | Section | Lines | Key Types | Purpose |
 |---------|-------|-----------|---------|
 | §1 | 45–376 | `SDR` | SIMD bitvector ops, noise, subsampling, projection |
-| §2 | 377–837 | `ScalarEncoder`, `RDSE`, `DateTimeEncoder`, `CategoryEncoder`, `GeospatialEncoder`, `DeltaEncoder`, `CompositeEncoder` | Raw data → SDR conversion |
-| §3 | 802–1008 | `Synapse`, `DendriteSegment`, `CellSegmentManager` | Synaptic infrastructure + lifecycle |
-| §4 | 1011–1351 | `SpatialPooler`, `SpatialPoolerConfig`, `SpatialPoolerMetrics` | Competitive learning with local/global inhibition |
-| §5 | 1352–1848 | `TemporalMemory`, `TemporalMemoryConfig`, `TemporalMemoryOutput`, `TemporalMemoryMetrics` | Sequence memory + prediction |
-| §5b | — | `TemporalPooler`, `TemporalPoolerConfig`, `TemporalPoolerOutput` | Stable sequence-level pooling for hierarchy |
-| §6 | 1849–1949 | `AnomalyLikelihood` | Statistical anomaly scoring (Welford + Gaussian tail) |
-| §7 | 1950–2052 | `SdrPredictor`, `SdrPrediction` | Multi-step value prediction from cell activity |
-| §8 | 2053–2199 | `GridCellModule`, `GridCellModuleConfig` | Allocentric location via toroidal grid |
-| §9 | 2200–2329 | `DisplacementCellModule` | Relative offset encoding between locations |
-| §10 | 2330–2564 | `CorticalColumn`, `CorticalColumnConfig`, `CorticalColumnOutput` | Feature-at-location processing unit |
-| §11 | 2565–2680 | `LateralVotingMechanism`, `LateralVotingConfig` | Multi-column consensus |
-| §12 | 2681–2847 | `ThousandBrainsEngine`, `ThousandBrainsConfig`, `ThousandBrainsOutput` | Full object learning/recognition |
-| §13 | 2848–3096 | `IRegion`, `SPRegion`, `TMRegion`, `Network`, `RegionLink` | Declarative computation graph |
-| §14 | 3097–3233 | `HtmSerializer` | Binary serialization with magic number + versioning |
-| §15 | 3234–3356 | `HtmDiagnostics`, `SdrQualityReport`, `SystemHealthReport` | Monitoring + SDR quality analysis |
-| §16 | 3357–3580 | `MultiStreamProcessor`, `StreamPipeline`, `StreamConfig` | Concurrent multi-stream via Channels |
-| §17 | 3581–3690 | `HtmEngine`, `HtmEngineConfig`, `HtmResult` | Single-stream convenience orchestrator |
-| §18 | 3691–3909 | `HtmExamples` | Four runnable demo patterns |
+| §2 | 377–839 | `ScalarEncoder`, `RDSE`, `DateTimeEncoder`, `CategoryEncoder`, `GeospatialEncoder`, `DeltaEncoder`, `CompositeEncoder` | Raw data → SDR conversion |
+| §3 | 840–1068 | `Synapse`, `DendriteSegment`, `CellSegmentManager` | Synaptic infrastructure + lifecycle |
+| §4 | 1069–1442 | `SpatialPooler`, `SpatialPoolerConfig`, `SpatialPoolerMetrics` | Competitive learning with local/global inhibition |
+| §5 | 1443–2021 | `TemporalMemory`, `TemporalMemoryConfig`, `TemporalMemoryOutput`, `TemporalMemoryMetrics` | Sequence memory + prediction |
+| §5b | 2022–2138 | `TemporalPooler`, `TemporalPoolerConfig`, `TemporalPoolerOutput` | Stable sequence-level pooling for hierarchy |
+| §6 | 2139–2277 | `AnomalyLikelihood` | Statistical anomaly scoring (Welford + Gaussian tail) |
+| §7 | 2278–2380 | `SdrPredictor`, `SdrPrediction` | Multi-step value prediction from cell activity |
+| §8 | 2381–2527 | `GridCellModule`, `GridCellModuleConfig` | Allocentric location via toroidal grid |
+| §9 | 2528–2657 | `DisplacementCellModule` | Relative offset encoding between locations |
+| §10 | 2658–2892 | `CorticalColumn`, `CorticalColumnConfig`, `CorticalColumnOutput` | Feature-at-location processing unit |
+| §11 | 2893–3008 | `LateralVotingMechanism`, `LateralVotingConfig` | Multi-column consensus |
+| §12 | 3009–3213 | `ThousandBrainsEngine`, `ThousandBrainsConfig`, `ThousandBrainsOutput` | Full object learning/recognition |
+| §13 | 3214–3926 | `IRegion`, `SPRegion`, `TMRegion`, `EncoderRegion`, `PredictorRegion`, `TemporalPoolerRegion`, `Network`, `RegionLink` | Declarative computation graph |
+| §14 | 3927–4285 | `HtmSerializer` | Binary serialization with magic number + versioning |
+| §15 | 4286–4408 | `HtmDiagnostics`, `SdrQualityReport`, `SystemHealthReport` | Monitoring + SDR quality analysis |
+| §16 | 4409–4632 | `MultiStreamProcessor`, `StreamPipeline`, `StreamConfig` | Concurrent multi-stream via Channels |
+| §17 | 4633–4786 | `HtmEngine`, `HtmEngineConfig`, `HtmResult` | Single-stream convenience orchestrator |
+| §18 | 4787–5005 | `HtmExamples` | Four runnable demo patterns |
 
 ## Critical Invariants — Do Not Break
 
@@ -118,7 +120,7 @@ The TM maintains a two-timestep state window. The compute cycle is:
 
 ### Modifying the Spatial Pooler
 - Overlap computation and inhibition are the hot paths. Profile before optimizing.
-- `BumpWeakColumns()` currently has a reflection hack (pseudocode). If implementing for real, add a `BumpPermanences(float amount)` method to `DendriteSegment`.
+- `BumpWeakColumns()` calls `DendriteSegment.BumpAllPermanences()` with `0.1 * ConnectedThreshold` per BAMI. The method uses `CollectionsMarshal.AsSpan()` for zero-copy mutation, consistent with `AdaptSynapses`.
 - Local inhibition creates variable total active counts (unlike global which is exactly `TargetSparsity * ColumnCount`). This is intentional and biologically motivated.
 
 ### Modifying the Temporal Memory
@@ -160,7 +162,10 @@ Bit-count aggregation: each bit's vote count = number of columns with that bit a
 
 Magic number: `0x48544D31` ("HTM1"), followed by version byte, type byte, then type-specific payload.
 - Type `0x01`: SDR (size, activeCount, int[] bits)
+- Type `0x02`: SpatialPooler (config + learned state via `SaveSpatialPooler`/`LoadSpatialPooler`)
+- Type `0x03`: TemporalMemory (config + learned state via `SaveTemporalMemory`/`LoadTemporalMemory`)
 - Type `0x10`: Network (region count, per-region name + type + serialized blob, link count, per-link 4 strings, FNV-1a checksum)
+- Type `0x20`: HtmEngine (iteration + SP config/state + TM config/state via `SaveHtmEngine`/`LoadHtmEngineComponents`)
 - Region blobs are self-describing: config properties followed by learned state. `SPRegion`/`TMRegion` provide static `CreateFromData(name, blob)` factories for reconstruction.
 - `LoadNetwork()` uses a `_regionFactory` dictionary (type name → factory). Custom region types must be registered via `HtmSerializer.RegisterRegionFactory()` before loading.
 - `SaveNetwork()` appends an FNV-1a checksum; `LoadNetwork()` verifies it before parsing.
@@ -201,16 +206,13 @@ When adding tests, validate these properties:
 ## Known Limitations & TODOs
 
 - No GPU acceleration path (see Etaler project for OpenCL reference)
-- `Network` does not support cycles (recurrent connections) — would need iterative settling
-- `AnomalyLikelihood` Welford variance can drift over very long streams — consider periodic resets
-- Category encoder `EncodeWithSimilarity` mutates the category's cached bits (side effect)
 
 ## Remaining Work
 
-See `HTM_IMPLEMENTATION_TASKS.md` for the full prioritized task list. **Tiers 1 and 2 are complete.** Remaining tiers:
+See `HTM_IMPLEMENTATION_TASKS.md` for the full prioritized task list. **Tiers 1, 2, and 3 implementation tasks are complete.** Only task 3.3 (hierarchical multi-region example) remains as a demo/example task. Remaining:
 
-- **Tier 3** — Missing features that extend capability (GPU acceleration stubs, streaming anomaly windowing, multi-object scene support)
-- **Tier 4** — Quality-of-life and hardening (test suite, diagnostic dashboards, config validation)
+- **Tier 3** — One example task: hierarchical multi-region demo (3.3)
+- **Tier 4** — Quality-of-life and hardening (test suite, compilable project, performance profiling, IDisposable lifecycle, logging hooks, serialization hardening)
 
 ## Reference Material
 

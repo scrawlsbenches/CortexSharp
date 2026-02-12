@@ -91,7 +91,7 @@ These are algorithms or concepts that BAMI describes but the implementation does
 - `Reset()` method clears temporal state, treating the next input as the first value.
 - Composable via `CompositeEncoder.AddEncoder<double>("delta", deltaEncoder)` — same `IEncoder<double>` interface as `ScalarEncoder`.
 
-### 3.2 ~~Add a Temporal Pooling layer (§5b)~~ **[L]** — DONE
+### 3.2 ~~Add a Temporal Pooling layer (§5b, §17)~~ **[L]** — DONE
 
 - Implemented `TemporalPooler` as a post-TM processing step (new §5b between TM and Anomaly Likelihood).
 - Evidence-based pooling: each predictive cell accumulates floating-point evidence on each observation, decays by `DecayRate` per step, and is removed when evidence reaches zero.
@@ -99,6 +99,7 @@ These are algorithms or concepts that BAMI describes but the implementation does
 - Output projection: top-evidence cells are projected to a fixed-size SDR via consistent hashing (`HashCode.Combine(cell, ProjectionSeed)`), deterministic for a given evidence state.
 - Stability tracking: output SDR is flagged `IsStable` when overlap with previous output exceeds 70% of target active bits.
 - `Reset()` clears all state for explicit sequence boundaries.
+- **Integrated into `HtmEngine`** (§17) as a standard pipeline step: Encoder → SP → TM → **TP** → Predictor → Anomaly. TP config exposed via `HtmEngineConfig` (`TpAnomalyResetThreshold`, `TpDecayRate`, `TpOutputActiveBits`, `TpProjectionSeed`). `HtmResult` now includes `TpOutput` with the stable pooled SDR, stability flag, and reset indicator.
 
 ### 3.3 Build a hierarchical multi-region example (§13, §18) **[M]**
 
@@ -108,29 +109,40 @@ The `Network` class supports DAG topologies and the `CreateStandardPipeline` fac
 - Add a corresponding example in `HtmExamples` demonstrating that the higher level learns slower, more abstract patterns.
 - This depends on 3.2 (temporal pooling) to produce meaningful inter-level representations.
 
-### 3.4 Implement `Network` support for recurrent connections (§13) **[L]**
+### 3.4 ~~Implement `Network` support for recurrent connections (§13)~~ **[L]** — DONE
 
-CLAUDE.md flags this: "Network does not support cycles (recurrent connections) — would need iterative settling." The current topological sort throws on cycles. Feedback connections are biologically essential (they're how predictions flow top-down).
+- Added `IsFeedback` field to `RegionLink` record (default `false`, backward-compatible positional record).
+- Added `Network.FeedbackLink()` method that creates links marked as feedback. These are excluded from the topological sort so the feedforward subgraph remains a DAG.
+- `TopologicalSort()` now only considers feedforward edges. If feedforward edges alone contain cycles, it still throws (with an improved error message suggesting `FeedbackLink()`).
+- `Compute()` runs an initial feedforward pass, then — only if feedback links exist — enters a settling loop that re-executes all regions (without learning) until outputs converge or `MaxSettlingIterations` is reached.
+- Convergence detection: snapshots feedback-target region outputs before each settling iteration. SDR outputs converge when overlap ratio >= `ConvergenceThreshold` (default 0.95). `HashSet<int>` uses `SetEquals`, floats use epsilon, others use `Equals`.
+- `LastSettlingIterations` property reports how many settling passes the last `Compute()` required (0 for pure feedforward networks).
+- Serialization updated: `SaveNetwork`/`LoadNetwork` now persist the `IsFeedback` flag per link.
+- Removed "Network does not support cycles" from CLAUDE.md Known Limitations.
 
-- Detect cycles during sort and switch to an iterative settling loop for those subgraphs.
-- Add a `MaxSettlingIterations` config and convergence detection (output stability across iterations).
-- Mark feedback links distinctly from feedforward links so the scheduler knows which edges to break.
+### 3.5 ~~Add an Encoder Region for the NetworkAPI (§13)~~ **[S]** — DONE
 
-### 3.5 Add an Encoder Region for the NetworkAPI (§13) **[S]**
+- Implemented `EncoderRegion<T> : IRegion` wrapping any `IEncoder<T>`.
+- Input port: `rawInput` (boxed `T`, PortType.Scalar). Output port: `bottomUpOut` (SDR).
+- Encoders have no learned state, so `Serialize`/`Deserialize` are no-ops.
+- Stateful encoders (e.g. DeltaEncoder) retain internal state; their `Reset()` must be called directly.
 
-The NetworkAPI has `SPRegion` and `TMRegion` but no `EncoderRegion`. To build a complete pipeline in the NetworkAPI (raw data → encoder → SP → TM), the encoder must be wrappable as a region.
+### 3.6 ~~Add a Classifier/Predictor Region for the NetworkAPI (§13)~~ **[S]** — DONE
 
-- Implement `EncoderRegion<T> : IRegion` that wraps any `IEncoder<T>`.
-- Input port: raw value (boxed `T`). Output port: SDR.
-- Enables fully declarative pipeline construction end-to-end.
+- Implemented `PredictorRegion : IRegion` wrapping `SdrPredictor`.
+- Input ports: `activeCells` (CellActivity) + `actualValue` (Scalar, for learning).
+- Output port: `predictions` (new PortType.Predictions).
+- Added `Predictions` value to the `PortType` enum.
+- Predictor re-adapts quickly on resumed input, so state is not serialized.
 
-### 3.6 Add a Classifier/Predictor Region for the NetworkAPI (§13) **[S]**
+### 3.7 Add a TemporalPooler Region for the NetworkAPI (§13) **[S]** — DONE
 
-Same gap as encoders — `SdrPredictor` has no region wrapper.
-
-- Implement `PredictorRegion : IRegion` wrapping `SdrPredictor`.
-- Input port: active cells (`HashSet<int>`). Output port: predictions.
-- Completes the full pipeline: Encoder → SP → TM → Predictor, all in NetworkAPI.
+- Implemented `TemporalPoolerRegion : IRegion` wrapping `TemporalPooler`.
+- Input ports: `predictiveCells` (CellActivity) + `anomaly` (Anomaly) — wires directly to TMRegion outputs.
+- Output port: `bottomUpOut` (SDR) — the stable pooled representation, suitable for feeding a higher-level SP.
+- Constructs a `TemporalMemoryOutput` internally from the two input ports.
+- Evidence re-accumulates quickly, so state is not serialized.
+- Together with 3.5 and 3.6, completes the full NetworkAPI pipeline: Encoder → SP → TM → TP → Predictor.
 
 ---
 
@@ -177,6 +189,6 @@ The `MultiStreamProcessor` creates background tasks via `Channel<T>` but has no 
 
 ### 4.6 Harden the serialization format (§14) **[S]**
 
-- Actually write and verify the FNV-1a checksum during save/load (it's implemented but unused).
+- ~~Actually write and verify the FNV-1a checksum during save/load~~ — DONE (completed as part of Tier 1 task 1.3: `SaveNetwork` writes FNV-1a checksum, `LoadNetwork` verifies it before parsing).
 - Add a format version migration path so that v2 can read v1 files.
 - Handle endianness explicitly for cross-platform compatibility.
