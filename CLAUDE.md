@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-This is a **Hierarchical Temporal Memory (HTM)** implementation in C# based on Numenta's BAMI theory and the Thousand Brains Framework. It is a single-file reference architecture (`HtmEnhanced.cs`, ~4875 lines, 18 sections) intended as high-level pseudocode that prioritizes algorithmic clarity while using real C# idioms, types, and patterns.
+This is a **Hierarchical Temporal Memory (HTM)** implementation in C# based on Numenta's BAMI theory and the Thousand Brains Framework. It is a single-file reference architecture (`HtmEnhanced.cs`, ~5000 lines, 18 sections) intended as high-level pseudocode that prioritizes algorithmic clarity while using real C# idioms, types, and patterns.
 
 **Namespace:** `HierarchicalTemporalMemory.Enhanced`
 **Target:** .NET 8+ (C# 12). Uses `System.Numerics`, `System.Runtime.Intrinsics`, `System.Threading.Channels`.
@@ -42,12 +42,12 @@ Every change you make must preserve this pipeline's data flow contract:
 | §10 | 2658–2892 | `CorticalColumn`, `CorticalColumnConfig`, `CorticalColumnOutput` | Feature-at-location processing unit |
 | §11 | 2893–3008 | `LateralVotingMechanism`, `LateralVotingConfig` | Multi-column consensus |
 | §12 | 3009–3213 | `ThousandBrainsEngine`, `ThousandBrainsConfig`, `ThousandBrainsOutput` | Full object learning/recognition |
-| §13 | 3214–3800 | `IRegion`, `SPRegion`, `TMRegion`, `EncoderRegion`, `PredictorRegion`, `TemporalPoolerRegion`, `Network`, `RegionLink` | Declarative computation graph |
-| §14 | 3801–4154 | `HtmSerializer` | Binary serialization with magic number + versioning |
-| §15 | 4155–4277 | `HtmDiagnostics`, `SdrQualityReport`, `SystemHealthReport` | Monitoring + SDR quality analysis |
-| §16 | 4278–4501 | `MultiStreamProcessor`, `StreamPipeline`, `StreamConfig` | Concurrent multi-stream via Channels |
-| §17 | 4502–4655 | `HtmEngine`, `HtmEngineConfig`, `HtmResult` | Single-stream convenience orchestrator |
-| §18 | 4656–4874 | `HtmExamples` | Four runnable demo patterns |
+| §13 | 3214–3926 | `IRegion`, `SPRegion`, `TMRegion`, `EncoderRegion`, `PredictorRegion`, `TemporalPoolerRegion`, `Network`, `RegionLink` | Declarative computation graph |
+| §14 | 3927–4285 | `HtmSerializer` | Binary serialization with magic number + versioning |
+| §15 | 4286–4408 | `HtmDiagnostics`, `SdrQualityReport`, `SystemHealthReport` | Monitoring + SDR quality analysis |
+| §16 | 4409–4632 | `MultiStreamProcessor`, `StreamPipeline`, `StreamConfig` | Concurrent multi-stream via Channels |
+| §17 | 4633–4786 | `HtmEngine`, `HtmEngineConfig`, `HtmResult` | Single-stream convenience orchestrator |
+| §18 | 4787–5005 | `HtmExamples` | Four runnable demo patterns |
 
 ## Critical Invariants — Do Not Break
 
@@ -206,13 +206,12 @@ When adding tests, validate these properties:
 ## Known Limitations & TODOs
 
 - No GPU acceleration path (see Etaler project for OpenCL reference)
-- `Network` does not support cycles (recurrent connections) — would need iterative settling
 
 ## Remaining Work
 
-See `HTM_IMPLEMENTATION_TASKS.md` for the full prioritized task list. **Tiers 1 and 2 are complete.** Tier 3 tasks 3.1 (DeltaEncoder), 3.2 (TemporalPooler), 3.5 (EncoderRegion), and 3.6 (PredictorRegion) are also complete, along with a TemporalPoolerRegion. Remaining tiers:
+See `HTM_IMPLEMENTATION_TASKS.md` for the full prioritized task list. **Tiers 1, 2, and 3 implementation tasks are complete.** Only task 3.3 (hierarchical multi-region example) remains as a demo/example task. Remaining:
 
-- **Tier 3** — Missing features that extend capability (hierarchical multi-region example, recurrent network connections)
+- **Tier 3** — One example task: hierarchical multi-region demo (3.3)
 - **Tier 4** — Quality-of-life and hardening (test suite, compilable project, performance profiling, IDisposable lifecycle, logging hooks, serialization hardening)
 
 ## Reference Material

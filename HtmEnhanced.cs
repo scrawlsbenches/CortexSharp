@@ -3247,10 +3247,12 @@ public interface IRegion
     void Deserialize(byte[] data);
 }
 
-/// Link between two region ports
+/// Link between two region ports. Feedback links create cycles in the graph
+/// and are handled via iterative settling rather than topological ordering.
 public record RegionLink(
     string SourceRegion, string SourcePort,
-    string TargetRegion, string TargetPort);
+    string TargetRegion, string TargetPort,
+    bool IsFeedback = false);
 
 /// Wraps the Spatial Pooler as a NetworkAPI region
 public sealed class SPRegion : IRegion
@@ -3680,50 +3682,95 @@ public sealed class TemporalPoolerRegion : IRegion
     public void Deserialize(byte[] data) { }
 }
 
-/// The NetworkAPI computation graph: manages regions, links, and execution order
+/// The NetworkAPI computation graph: manages regions, links, and execution order.
+/// Supports both feedforward DAGs (topological execution) and recurrent graphs
+/// (feedback links handled via iterative settling with convergence detection).
 public sealed class Network
 {
     private readonly Dictionary<string, IRegion> _regions = new();
     private readonly List<RegionLink> _links = new();
-    private List<string>? _executionOrder;  // Topologically sorted
+    private List<string>? _executionOrder;  // Topologically sorted (ignoring feedback)
+    private HashSet<string>? _feedbackTargets; // Regions that receive feedback input
 
     public IReadOnlyDictionary<string, IRegion> Regions => _regions;
     public IReadOnlyList<RegionLink> Links => _links;
 
+    /// Maximum settling iterations for resolving feedback connections.
+    /// Only used when the network contains feedback links.
+    public int MaxSettlingIterations { get; set; } = 10;
+
+    /// Convergence threshold for settling. For SDR outputs, this is the
+    /// minimum overlap ratio (overlap / activeBits) between successive
+    /// iterations. For other types, exact equality is required.
+    public float ConvergenceThreshold { get; set; } = 0.95f;
+
+    /// Number of settling iterations used in the last Compute() call.
+    /// 0 for pure feedforward networks.
+    public int LastSettlingIterations { get; private set; }
+
     public Network AddRegion(IRegion region)
     {
         _regions[region.Name] = region;
-        _executionOrder = null; // Invalidate
+        _executionOrder = null;
+        _feedbackTargets = null;
         return this;
     }
 
+    /// Add a feedforward link between two region ports.
     public Network Link(
         string sourceRegion, string sourcePort,
         string targetRegion, string targetPort)
     {
         _links.Add(new RegionLink(sourceRegion, sourcePort, targetRegion, targetPort));
         _executionOrder = null;
+        _feedbackTargets = null;
         return this;
     }
 
-    /// Compute one timestep: propagate data through all regions in topological order
+    /// Add a feedback (recurrent) link. Feedback links are excluded from
+    /// topological sort and resolved via iterative settling. Use these for
+    /// top-down predictions, lateral connections, or any cycle-creating edge.
+    public Network FeedbackLink(
+        string sourceRegion, string sourcePort,
+        string targetRegion, string targetPort)
+    {
+        _links.Add(new RegionLink(sourceRegion, sourcePort, targetRegion, targetPort, IsFeedback: true));
+        _executionOrder = null;
+        _feedbackTargets = null;
+        return this;
+    }
+
+    /// Compute one timestep. For pure feedforward networks, runs a single
+    /// topological pass. For networks with feedback links, runs an initial
+    /// feedforward pass followed by settling iterations until convergence
+    /// or MaxSettlingIterations is reached.
     public void Compute(bool learn = true)
     {
         _executionOrder ??= TopologicalSort();
+        _feedbackTargets ??= BuildFeedbackTargets();
 
-        foreach (string regionName in _executionOrder)
+        // Pass 1: feedforward — propagate all links, compute in topological order
+        ExecutePass(learn);
+
+        // Pass 2+: settling loop (only if feedback links exist)
+        if (_feedbackTargets.Count > 0)
         {
-            var region = _regions[regionName];
-
-            // Gather inputs from upstream regions
-            foreach (var link in _links.Where(l => l.TargetRegion == regionName))
+            LastSettlingIterations = 0;
+            for (int i = 0; i < MaxSettlingIterations; i++)
             {
-                var sourceRegion = _regions[link.SourceRegion];
-                var value = sourceRegion.GetOutput(link.SourcePort);
-                region.SetInput(link.TargetPort, value);
-            }
+                var snapshots = SnapshotFeedbackTargetOutputs();
 
-            region.Compute(learn);
+                // Settling passes don't learn — learning only on the initial pass
+                ExecutePass(learn: false);
+                LastSettlingIterations = i + 1;
+
+                if (HasConverged(snapshots))
+                    break;
+            }
+        }
+        else
+        {
+            LastSettlingIterations = 0;
         }
     }
 
@@ -3738,13 +3785,91 @@ public sealed class Network
         foreach (var region in _regions.Values) region.Reset();
     }
 
-    /// Topological sort of regions based on link dependencies
+    /// Execute one pass through all regions in topological order,
+    /// propagating data through ALL links (including feedback).
+    private void ExecutePass(bool learn)
+    {
+        foreach (string regionName in _executionOrder!)
+        {
+            var region = _regions[regionName];
+
+            // Gather inputs from all upstream links (feedforward and feedback)
+            foreach (var link in _links.Where(l => l.TargetRegion == regionName))
+            {
+                var sourceRegion = _regions[link.SourceRegion];
+                var value = sourceRegion.GetOutput(link.SourcePort);
+                region.SetInput(link.TargetPort, value);
+            }
+
+            region.Compute(learn);
+        }
+    }
+
+    /// Snapshot the current output of every output port on feedback-target regions.
+    private Dictionary<(string Region, string Port), object> SnapshotFeedbackTargetOutputs()
+    {
+        var snapshots = new Dictionary<(string, string), object>();
+        foreach (string regionName in _feedbackTargets!)
+        {
+            var region = _regions[regionName];
+            foreach (var port in region.OutputPorts)
+            {
+                var value = region.GetOutput(port.Name);
+                // Clone SDRs and cell sets so the snapshot isn't a reference to live state
+                object snapshot = value switch
+                {
+                    SDR sdr => sdr, // SDR is effectively immutable (new instance each Compute)
+                    HashSet<int> cells => new HashSet<int>(cells),
+                    _ => value,
+                };
+                snapshots[(regionName, port.Name)] = snapshot;
+            }
+        }
+        return snapshots;
+    }
+
+    /// Check if feedback-target outputs have converged compared to snapshots.
+    private bool HasConverged(Dictionary<(string Region, string Port), object> snapshots)
+    {
+        foreach (var ((regionName, portName), previous) in snapshots)
+        {
+            var current = _regions[regionName].GetOutput(portName);
+
+            bool portConverged = (previous, current) switch
+            {
+                (SDR prevSdr, SDR curSdr) =>
+                    prevSdr.ActiveCount > 0
+                    && curSdr.ActiveCount > 0
+                    && prevSdr.Overlap(curSdr) >= (int)(Math.Min(prevSdr.ActiveCount, curSdr.ActiveCount) * ConvergenceThreshold),
+
+                (HashSet<int> prevCells, HashSet<int> curCells) =>
+                    prevCells.SetEquals(curCells),
+
+                (float prevFloat, float curFloat) =>
+                    Math.Abs(prevFloat - curFloat) < 0.001f,
+
+                _ => Equals(previous, current),
+            };
+
+            if (!portConverged) return false;
+        }
+        return true;
+    }
+
+    /// Identify regions that are targets of feedback links.
+    private HashSet<string> BuildFeedbackTargets()
+        => _links.Where(l => l.IsFeedback).Select(l => l.TargetRegion).ToHashSet();
+
+    /// Topological sort ignoring feedback edges. Feedback links are excluded
+    /// so the feedforward subgraph forms a DAG. If the feedforward edges alone
+    /// contain cycles, that is still an error.
     private List<string> TopologicalSort()
     {
         var inDegree = _regions.Keys.ToDictionary(k => k, _ => 0);
         var adjacency = _regions.Keys.ToDictionary(k => k, _ => new List<string>());
 
-        foreach (var link in _links)
+        // Only count feedforward links for topological ordering
+        foreach (var link in _links.Where(l => !l.IsFeedback))
         {
             adjacency[link.SourceRegion].Add(link.TargetRegion);
             inDegree[link.TargetRegion]++;
@@ -3767,7 +3892,8 @@ public sealed class Network
         }
 
         if (sorted.Count != _regions.Count)
-            throw new InvalidOperationException("Cycle detected in network graph");
+            throw new InvalidOperationException(
+                "Cycle detected in feedforward links. Use FeedbackLink() for recurrent connections.");
 
         return sorted;
     }
@@ -3930,6 +4056,7 @@ public static class HtmSerializer
             bw.Write(link.SourcePort);
             bw.Write(link.TargetRegion);
             bw.Write(link.TargetPort);
+            bw.Write(link.IsFeedback);
         }
 
         // Append checksum
@@ -4000,7 +4127,11 @@ public static class HtmSerializer
             string sourcePort = br.ReadString();
             string targetRegion = br.ReadString();
             string targetPort = br.ReadString();
-            network.Link(sourceRegion, sourcePort, targetRegion, targetPort);
+            bool isFeedback = br.ReadBoolean();
+            if (isFeedback)
+                network.FeedbackLink(sourceRegion, sourcePort, targetRegion, targetPort);
+            else
+                network.Link(sourceRegion, sourcePort, targetRegion, targetPort);
         }
 
         return network;

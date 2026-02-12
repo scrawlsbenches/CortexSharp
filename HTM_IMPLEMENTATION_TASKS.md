@@ -109,13 +109,16 @@ The `Network` class supports DAG topologies and the `CreateStandardPipeline` fac
 - Add a corresponding example in `HtmExamples` demonstrating that the higher level learns slower, more abstract patterns.
 - This depends on 3.2 (temporal pooling) to produce meaningful inter-level representations.
 
-### 3.4 Implement `Network` support for recurrent connections (§13) **[L]**
+### 3.4 ~~Implement `Network` support for recurrent connections (§13)~~ **[L]** — DONE
 
-CLAUDE.md flags this: "Network does not support cycles (recurrent connections) — would need iterative settling." The current topological sort throws on cycles. Feedback connections are biologically essential (they're how predictions flow top-down).
-
-- Detect cycles during sort and switch to an iterative settling loop for those subgraphs.
-- Add a `MaxSettlingIterations` config and convergence detection (output stability across iterations).
-- Mark feedback links distinctly from feedforward links so the scheduler knows which edges to break.
+- Added `IsFeedback` field to `RegionLink` record (default `false`, backward-compatible positional record).
+- Added `Network.FeedbackLink()` method that creates links marked as feedback. These are excluded from the topological sort so the feedforward subgraph remains a DAG.
+- `TopologicalSort()` now only considers feedforward edges. If feedforward edges alone contain cycles, it still throws (with an improved error message suggesting `FeedbackLink()`).
+- `Compute()` runs an initial feedforward pass, then — only if feedback links exist — enters a settling loop that re-executes all regions (without learning) until outputs converge or `MaxSettlingIterations` is reached.
+- Convergence detection: snapshots feedback-target region outputs before each settling iteration. SDR outputs converge when overlap ratio >= `ConvergenceThreshold` (default 0.95). `HashSet<int>` uses `SetEquals`, floats use epsilon, others use `Equals`.
+- `LastSettlingIterations` property reports how many settling passes the last `Compute()` required (0 for pure feedforward networks).
+- Serialization updated: `SaveNetwork`/`LoadNetwork` now persist the `IsFeedback` flag per link.
+- Removed "Network does not support cycles" from CLAUDE.md Known Limitations.
 
 ### 3.5 ~~Add an Encoder Region for the NetworkAPI (§13)~~ **[S]** — DONE
 
