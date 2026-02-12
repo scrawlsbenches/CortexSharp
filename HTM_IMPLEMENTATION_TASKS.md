@@ -46,43 +46,37 @@ These are things that exist in the code right now as non-functional placeholders
 
 These work at a basic level but have gaps that limit correctness, robustness, or coverage.
 
-### 2.1 Fix `CategoryEncoder.EncodeWithSimilarity()` mutation side effect (§2) **[S]**
+### 2.1 ~~Fix `CategoryEncoder.EncodeWithSimilarity()` mutation side effect (§2)~~ **[S]** — DONE
 
-Line 666: `_categoryBits[value] = result` overwrites the category's canonical encoding. If you call `EncodeWithSimilarity("cat", "dog", 5)` and then later call `Encode("cat")`, you get the mutated bits, not the original. This violates the encoder contract (same input → same output).
+- Removed the `_categoryBits[value] = result` write-back in `EncodeWithSimilarity()`. The method now computes and returns a similarity-adjusted SDR without mutating the category's canonical encoding.
+- `Encode(value)` now always returns the original encoding regardless of prior `EncodeWithSimilarity()` calls, preserving the encoder contract (same input → same output).
 
-- Compute and return the similarity-adjusted SDR without writing it back to `_categoryBits`.
-- If the caller needs persistent similarity relationships, provide a separate `SetSimilarity()` method or a similarity graph at construction time.
+### 2.2 ~~Add `AnomalyLikelihood` Welford variance reset mechanism (§6)~~ **[S]** — DONE
 
-### 2.2 Add `AnomalyLikelihood` Welford variance reset mechanism (§6) **[S]**
+- Changed `_reestimationPeriod` (unused float) to `_reestimationInterval` (configurable int, default: 10× window size).
+- Added `ReestimateFromHistory()` private method that recomputes `_mean`/`_m2` from the current `_scoreHistory` queue contents.
+- Re-estimation triggers every `_reestimationInterval` iterations (after the learning period), discarding accumulated Welford drift and tracking only the recent distribution.
+- Constructor accepts optional `reestimationInterval` parameter; 0 uses the default (10× window size).
 
-CLAUDE.md flags this: "Welford variance can drift over very long streams." The running mean/M2 accumulator has no decay, so after millions of iterations the statistics become dominated by ancient history and stop tracking regime changes.
+### 2.3 ~~Implement full SP/TM serialization for standalone use (§14)~~ **[M]** — DONE
 
-- Add a configurable `reestimationInterval` (default: 10× window size).
-- When hit, reinitialize mean/M2 from the current `_scoreHistory` queue contents rather than the full lifetime accumulator.
-- Alternatively, switch to an exponentially weighted variance estimator that naturally forgets.
+- Added `SaveSpatialPooler()`/`LoadSpatialPooler()` to `HtmSerializer` — type byte `0x02`, writes config + learned state.
+- Added `SaveTemporalMemory()`/`LoadTemporalMemory()` to `HtmSerializer` — type byte `0x03`, writes config + learned state.
+- Added `SaveHtmEngine()`/`LoadHtmEngineComponents()` to `HtmSerializer` — type byte `0x20`, writes iteration + SP config/state + TM config/state.
+- `HtmEngine` now stores `_spConfig`/`_tmConfig` as fields and exposes `Save(string path)`/`Load(string path)` convenience methods.
+- Predictor and anomaly likelihood are not serialized (they re-adapt quickly on resumed input).
 
-### 2.3 Implement full SP/TM serialization for standalone use (§14) **[M]**
+### 2.4 ~~Implement `Network` deserialization with region type registry (§13, §14)~~ **[M]** — DONE (completed as part of Tier 1 task 1.3)
 
-The serializer handles SDRs and Network topology, but there is no way to serialize a standalone `SpatialPooler` or `TemporalMemory` outside of the NetworkAPI. The `HtmEngine` (§17) composes SP+TM directly, not via Network, so it has no save/load path.
+- Already implemented: `_regionFactory` dictionary in `HtmSerializer` with pre-registered `SPRegion` and `TMRegion` factories.
+- `RegisterRegionFactory()` allows user registration of custom region types.
+- `LoadNetwork()` reads saved format, verifies FNV-1a checksum, and reconstructs regions via the factory.
 
-- Add `SerializeSpatialPooler(SpatialPooler sp)` and `SerializeTemporalMemory(TemporalMemory tm)` to `HtmSerializer`.
-- Add corresponding deserializers that reconstruct a fully trained instance.
-- Wire these into `HtmEngine` as `Save(string path)` / `Load(string path)` convenience methods.
+### 2.5 ~~Add `TMRegion` and `SPRegion` reset with proper state clearing (§13)~~ **[S]** — DONE
 
-### 2.4 Implement `Network` deserialization with region type registry (§13, §14) **[M]**
-
-`SaveNetwork` writes the fully qualified type name string for each region, but there is no mechanism to map that string back to a constructor. The Network class also has no `Deserialize` method.
-
-- Add a static `RegionFactory` that maps type names to factory functions: `Dictionary<string, Func<string, byte[], IRegion>>`.
-- Pre-register `SPRegion` and `TMRegion`. Allow user registration for custom regions.
-- Implement `LoadNetwork()` using this factory.
-
-### 2.5 Add `TMRegion` and `SPRegion` reset with proper state clearing (§13) **[S]**
-
-`SPRegion.Reset()` and `TMRegion.Reset()` are empty method bodies. For the NetworkAPI to support multi-sequence learning (reset between sequences), these need to actually clear TM cell state and, optionally, SP duty cycles.
-
-- `TMRegion.Reset()`: clear active/winner/predictive cell sets and segment caches; do not clear learned synapses.
-- `SPRegion.Reset()`: optional — may be a no-op for SP, but document the decision.
+- Added `TemporalMemory.Reset()` — clears all six cell state sets (`_activeCells`, `_winnerCells`, `_predictiveCells` + their `_prev*` counterparts) and both segment caches. Preserves learned synapses and segments.
+- `TMRegion.Reset()` now calls `_tm.Reset()` and clears `_lastOutput`.
+- `SPRegion.Reset()` remains a no-op with documentation: SP has no temporal state; duty cycles and boost factors are long-term learning statistics that should persist across sequences.
 
 ---
 

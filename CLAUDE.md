@@ -206,9 +206,8 @@ When adding tests, validate these properties:
 
 ## Remaining Work
 
-See `HTM_IMPLEMENTATION_TASKS.md` for the full prioritized task list. **Tier 1 is complete.** Remaining tiers:
+See `HTM_IMPLEMENTATION_TASKS.md` for the full prioritized task list. **Tiers 1 and 2 are complete.** Remaining tiers:
 
-- **Tier 2** — Improve partially implemented features (AnomalyLikelihood variance reset, CategoryEncoder side-effect fix, Network cycle detection, local inhibition radius auto-tuning)
 - **Tier 3** — Missing features that extend capability (GPU acceleration stubs, streaming anomaly windowing, multi-object scene support)
 - **Tier 4** — Quality-of-life and hardening (test suite, diagnostic dashboards, config validation)
 
