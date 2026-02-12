@@ -7,7 +7,7 @@ This is a **Hierarchical Temporal Memory (HTM)** implementation in C# based on N
 **Namespace:** `HierarchicalTemporalMemory.Enhanced`
 **Target:** .NET 8+ (C# 12). Uses `System.Numerics`, `System.Runtime.Intrinsics`, `System.Threading.Channels`.
 
-This is **not** a library you `dotnet build` out of the box — it is a design document expressed as compilable-shaped code. Some sections use reflection hacks or elide full implementations (marked with comments). Treat it as the authoritative architectural blueprint.
+This is **not** a library you `dotnet build` out of the box — it is a design document expressed as compilable-shaped code. Treat it as the authoritative architectural blueprint.
 
 ## Core HTM Pipeline
 
@@ -55,8 +55,8 @@ Every change you make must preserve this pipeline's data flow contract:
 - SDR size (`_size`) is immutable after construction. Binary operations (`Union`, `Intersect`, etc.) assert matching sizes.
 
 ### Synapse/Segment Invariants
-- `CellSegmentManager` enforces `_maxSegmentsPerCell` via LRU eviction in `CreateSegment()`. Never bypass this by adding segments directly to the internal list.
-- `DendriteSegment.AdaptSynapses()` uses `CollectionsMarshal.AsSpan()` for zero-copy mutation. This is intentional — the synapses list is mutated in-place for performance.
+- `CellSegmentManager` enforces `_maxSegmentsPerCell` via LRU eviction in `CreateSegment()`. Never bypass this by adding segments directly to the internal list. The `RestoreSegment()` method is **only** for deserialization — it does not enforce LRU.
+- `DendriteSegment.AdaptSynapses()` and `BumpAllPermanences()` use `CollectionsMarshal.AsSpan()` for zero-copy mutation. This is intentional — the synapses list is mutated in-place for performance.
 - Segment cleanup (`CellSegmentManager.Maintain()`) is called periodically by TM, not on every step. The interval is `TemporalMemoryConfig.SegmentCleanupInterval`.
 
 ### Temporal Memory State Machine
@@ -73,8 +73,10 @@ The TM maintains a two-timestep state window. The compute cycle is:
 ### Thousand Brains Contracts
 - `CorticalColumn.Compute()` must always call `_featureSP.Compute()` then `_sequenceTM.Compute()` in that order.
 - `CorticalColumn.ReceiveLateralInput()` modifies `_currentObjectRepresentation` in-place. The voting loop calls this iteratively.
-- `ThousandBrainsEngine.Process()` path: grid move → column compute → lateral voting loop → recognition match.
-- `StartNewObject()` must be called before learning a new object; it resets all columns' object representations.
+- `ThousandBrainsEngine.Process()` path: grid move → column compute → lateral voting loop → recognition match → displacement prediction.
+- Displacement cells compute displacements between consecutive grid locations during learning (stored per object in `_objectDisplacements`), and predict next location during recognition via `PredictTarget()`.
+- `StartNewObject()` must be called before learning a new object; it resets all columns' object representations **and** displacement state (`_prevGridLocations`, `_currentDisplacements`).
+- `LearnObject()` stores the current displacement sequence alongside the consensus SDR.
 
 ## Coding Conventions
 
@@ -157,8 +159,10 @@ Bit-count aggregation: each bit's vote count = number of columns with that bit a
 
 Magic number: `0x48544D31` ("HTM1"), followed by version byte, type byte, then type-specific payload.
 - Type `0x01`: SDR (size, activeCount, int[] bits)
-- Type `0x10`: Network (region count, per-region name + type + serialized blob, link count, per-link 4 strings)
-- Checksum: FNV-1a over raw bytes.
+- Type `0x10`: Network (region count, per-region name + type + serialized blob, link count, per-link 4 strings, FNV-1a checksum)
+- Region blobs are self-describing: config properties followed by learned state. `SPRegion`/`TMRegion` provide static `CreateFromData(name, blob)` factories for reconstruction.
+- `LoadNetwork()` uses a `_regionFactory` dictionary (type name → factory). Custom region types must be registered via `HtmSerializer.RegisterRegionFactory()` before loading.
+- `SaveNetwork()` appends an FNV-1a checksum; `LoadNetwork()` verifies it before parsing.
 
 ## Testing Guidelines
 
@@ -195,13 +199,18 @@ When adding tests, validate these properties:
 
 ## Known Limitations & TODOs
 
-- `SpatialPooler.BumpWeakColumns()` uses reflection to access private field — needs proper API
-- `IRegion.Serialize()`/`Deserialize()` return empty arrays — implement per-region state serialization
-- `ThousandBrainsEngine` displacement cell predictions (§12 step 5) are stubbed
 - No GPU acceleration path (see Etaler project for OpenCL reference)
 - `Network` does not support cycles (recurrent connections) — would need iterative settling
 - `AnomalyLikelihood` Welford variance can drift over very long streams — consider periodic resets
 - Category encoder `EncodeWithSimilarity` mutates the category's cached bits (side effect)
+
+## Remaining Work
+
+See `HTM_IMPLEMENTATION_TASKS.md` for the full prioritized task list. **Tier 1 is complete.** Remaining tiers:
+
+- **Tier 2** — Improve partially implemented features (AnomalyLikelihood variance reset, CategoryEncoder side-effect fix, Network cycle detection, local inhibition radius auto-tuning)
+- **Tier 3** — Missing features that extend capability (GPU acceleration stubs, streaming anomaly windowing, multi-object scene support)
+- **Tier 4** — Quality-of-life and hardening (test suite, diagnostic dashboards, config validation)
 
 ## Reference Material
 
