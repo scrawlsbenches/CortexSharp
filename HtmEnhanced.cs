@@ -663,7 +663,6 @@ public sealed class CategoryEncoder : IEncoder<string>
         }
 
         var result = valueBits.OrderBy(x => x).ToArray();
-        _categoryBits[value] = result;
         return new SDR(OutputSize, result);
     }
 }
@@ -1826,6 +1825,22 @@ public sealed class TemporalMemory
     public HashSet<int> GetWinnerCells() => new(_winnerCells);
     public HashSet<int> GetPredictiveCells() => new(_predictiveCells);
 
+    /// Reset transient cell state for sequence boundary (e.g., between independent
+    /// sequences). Clears active/winner/predictive cells and segment caches so the
+    /// TM does not carry temporal context across sequence boundaries.
+    /// Learned synapses and segments are preserved.
+    public void Reset()
+    {
+        _activeCells.Clear();
+        _winnerCells.Clear();
+        _predictiveCells.Clear();
+        _prevActiveCells.Clear();
+        _prevWinnerCells.Clear();
+        _prevPredictiveCells.Clear();
+        _activeSegmentCache.Clear();
+        _matchingSegmentCache.Clear();
+    }
+
     /// Get the predicted columns for the NEXT timestep
     public HashSet<int> GetPredictedColumns()
         => _predictiveCells.Select(CellColumn).ToHashSet();
@@ -1977,7 +1992,7 @@ public sealed class AnomalyLikelihood
 {
     private readonly int _windowSize;
     private readonly int _learningPeriod;
-    private readonly float _reestimationPeriod;
+    private readonly int _reestimationInterval;
     private readonly Queue<float> _scoreHistory;
     private int _iteration;
 
@@ -1993,14 +2008,19 @@ public sealed class AnomalyLikelihood
     public float LastLikelihood { get; private set; }
     public float SmoothedAnomaly => _smoothedAnomaly;
 
+    /// <param name="reestimationInterval">
+    /// How often (in iterations) to reinitialize running statistics from the
+    /// score history window, preventing Welford drift over very long streams.
+    /// Default: 10 * windowSize. Set to 0 to disable re-estimation.
+    /// </param>
     public AnomalyLikelihood(
         int windowSize = 1000, int learningPeriod = 300,
-        float smoothingAlpha = 0.1f)
+        float smoothingAlpha = 0.1f, int reestimationInterval = 0)
     {
         _windowSize = windowSize;
         _learningPeriod = learningPeriod;
         _smoothingAlpha = smoothingAlpha;
-        _reestimationPeriod = windowSize / 10f;
+        _reestimationInterval = reestimationInterval > 0 ? reestimationInterval : windowSize * 10;
         _scoreHistory = new Queue<float>(windowSize + 1);
     }
 
@@ -2026,6 +2046,16 @@ public sealed class AnomalyLikelihood
         _m2 += delta * delta2;
         _variance = _iteration > 1 ? _m2 / (Math.Min(_iteration, _windowSize) - 1) : 0;
 
+        // Periodic re-estimation: recompute mean/variance from the current score
+        // history window to prevent Welford drift over very long streams.
+        if (_reestimationInterval > 0
+            && _iteration > _learningPeriod
+            && _iteration % _reestimationInterval == 0
+            && _scoreHistory.Count > 1)
+        {
+            ReestimateFromHistory();
+        }
+
         // During learning period, return neutral
         if (_iteration < _learningPeriod)
             return LastLikelihood = 0.5f;
@@ -2044,6 +2074,29 @@ public sealed class AnomalyLikelihood
         float logLikelihood = (float)(1.0 - Math.Exp(-Math.Log(1.0 / Math.Max(1e-10, 1.0 - likelihood))));
 
         return LastLikelihood = Math.Clamp(logLikelihood, 0f, 1f);
+    }
+
+    /// Reinitialize running statistics from the current score history window.
+    /// This discards accumulated Welford state and recomputes from scratch,
+    /// ensuring statistics track the recent distribution rather than lifetime history.
+    private void ReestimateFromHistory()
+    {
+        double sum = 0;
+        foreach (float score in _scoreHistory)
+            sum += score;
+
+        int n = _scoreHistory.Count;
+        _mean = sum / n;
+
+        double m2 = 0;
+        foreach (float score in _scoreHistory)
+        {
+            double d = score - _mean;
+            m2 += d * d;
+        }
+
+        _m2 = m2;
+        _variance = n > 1 ? _m2 / (n - 1) : 0;
     }
 
     /// Standard normal CDF approximation (Abramowitz & Stegun)
@@ -3083,6 +3136,8 @@ public sealed class SPRegion : IRegion
     public void Compute(bool learn = true)
         => _output = _sp.Compute(_input, learn);
 
+    /// SP has no temporal state to reset. Duty cycles and boost factors are
+    /// long-term learning statistics that should persist across sequences.
     public void Reset() { }
 
     public byte[] Serialize()
@@ -3199,7 +3254,12 @@ public sealed class TMRegion : IRegion
     public void Compute(bool learn = true)
         => _lastOutput = _tm.Compute(_input, learn);
 
-    public void Reset() { }
+    /// Clear TM cell state for sequence boundaries. Preserves learned synapses.
+    public void Reset()
+    {
+        _tm.Reset();
+        _lastOutput = null;
+    }
 
     public byte[] Serialize()
     {
@@ -3608,6 +3668,137 @@ public static class HtmSerializer
         }
         return hash;
     }
+
+    // --- Standalone SP/TM serialization (outside NetworkAPI) ---
+
+    /// Save a standalone SpatialPooler (config + learned state) to a file.
+    public static void SaveSpatialPooler(
+        SpatialPooler sp, SpatialPoolerConfig config, string filePath)
+    {
+        using var ms = new MemoryStream();
+        using var bw = new BinaryWriter(ms);
+
+        bw.Write(MagicNumber);
+        bw.Write((byte)FormatVersion);
+        bw.Write((byte)0x02); // Type: SpatialPooler
+        SPRegion.WriteSPConfig(bw, config);
+        sp.SerializeState(bw);
+
+        File.WriteAllBytes(filePath, ms.ToArray());
+    }
+
+    /// Load a standalone SpatialPooler from a file.
+    /// Returns a fully reconstructed SP with config and learned state.
+    public static (SpatialPooler SP, SpatialPoolerConfig Config) LoadSpatialPooler(string filePath)
+    {
+        var data = File.ReadAllBytes(filePath);
+        using var ms = new MemoryStream(data);
+        using var br = new BinaryReader(ms);
+
+        uint magic = br.ReadUInt32();
+        if (magic != MagicNumber) throw new FormatException("Invalid HTM format");
+
+        byte version = br.ReadByte();
+        byte type = br.ReadByte();
+        if (type != 0x02) throw new FormatException("Not a SpatialPooler file");
+
+        var config = SPRegion.ReadSPConfig(br);
+        var sp = new SpatialPooler(config);
+        sp.DeserializeState(br);
+
+        return (sp, config);
+    }
+
+    /// Save a standalone TemporalMemory (config + learned state) to a file.
+    public static void SaveTemporalMemory(
+        TemporalMemory tm, TemporalMemoryConfig config, string filePath)
+    {
+        using var ms = new MemoryStream();
+        using var bw = new BinaryWriter(ms);
+
+        bw.Write(MagicNumber);
+        bw.Write((byte)FormatVersion);
+        bw.Write((byte)0x03); // Type: TemporalMemory
+        TMRegion.WriteTMConfig(bw, config);
+        tm.SerializeState(bw);
+
+        File.WriteAllBytes(filePath, ms.ToArray());
+    }
+
+    /// Load a standalone TemporalMemory from a file.
+    /// Returns a fully reconstructed TM with config and learned state.
+    public static (TemporalMemory TM, TemporalMemoryConfig Config) LoadTemporalMemory(string filePath)
+    {
+        var data = File.ReadAllBytes(filePath);
+        using var ms = new MemoryStream(data);
+        using var br = new BinaryReader(ms);
+
+        uint magic = br.ReadUInt32();
+        if (magic != MagicNumber) throw new FormatException("Invalid HTM format");
+
+        byte version = br.ReadByte();
+        byte type = br.ReadByte();
+        if (type != 0x03) throw new FormatException("Not a TemporalMemory file");
+
+        var config = TMRegion.ReadTMConfig(br);
+        var tm = new TemporalMemory(config);
+        tm.DeserializeState(br);
+
+        return (tm, config);
+    }
+
+    /// Save a full HtmEngine (SP config + state, TM config + state, iteration)
+    public static void SaveHtmEngine(
+        SpatialPooler sp, SpatialPoolerConfig spConfig,
+        TemporalMemory tm, TemporalMemoryConfig tmConfig,
+        int iteration, string filePath)
+    {
+        using var ms = new MemoryStream();
+        using var bw = new BinaryWriter(ms);
+
+        bw.Write(MagicNumber);
+        bw.Write((byte)FormatVersion);
+        bw.Write((byte)0x20); // Type: HtmEngine
+        bw.Write(iteration);
+
+        SPRegion.WriteSPConfig(bw, spConfig);
+        sp.SerializeState(bw);
+
+        TMRegion.WriteTMConfig(bw, tmConfig);
+        tm.SerializeState(bw);
+
+        File.WriteAllBytes(filePath, ms.ToArray());
+    }
+
+    /// Load the raw components of a saved HtmEngine.
+    /// Returns the reconstructed SP, TM, their configs, and the saved iteration count.
+    public static (SpatialPooler SP, SpatialPoolerConfig SPConfig,
+                    TemporalMemory TM, TemporalMemoryConfig TMConfig,
+                    int Iteration) LoadHtmEngineComponents(string filePath)
+    {
+        var data = File.ReadAllBytes(filePath);
+        using var ms = new MemoryStream(data);
+        using var br = new BinaryReader(ms);
+
+        uint magic = br.ReadUInt32();
+        if (magic != MagicNumber) throw new FormatException("Invalid HTM format");
+
+        byte version = br.ReadByte();
+        byte type = br.ReadByte();
+        if (type != 0x20) throw new FormatException("Not an HtmEngine file");
+
+        int iteration = br.ReadInt32();
+
+        var spConfig = SPRegion.ReadSPConfig(br);
+        var sp = new SpatialPooler(spConfig);
+        sp.DeserializeState(br);
+
+        var tmConfig = TMRegion.ReadTMConfig(br);
+        var tm = new TemporalMemory(tmConfig);
+        tm.DeserializeState(br);
+
+        return (sp, spConfig, tm, tmConfig, iteration);
+    }
 }
 
 
@@ -3993,8 +4184,10 @@ public sealed class HtmEngine
 {
     private readonly HtmEngineConfig _config;
     private readonly CompositeEncoder _encoder;
-    private readonly SpatialPooler _sp;
-    private readonly TemporalMemory _tm;
+    private readonly SpatialPoolerConfig _spConfig;
+    private readonly TemporalMemoryConfig _tmConfig;
+    private SpatialPooler _sp;
+    private TemporalMemory _tm;
     private readonly SdrPredictor _predictor;
     private readonly AnomalyLikelihood _anomalyLikelihood;
     private int _iteration;
@@ -4007,23 +4200,25 @@ public sealed class HtmEngine
         _config = config;
         _encoder = config.Encoder;
 
-        _sp = new SpatialPooler(new SpatialPoolerConfig
+        _spConfig = new SpatialPoolerConfig
         {
             InputSize = _encoder.TotalSize,
             ColumnCount = config.ColumnCount,
             TargetSparsity = config.Sparsity,
             Inhibition = config.Inhibition,
             InhibitionRadius = config.InhibitionRadius,
-        });
+        };
 
-        _tm = new TemporalMemory(new TemporalMemoryConfig
+        _tmConfig = new TemporalMemoryConfig
         {
             ColumnCount = config.ColumnCount,
             CellsPerColumn = config.CellsPerColumn,
             MaxSegmentsPerCell = config.MaxSegmentsPerCell,
             MaxSynapsesPerSegment = config.MaxSynapsesPerSegment,
-        });
+        };
 
+        _sp = new SpatialPooler(_spConfig);
+        _tm = new TemporalMemory(_tmConfig);
         _predictor = new SdrPredictor(config.PredictionSteps, resolution: config.PredictorResolution);
         _anomalyLikelihood = new AnomalyLikelihood();
     }
@@ -4065,6 +4260,21 @@ public sealed class HtmEngine
     /// Get comprehensive system health report
     public SystemHealthReport GetHealth()
         => HtmDiagnostics.GetSystemHealth(_sp, _tm);
+
+    /// Save SP and TM learned state to a file. The predictor and anomaly
+    /// likelihood are not serialized — they re-adapt quickly on resumed input.
+    public void Save(string filePath)
+        => HtmSerializer.SaveHtmEngine(_sp, _spConfig, _tm, _tmConfig, _iteration, filePath);
+
+    /// Load SP and TM learned state from a file, replacing current state.
+    /// The encoder, predictor, and anomaly likelihood are preserved from this instance.
+    public void Load(string filePath)
+    {
+        var (sp, _, tm, _, iteration) = HtmSerializer.LoadHtmEngineComponents(filePath);
+        _sp = sp;
+        _tm = tm;
+        _iteration = iteration;
+    }
 }
 
 
