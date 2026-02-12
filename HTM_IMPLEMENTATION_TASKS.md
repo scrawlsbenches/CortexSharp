@@ -177,6 +177,6 @@ The `MultiStreamProcessor` creates background tasks via `Channel<T>` but has no 
 
 ### 4.6 Harden the serialization format (§14) **[S]**
 
-- Actually write and verify the FNV-1a checksum during save/load (it's implemented but unused).
+- ~~Actually write and verify the FNV-1a checksum during save/load~~ — DONE (completed as part of Tier 1 task 1.3: `SaveNetwork` writes FNV-1a checksum, `LoadNetwork` verifies it before parsing).
 - Add a format version migration path so that v2 can read v1 files.
 - Handle endianness explicitly for cross-platform compatibility.
