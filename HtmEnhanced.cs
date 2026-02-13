@@ -3920,6 +3920,58 @@ public sealed class Network
 
         return network;
     }
+
+    /// Build a two-level hierarchical pipeline:
+    ///   L1_SP → L1_TM → L1_TP → L2_SP → L2_TM
+    ///
+    /// Level 1 learns element-level transitions. The TemporalPooler bridges
+    /// the two levels by producing a stable SDR that only changes at sequence
+    /// boundaries (anomaly spikes). Level 2 receives this slowly-changing
+    /// input and learns sequence-of-sequences patterns on a longer timescale.
+    /// This is the core hierarchical processing loop from BAMI.
+    public static Network CreateHierarchicalPipeline(
+        int inputSize,
+        int l1ColumnCount = 2048, int l1CellsPerColumn = 32,
+        int l2ColumnCount = 1024, int l2CellsPerColumn = 16,
+        TemporalPoolerConfig? tpConfig = null)
+    {
+        tpConfig ??= new TemporalPoolerConfig();
+        var network = new Network();
+
+        // Level 1: SP → TM
+        network.AddRegion(new SPRegion("L1_SP", new SpatialPoolerConfig
+        {
+            InputSize = inputSize,
+            ColumnCount = l1ColumnCount,
+        }));
+        network.AddRegion(new TMRegion("L1_TM", new TemporalMemoryConfig
+        {
+            ColumnCount = l1ColumnCount,
+            CellsPerColumn = l1CellsPerColumn,
+        }));
+        network.Link("L1_SP", "bottomUpOut", "L1_TM", "bottomUpIn");
+
+        // Bridge: TP consumes L1 TM's predictive cells + anomaly
+        network.AddRegion(new TemporalPoolerRegion("L1_TP", tpConfig));
+        network.Link("L1_TM", "predictiveCells", "L1_TP", "predictiveCells");
+        network.Link("L1_TM", "anomaly", "L1_TP", "anomaly");
+
+        // Level 2: SP → TM (input = TP output SDR)
+        network.AddRegion(new SPRegion("L2_SP", new SpatialPoolerConfig
+        {
+            InputSize = tpConfig.OutputSize,
+            ColumnCount = l2ColumnCount,
+        }));
+        network.AddRegion(new TMRegion("L2_TM", new TemporalMemoryConfig
+        {
+            ColumnCount = l2ColumnCount,
+            CellsPerColumn = l2CellsPerColumn,
+        }));
+        network.Link("L1_TP", "bottomUpOut", "L2_SP", "bottomUpIn");
+        network.Link("L2_SP", "bottomUpOut", "L2_TM", "bottomUpIn");
+
+        return network;
+    }
 }
 
 
@@ -5001,5 +5053,92 @@ public static class HtmExamples
                               $"converged={result.Converged}, " +
                               $"iters={result.VotingIterations})");
         }
+    }
+
+    /// Example 5: Hierarchical multi-region pipeline (BAMI hierarchy)
+    ///
+    /// Demonstrates the core BAMI thesis: lower levels learn fast fine-grained
+    /// transitions, upper levels learn slow abstract patterns, and temporal
+    /// pooling is the bridge between timescales.
+    ///
+    /// Signal structure:
+    ///   3 subsequences: A=[10,20,30,40], B=[50,60,70,80], C=[90,80,70,60]
+    ///   Supersequence: A → B → C → A → B → C → ... (repeating)
+    ///
+    /// Expected behavior:
+    ///   - Level 1 anomaly drops quickly (learns element transitions within a few cycles)
+    ///   - Level 2 anomaly drops more slowly (learns which subsequence follows which)
+    ///   - TP output is stable within each subsequence, resets at boundaries
+    public static void RunHierarchicalDemo()
+    {
+        // --- Define nested temporal structure ---
+        double[][] subsequences = new[]
+        {
+            new[] { 10.0, 20.0, 30.0, 40.0 },  // A
+            new[] { 50.0, 60.0, 70.0, 80.0 },  // B
+            new[] { 90.0, 80.0, 70.0, 60.0 },  // C
+        };
+        string[] seqNames = { "A", "B", "C" };
+        int elementsPerSeq = subsequences[0].Length;
+
+        // --- Build encoder ---
+        var encoder = new ScalarEncoder(size: 400, activeBits: 21, minVal: 0, maxVal: 100);
+
+        // --- Build two-level hierarchy ---
+        //   L1_SP → L1_TM → L1_TP → L2_SP → L2_TM
+        var tpConfig = new TemporalPoolerConfig
+        {
+            OutputSize = 1024,
+            OutputActiveBits = 40,
+            AnomalyResetThreshold = 0.5f,
+            DecayRate = 0.01f,
+        };
+        var network = Network.CreateHierarchicalPipeline(
+            inputSize: 400,
+            l1ColumnCount: 1024, l1CellsPerColumn: 16,
+            l2ColumnCount: 512, l2CellsPerColumn: 16,
+            tpConfig: tpConfig);
+
+        // --- Run ---
+        int totalSteps = 2000;
+        int step = 0;
+
+        Console.WriteLine("Hierarchical HTM Demo: L1_SP → L1_TM → L1_TP → L2_SP → L2_TM");
+        Console.WriteLine("Subsequences: A=[10,20,30,40]  B=[50,60,70,80]  C=[90,80,70,60]");
+        Console.WriteLine("Supersequence: A → B → C (repeating)\n");
+        Console.WriteLine($"{"Step",5} {"Seq",3} {"Val",5} {"L1 Anom",9} {"L2 Anom",9} {"TP Stable",10}");
+        Console.WriteLine(new string('-', 45));
+
+        for (int cycle = 0; step < totalSteps; cycle++)
+        {
+            for (int s = 0; s < subsequences.Length && step < totalSteps; s++)
+            {
+                for (int e = 0; e < elementsPerSeq && step < totalSteps; e++, step++)
+                {
+                    double value = subsequences[s][e];
+                    SDR encoded = encoder.Encode(value);
+
+                    network.SetInput("L1_SP", "bottomUpIn", encoded);
+                    network.Compute();
+
+                    float l1Anomaly = (float)network.GetOutput("L1_TM", "anomaly");
+                    float l2Anomaly = (float)network.GetOutput("L2_TM", "anomaly");
+                    var tpOut = (SDR)network.GetOutput("L1_TP", "bottomUpOut");
+                    bool tpStable = tpOut.ActiveCount > 0;
+
+                    // Log every 100 steps plus the first full cycle
+                    if (step < elementsPerSeq * subsequences.Length || step % 100 == 0)
+                    {
+                        Console.WriteLine(
+                            $"{step,5} {seqNames[s],3} {value,5:F0} " +
+                            $"{l1Anomaly,9:P0} {l2Anomaly,9:P0} " +
+                            $"{(tpStable ? "yes" : "no"),10}");
+                    }
+                }
+            }
+        }
+
+        Console.WriteLine($"\nCompleted {totalSteps} steps ({totalSteps / (elementsPerSeq * subsequences.Length)} full cycles).");
+        Console.WriteLine("Expected: L1 anomaly near 0% after ~2 cycles; L2 anomaly drops over ~10+ cycles.");
     }
 }

@@ -47,7 +47,7 @@ Every change you make must preserve this pipeline's data flow contract:
 | §15 | 4286–4408 | `HtmDiagnostics`, `SdrQualityReport`, `SystemHealthReport` | Monitoring + SDR quality analysis |
 | §16 | 4409–4632 | `MultiStreamProcessor`, `StreamPipeline`, `StreamConfig` | Concurrent multi-stream via Channels |
 | §17 | 4633–4786 | `HtmEngine`, `HtmEngineConfig`, `HtmResult` | Single-stream convenience orchestrator |
-| §18 | 4787–5005 | `HtmExamples` | Four runnable demo patterns |
+| §18 | 4787–5080 | `HtmExamples` | Five runnable demo patterns |
 
 ## Critical Invariants — Do Not Break
 
@@ -209,9 +209,8 @@ When adding tests, validate these properties:
 
 ## Remaining Work
 
-See `HTM_IMPLEMENTATION_TASKS.md` for the full prioritized task list. **Tiers 1, 2, and 3 implementation tasks are complete.** Only task 3.3 (hierarchical multi-region example) remains as a demo/example task. Remaining:
+See `HTM_IMPLEMENTATION_TASKS.md` for the full prioritized task list. **Tiers 1, 2, and 3 are complete.** Remaining:
 
-- **Tier 3** — One example task: hierarchical multi-region demo (3.3)
 - **Tier 4** — Quality-of-life and hardening (test suite, compilable project, performance profiling, IDisposable lifecycle, logging hooks, serialization hardening)
 
 ## Reference Material
