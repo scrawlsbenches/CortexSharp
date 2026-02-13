@@ -21,6 +21,8 @@ using HierarchicalTemporalMemory.Enhanced;
 //   dotnet run gridcells    — grid cells, displacement cells, Thousand Brains
 //   dotnet run encoders     — GeospatialEncoder, DeltaEncoder, GPS route
 //   dotnet run textpredict  — character-level text prediction
+//   dotnet run feedback     — hierarchical feedback (L2→L1 apical comparison)
+//   dotnet run hier1000b    — hierarchical Thousand Brains (two-level engine)
 // ============================================================================
 //
 // ============================================================================
@@ -63,6 +65,8 @@ var examples = new (string Name, string Description, Action Run)[]
     ("gridcells",    "Grid Cells — path integration, displacement, 1000 Brains", HtmExamples.RunGridCellDemo),
     ("encoders",     "Encoders — GeospatialEncoder + DeltaEncoder + GPS route",  HtmExamples.RunEncoderDemo),
     ("textpredict",  "Text Prediction — character-level sequence learning",     HtmExamples.RunTextPredictionDemo),
+    ("feedback",     "Hierarchical Feedback — L2→L1 apical top-down comparison", HtmExamples.RunHierarchicalFeedbackDemo),
+    ("hier1000b",    "Hierarchical 1000 Brains — two-level object recognition",  HtmExamples.RunHierarchicalThousandBrainsDemo),
 };
 
 string selected = args.Length > 0 ? args[0].ToLowerInvariant() : "";

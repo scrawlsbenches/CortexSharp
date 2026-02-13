@@ -3128,15 +3128,17 @@ public sealed class CorticalColumnConfig
     public float L23InitialPermanence { get; init; } = 0.21f;
     public float L23ConnectedThreshold { get; init; } = 0.5f;
     public int L23MaxNewSynapses { get; init; } = 20;
-    // Apical dendrites — top-down feedback from higher regions or consensus
-    // TODO: Currently apical input comes from lateral consensus (_prevConsensus in
-    // ThousandBrainsEngine), not from a true higher cortical region. When multi-region
-    // hierarchy is implemented, ApicalInputSize should match the higher region's cell
-    // SDR size, and the source should be hierarchical predictions rather than same-level
-    // consensus. The apical boost is also simplified — it applies a flat multiplier
-    // (ApicalBoostFactor=1.5) rather than implementing the biological mechanism where
-    // apical depolarization creates a distinct predictive state that interacts with
-    // distal predictions (predicted+apical > predicted-only > unpredicted).
+    // Apical dendrites — top-down feedback from higher regions or consensus.
+    // Apical depolarization creates a distinct predictive state that interacts with
+    // distal predictions via categorical tiers (not a flat multiplier):
+    //   Tier 0: distal + apical (strongest — both sequence and top-down agree)
+    //   Tier 1: distal only (sequence context matches)
+    //   Tier 1.5: apical only (top-down expects, no sequence match)
+    //   Tier 2: developing segments (potential activity meets min threshold)
+    //   Tier 3: novel (no relevant segments — least-used allocation)
+    // When multi-region hierarchy is implemented, ApicalInputSize should match the
+    // higher region's cell SDR size, and the source should be hierarchical predictions
+    // rather than same-level consensus.
     public int ApicalInputSize { get; init; } = 2048;      // Size of apical feedback SDR
     public int ApicalActivationThreshold { get; init; } = 6;  // Min synapses for apical depolarization
     public int ApicalMinThreshold { get; init; } = 4;         // Min synapses for learning match
@@ -3147,7 +3149,6 @@ public sealed class CorticalColumnConfig
     public float ApicalInitialPermanence { get; init; } = 0.21f;
     public float ApicalConnectedThreshold { get; init; } = 0.5f;
     public int ApicalMaxNewSynapses { get; init; } = 16;
-    public float ApicalBoostFactor { get; init; } = 1.5f;     // How much apical depolarization boosts cell priority
     // Backward compatibility
     public int ColumnCount { get => L4ColumnCount; init => L4ColumnCount = value; }
 }
@@ -3178,7 +3179,8 @@ public sealed class CorticalColumnConfig
 ///   Proximal (L4 SP)  — feedforward sensory input drives column activation
 ///   Distal   (L2/3)   — lateral (feature+location) context drives prediction
 ///   Apical   (L2/3)   — top-down feedback from higher regions or consensus
-///                        depolarizes cells, biasing competitive selection
+///                        depolarizes cells via categorical tier priority:
+///                        distal+apical > distal-only > apical-only > developing > novel
 public sealed class CorticalColumn
 {
     private readonly CorticalColumnConfig _config;
@@ -3268,17 +3270,30 @@ public sealed class CorticalColumn
         if (apicalInput != null && apicalInput.ActiveCount > 0)
             apicalInputBits = apicalInput.ActiveBits.ToArray().ToHashSet();
 
-        // Score each L2/3 cell using the TM's dual-threshold approach:
-        //   - Connected activity (>= ConnectedThreshold): cell has mature segments → activates
-        //   - Potential activity (all synapses incl. sub-threshold): cell has developing segments
+        // Score each L2/3 cell across three dendritic zones, then select winners
+        // via categorical tiers that match the biological priority:
         //
-        // This three-tier priority ensures cells with developing segments are preferentially
-        // re-selected, allowing permanences to be reinforced across training cycles:
-        //   Tier 1: Cells with connected activity >= ActivationThreshold (known patterns)
-        //   Tier 2: Cells with potential activity >= MinThreshold (developing associations)
-        //   Tier 3: Cells with fewest segments (truly novel — least-used allocation)
-        var tier1Cells = new List<(int CellIdx, float Score)>();  // Mature segments
-        var tier2Cells = new List<(int CellIdx, float Score)>();  // Developing segments
+        //   Tier 0 (learning only): cells already in the current object representation
+        //           (recurrent maintenance — stay active to accumulate associations)
+        //   Tier 1: distal + apical (strongest — both sequence/feature context AND
+        //           top-down expectation agree; this is the "predicted+attended" state)
+        //   Tier 2: distal only (mature connected segments, sequence context matches)
+        //   Tier 3: apical only (top-down expects this cell, but no local match yet;
+        //           attention/expectation without feedforward confirmation)
+        //   Tier 4: developing segments (potential activity meets min threshold;
+        //           re-selecting reinforces permanences toward connection threshold)
+        //   Tier 5: truly novel (no relevant segments — least-used allocation)
+        //
+        // This categorical distinction is critical: a cell with both distal and apical
+        // support ALWAYS wins over one with only distal support, regardless of activity
+        // scores. The flat multiplier approach previously used here collapsed this into
+        // a single numeric axis where a high-activity distal-only cell could outrank a
+        // lower-activity distal+apical cell — contradicting the biology where apical
+        // depolarization creates a qualitatively distinct state (NMDA plateau potential).
+        var tier1Cells = new List<(int CellIdx, float Score)>();  // Distal + apical
+        var tier2Cells = new List<(int CellIdx, float Score)>();  // Distal only
+        var tier3Cells = new List<(int CellIdx, float Score)>();  // Apical only
+        var tier4Cells = new List<(int CellIdx, float Score)>();  // Developing segments
         for (int c = 0; c < _config.ObjectRepresentationSize; c++)
         {
             // Distal connected activity: mature segments with strong synapses
@@ -3305,32 +3320,34 @@ public sealed class CorticalColumn
                 }
             }
 
-            // TODO: Replace flat apicalBoost multiplier with a proper three-way interaction model.
-            // Biologically, apical depolarization is a distinct state from distal depolarization.
-            // The correct priority should be:
-            //   1. Cells with BOTH distal AND apical depolarization (strongest prediction — context
-            //      from both sequence history and top-down expectation agree)
-            //   2. Cells with distal depolarization only (sequence context matches)
-            //   3. Cells with apical depolarization only (top-down expects, but no sequence match)
-            //   4. Cells with no depolarization (novel/bursting)
-            // Currently this is collapsed into a single score multiplication, which loses the
-            // categorical distinction between these states. A proper implementation would add
-            // Tier 0.5 (distal+apical) above Tier 1 (distal only) in the cell selection.
-            float apicalBoost = (maxApicalActivity >= _config.ApicalActivationThreshold)
-                ? _config.ApicalBoostFactor : 1.0f;
+            bool hasDistal = maxConnectedActivity >= _config.L23ActivationThreshold;
+            bool hasApical = maxApicalActivity >= _config.ApicalActivationThreshold;
+            bool hasDeveloping = maxPotentialActivity >= _config.L23MinThreshold;
 
-            // Tier 1: mature segments (connected activity meets threshold)
-            if (maxConnectedActivity >= _config.L23ActivationThreshold)
+            if (hasDistal && hasApical)
             {
-                tier1Cells.Add((c, maxConnectedActivity * apicalBoost));
+                // Tier 1: both dendritic zones depolarized — strongest prediction.
+                // Score combines both activities to rank within this tier.
+                tier1Cells.Add((c, maxConnectedActivity + maxApicalActivity));
             }
-            // Tier 2: developing segments (potential activity meets min threshold)
-            // These cells have segments with the right synapses but permanences
-            // haven't crossed the connection threshold yet. Re-selecting them
-            // allows learning to reinforce their synapses.
-            else if (maxPotentialActivity >= _config.L23MinThreshold)
+            else if (hasDistal)
             {
-                tier2Cells.Add((c, maxPotentialActivity * apicalBoost));
+                // Tier 2: distal only — local feature+location context matches
+                tier2Cells.Add((c, maxConnectedActivity));
+            }
+            else if (hasApical)
+            {
+                // Tier 3: apical only — top-down expectation without local confirmation.
+                // This models attention: the higher region expects this cell to be active.
+                tier3Cells.Add((c, maxApicalActivity));
+            }
+            else if (hasDeveloping)
+            {
+                // Tier 4: developing segments (potential activity meets min threshold).
+                // These cells have segments with the right synapses but permanences
+                // haven't crossed the connection threshold yet. Re-selecting them
+                // allows learning to reinforce their synapses.
+                tier4Cells.Add((c, maxPotentialActivity));
             }
         }
 
@@ -3360,7 +3377,7 @@ public sealed class CorticalColumn
             slotsRemaining = _config.ObjectActiveBits - newL23Active.Count;
         }
 
-        // Tier 1: cells with mature connected segments (highest priority for recognition)
+        // Tier 1: distal + apical (predicted AND expected by higher region)
         if (slotsRemaining > 0 && tier1Cells.Count > 0)
         {
             foreach (var (cellIdx, _) in tier1Cells
@@ -3373,7 +3390,7 @@ public sealed class CorticalColumn
             slotsRemaining = _config.ObjectActiveBits - newL23Active.Count;
         }
 
-        // Tier 2: cells with developing segments (re-select to reinforce learning)
+        // Tier 2: distal only (mature connected segments, local context matches)
         if (slotsRemaining > 0 && tier2Cells.Count > 0)
         {
             foreach (var (cellIdx, _) in tier2Cells
@@ -3386,7 +3403,33 @@ public sealed class CorticalColumn
             slotsRemaining = _config.ObjectActiveBits - newL23Active.Count;
         }
 
-        // Tier 3: truly novel — no relevant segments at all. Allocate least-used cells.
+        // Tier 3: apical only (top-down attention without local confirmation)
+        if (slotsRemaining > 0 && tier3Cells.Count > 0)
+        {
+            foreach (var (cellIdx, _) in tier3Cells
+                .Where(c => !newL23Active.Contains(c.CellIdx))
+                .OrderByDescending(c => c.Score)
+                .Take(slotsRemaining))
+            {
+                newL23Active.Add(cellIdx);
+            }
+            slotsRemaining = _config.ObjectActiveBits - newL23Active.Count;
+        }
+
+        // Tier 4: developing segments (re-select to reinforce learning)
+        if (slotsRemaining > 0 && tier4Cells.Count > 0)
+        {
+            foreach (var (cellIdx, _) in tier4Cells
+                .Where(c => !newL23Active.Contains(c.CellIdx))
+                .OrderByDescending(c => c.Score)
+                .Take(slotsRemaining))
+            {
+                newL23Active.Add(cellIdx);
+            }
+            slotsRemaining = _config.ObjectActiveBits - newL23Active.Count;
+        }
+
+        // Tier 5: truly novel — no relevant segments at all. Allocate least-used cells.
         if (slotsRemaining > 0)
         {
             var available = Enumerable.Range(0, _config.ObjectRepresentationSize)
@@ -3807,7 +3850,6 @@ public sealed class ThousandBrainsEngine
             ApicalInitialPermanence = config.ColumnConfig.ApicalInitialPermanence,
             ApicalConnectedThreshold = config.ColumnConfig.ApicalConnectedThreshold,
             ApicalMaxNewSynapses = config.ColumnConfig.ApicalMaxNewSynapses,
-            ApicalBoostFactor = config.ColumnConfig.ApicalBoostFactor,
         };
 
         for (int i = 0; i < config.ColumnCount; i++)
@@ -4049,6 +4091,173 @@ public record ThousandBrainsOutput
     public required CorticalColumnOutput[] ColumnOutputs { get; init; }
     public float AvgAnomaly { get; init; }
     public SDR? PredictedNextLocation { get; init; }
+}
+
+
+// ============================================================================
+// SECTION 12b: Hierarchical Thousand Brains Engine
+// ============================================================================
+// Two ThousandBrainsEngines wired as a hierarchy: a lower-level engine (L1)
+// processes raw sensory input and a higher-level engine (L2) processes the
+// lower engine's consensus as its sensory input.
+//
+// The higher engine sends its consensus back down to the lower engine as
+// hierarchicalFeedback — true top-down apical input. This implements the
+// biological pathway where higher cortical regions modulate lower ones:
+//   L1 columns see sensory patches → form local object hypotheses
+//   L2 columns see L1 consensus → form abstract/multi-object hypotheses
+//   L2 consensus feeds back to L1 as apical input → constrains L1 cell selection
+//
+// The settling loop iterates until both levels converge:
+//   1. L1 processes sensory input (first pass: no feedback)
+//   2. L2 processes L1 consensus
+//   3. L2 consensus → L1 apical input
+//   4. L1 reprocesses with top-down modulation
+//   5. Repeat 2-4 until consensus stabilizes
+// ============================================================================
+
+public sealed class HierarchicalThousandBrainsConfig
+{
+    public ThousandBrainsConfig L1Config { get; init; } = new();
+    public ThousandBrainsConfig L2Config { get; init; } = new();
+    public int MaxSettlingIterations { get; init; } = 5;
+    public float ConvergenceThreshold { get; init; } = 0.8f;
+}
+
+public sealed class HierarchicalThousandBrainsEngine
+{
+    private readonly HierarchicalThousandBrainsConfig _config;
+    private readonly ThousandBrainsEngine _l1Engine;
+    private readonly ThousandBrainsEngine _l2Engine;
+
+    // Encoder to project L1 consensus into L2's sensory input space.
+    // L1 consensus is in ObjectRepresentationSize space; L2 expects its own InputSize.
+    // When they match, this is an identity mapping. When they differ, we subsample.
+    private readonly int _l2InputSize;
+
+    public ThousandBrainsEngine L1Engine => _l1Engine;
+    public ThousandBrainsEngine L2Engine => _l2Engine;
+
+    public HierarchicalThousandBrainsEngine(HierarchicalThousandBrainsConfig config)
+    {
+        _config = config;
+        _l1Engine = new ThousandBrainsEngine(config.L1Config);
+        _l2InputSize = config.L2Config.ColumnConfig.InputSize;
+
+        // L2 engine processes L1's consensus as its sensory input.
+        _l2Engine = new ThousandBrainsEngine(config.L2Config);
+    }
+
+    /// Process one sensory observation through the two-level hierarchy.
+    /// Returns outputs from both levels plus settling iteration count.
+    public HierarchicalThousandBrainsOutput Process(
+        SDR[] sensoryPatches, float moveDeltaX, float moveDeltaY,
+        bool learn = true)
+    {
+        // Pass 1: L1 feedforward (no top-down feedback yet)
+        var l1Output = _l1Engine.Process(
+            sensoryPatches, moveDeltaX, moveDeltaY, learn,
+            hierarchicalFeedback: null);
+
+        // Pass 1: L2 processes L1's consensus as sensory input
+        var l2SensoryInput = ProjectConsensusToInput(l1Output.Consensus);
+        var l2Patches = Enumerable.Repeat(l2SensoryInput, _config.L2Config.ColumnCount).ToArray();
+        var l2Output = _l2Engine.Process(
+            l2Patches, moveDeltaX, moveDeltaY, learn,
+            hierarchicalFeedback: null);
+
+        // Settling loop: L2 consensus → L1 apical → L1 recomputes → L2 refines
+        int settlingIterations = 0;
+        for (int i = 0; i < _config.MaxSettlingIterations; i++)
+        {
+            var prevL1Consensus = l1Output.Consensus;
+
+            // L2 consensus feeds back to L1 as hierarchical (apical) feedback
+            var feedback = l2Output.Consensus;
+            l1Output = _l1Engine.Process(
+                sensoryPatches, moveDeltaX, moveDeltaY,
+                learn: false,  // Don't re-learn during settling
+                hierarchicalFeedback: feedback);
+
+            // L2 re-processes with updated L1 consensus
+            l2SensoryInput = ProjectConsensusToInput(l1Output.Consensus);
+            l2Patches = Enumerable.Repeat(l2SensoryInput, _config.L2Config.ColumnCount).ToArray();
+            l2Output = _l2Engine.Process(
+                l2Patches, moveDeltaX, moveDeltaY,
+                learn: false,
+                hierarchicalFeedback: null);
+
+            settlingIterations = i + 1;
+
+            // Check convergence: L1 consensus stabilized
+            if (prevL1Consensus.ActiveCount > 0 && l1Output.Consensus.ActiveCount > 0)
+            {
+                float overlap = (float)prevL1Consensus.Overlap(l1Output.Consensus)
+                    / Math.Max(prevL1Consensus.ActiveCount, 1);
+                if (overlap >= _config.ConvergenceThreshold)
+                    break;
+            }
+        }
+
+        // Final learning pass after convergence (learn the settled state)
+        if (learn && settlingIterations > 0)
+        {
+            var feedback = l2Output.Consensus;
+            _l1Engine.Process(
+                sensoryPatches, moveDeltaX, moveDeltaY,
+                learn: true,
+                hierarchicalFeedback: feedback);
+        }
+
+        return new HierarchicalThousandBrainsOutput
+        {
+            L1Output = l1Output,
+            L2Output = l2Output,
+            SettlingIterations = settlingIterations,
+        };
+    }
+
+    /// Label the current object at both levels.
+    public void LearnObject(string label)
+    {
+        _l1Engine.LearnObject(label);
+        _l2Engine.LearnObject(label);
+    }
+
+    /// Reset both engines for a new object.
+    public void StartNewObject()
+    {
+        _l1Engine.StartNewObject();
+        _l2Engine.StartNewObject();
+    }
+
+    /// Project L1 consensus SDR into L2's input space.
+    /// If sizes match, pass through directly. Otherwise, map bits proportionally.
+    private SDR ProjectConsensusToInput(SDR consensus)
+    {
+        if (consensus.ActiveCount == 0)
+            return new SDR(_l2InputSize);
+
+        int sourceSize = consensus.Size;
+        if (sourceSize == _l2InputSize)
+            return consensus;
+
+        // Proportional bit mapping: map each source bit to a target position
+        var targetBits = new HashSet<int>();
+        foreach (int bit in consensus.ActiveBits)
+        {
+            int mapped = (int)((long)bit * _l2InputSize / sourceSize);
+            targetBits.Add(Math.Clamp(mapped, 0, _l2InputSize - 1));
+        }
+        return new SDR(_l2InputSize, targetBits);
+    }
+}
+
+public record HierarchicalThousandBrainsOutput
+{
+    public required ThousandBrainsOutput L1Output { get; init; }
+    public required ThousandBrainsOutput L2Output { get; init; }
+    public int SettlingIterations { get; init; }
 }
 
 
@@ -7465,5 +7674,292 @@ public static class HtmExamples
         Console.WriteLine("  Different cells activate for the same character in different contexts.");
         Console.WriteLine("  'a' after 'c' uses different cells than 'a' after 'b' -- this is how");
         Console.WriteLine("  the neocortex disambiguates identical stimuli in different temporal contexts.");
+    }
+
+    /// Example 12: Hierarchical Feedback — L2→L1 top-down modulation
+    ///
+    /// Compares feedforward-only (enableFeedback=false) vs feedback-enabled
+    /// (enableFeedback=true) on identical sequence learning. The feedback path
+    /// sends L2_TM's predictive cells back to L1_TM's apical dendrites,
+    /// providing top-down context that should help L1 disambiguate faster.
+    ///
+    /// Signal structure (same as RunHierarchicalDemo):
+    ///   3 subsequences: A=[10,20,30,40], B=[50,60,70,80], C=[90,80,70,60]
+    ///   Supersequence: A → B → C → A → B → C → ...
+    ///
+    /// Expected: feedback-enabled pipeline should show lower L1 anomaly in
+    /// early training (L2 predictions help L1 disambiguate) and the settling
+    /// loop should converge within a few iterations.
+    public static void RunHierarchicalFeedbackDemo()
+    {
+        Console.WriteLine("Hierarchical Feedback Demo: Feedforward-Only vs L2→L1 Feedback");
+        Console.WriteLine(new string('=', 72));
+
+        // --- Signal definition ---
+        double[][] subsequences = {
+            new[] { 10.0, 20.0, 30.0, 40.0 },  // A
+            new[] { 50.0, 60.0, 70.0, 80.0 },  // B
+            new[] { 90.0, 80.0, 70.0, 60.0 },  // C
+        };
+        string[] seqNames = { "A", "B", "C" };
+        int elementsPerSeq = subsequences[0].Length;
+        int seqCount = subsequences.Length;
+        int cycleLength = elementsPerSeq * seqCount;
+
+        var encoder = new ScalarEncoder(size: 400, activeBits: 21, minValue: 0, maxValue: 100);
+        var allValues = subsequences.SelectMany(s => s).Distinct().ToArray();
+
+        var tpConfig = new TemporalPoolerConfig
+        {
+            OutputSize = 1024,
+            OutputActiveBits = 40,
+            AnomalyResetThreshold = 0.5f,
+            DecayRate = 0.3f,
+        };
+
+        // --- Run both configurations ---
+        var configs = new (string Label, bool Feedback)[]
+        {
+            ("Feedforward-only", false),
+            ("With L2→L1 feedback", true),
+        };
+
+        // Track anomaly per cycle for comparison
+        var results = new Dictionary<string, List<float>>();
+
+        foreach (var (label, feedback) in configs)
+        {
+            Console.WriteLine($"\n--- {label} (enableFeedback={feedback}) ---");
+
+            var network = Network.CreateHierarchicalPipeline(
+                inputSize: 400,
+                l1ColumnCount: 1024, l1CellsPerColumn: 16,
+                l2ColumnCount: 512, l2CellsPerColumn: 16,
+                tpConfig: tpConfig,
+                enableFeedback: feedback);
+
+            // Phase 1: SP pre-training (L1_SP only)
+            var l1sp = (SPRegion)network.Regions["L1_SP"];
+            Console.Write("  SP pre-training (50 cycles)...");
+            for (int c = 0; c < 50; c++)
+                foreach (double v in allValues)
+                {
+                    l1sp.SetInput("bottomUpIn", encoder.Encode(v));
+                    l1sp.Compute(learn: true);
+                }
+            l1sp.FreezeLearning = true;
+            Console.WriteLine(" done");
+            network.Reset();
+
+            // Phase 2: L2_SP warm-up (500 steps)
+            var l2sp = (SPRegion)network.Regions["L2_SP"];
+            Console.Write("  L2 SP warm-up (500 steps)...");
+            int warmupStep = 0;
+            for (int cycle = 0; warmupStep < 500; cycle++)
+                for (int s = 0; s < seqCount && warmupStep < 500; s++)
+                    for (int e = 0; e < elementsPerSeq && warmupStep < 500; e++, warmupStep++)
+                    {
+                        network.SetInput("L1_SP", "bottomUpIn", encoder.Encode(subsequences[s][e]));
+                        network.Compute(learn: true);
+                    }
+            l2sp.FreezeLearning = true;
+            network.Reset();
+            Console.WriteLine(" done");
+
+            // Phase 3: Sequence learning — track L1 anomaly per cycle
+            int totalCycles = 30;
+            int totalSteps = totalCycles * cycleLength;
+            var cycleAnomalies = new List<float>();
+            int step = 0;
+
+            Console.Write($"  Training ({totalSteps} steps)...");
+            for (int cycle = 0; cycle < totalCycles; cycle++)
+            {
+                float cycleSum = 0;
+                for (int s = 0; s < seqCount; s++)
+                    for (int e = 0; e < elementsPerSeq; e++, step++)
+                    {
+                        network.SetInput("L1_SP", "bottomUpIn", encoder.Encode(subsequences[s][e]));
+                        network.Compute(learn: true);
+                        float l1Anomaly = (float)network.GetOutput("L1_TM", "anomaly");
+                        cycleSum += l1Anomaly;
+                    }
+                cycleAnomalies.Add(cycleSum / cycleLength);
+            }
+            Console.WriteLine(" done");
+
+            results[label] = cycleAnomalies;
+
+            if (feedback)
+                Console.WriteLine($"  Settling iterations (last step): {network.LastSettlingIterations}");
+        }
+
+        // --- Comparison table ---
+        Console.WriteLine($"\n{"Cycle",6} | {"Feedforward",12} | {"Feedback",12} | {"Improvement",12}");
+        Console.WriteLine(new string('-', 50));
+
+        var ff = results["Feedforward-only"];
+        var fb = results["With L2→L1 feedback"];
+        for (int c = 0; c < ff.Count; c++)
+        {
+            if (c < 5 || c % 5 == 0 || c == ff.Count - 1)
+            {
+                float improvement = ff[c] > 0.001f ? (ff[c] - fb[c]) / ff[c] * 100 : 0;
+                Console.WriteLine(
+                    $"{c + 1,6} | {ff[c] * 100,10:F1}% | {fb[c] * 100,10:F1}% | " +
+                    $"{(improvement > 0 ? $"+{improvement:F0}% better" : "same"),12}");
+            }
+        }
+
+        Console.WriteLine("\nExpected: feedback pipeline shows lower L1 anomaly in early cycles.");
+        Console.WriteLine("L2 predictions help L1 disambiguate subsequence transitions faster.");
+        Console.WriteLine("After full convergence, both pipelines reach similar final anomaly.");
+    }
+
+    /// Example 13: Hierarchical Thousand Brains — two-level object recognition
+    ///
+    /// Wires two ThousandBrainsEngines in a hierarchy:
+    ///   L1 (lower): processes raw sensory features with grid cell locations
+    ///   L2 (higher): processes L1's consensus as abstract input
+    ///   L2 consensus → L1 apical input (top-down attention/expectation)
+    ///
+    /// Demonstrates that top-down feedback from L2 helps L1 converge to the
+    /// correct object faster (fewer touches needed for recognition).
+    public static void RunHierarchicalThousandBrainsDemo()
+    {
+        Console.WriteLine("Hierarchical Thousand Brains — Two-Level Object Recognition");
+        Console.WriteLine(new string('=', 72));
+
+        // --- Engine configuration ---
+        // L1: 4 columns processing raw sensory patches
+        var l1ColConfig = new CorticalColumnConfig
+        {
+            InputSize = 256,
+            LocationSize = 1600,
+            L4ColumnCount = 512,
+            CellsPerColumn = 8,
+            ObjectRepresentationSize = 2048,
+            ObjectActiveBits = 40,
+        };
+
+        // L2: 4 columns processing L1's consensus as sensory input
+        // L2 sees more abstract representations — object identity from L1
+        var l2ColConfig = new CorticalColumnConfig
+        {
+            InputSize = 256,
+            LocationSize = 1600,
+            L4ColumnCount = 256,
+            CellsPerColumn = 8,
+            ObjectRepresentationSize = 1024,
+            ObjectActiveBits = 20,
+        };
+
+        var hierarchicalEngine = new HierarchicalThousandBrainsEngine(new HierarchicalThousandBrainsConfig
+        {
+            L1Config = new ThousandBrainsConfig
+            {
+                ColumnCount = 4,
+                ColumnConfig = l1ColConfig,
+                VotingConfig = new LateralVotingConfig
+                {
+                    ConvergenceThreshold = 0.6f,
+                    MaxIterations = 5,
+                },
+            },
+            L2Config = new ThousandBrainsConfig
+            {
+                ColumnCount = 4,
+                ColumnConfig = l2ColConfig,
+                VotingConfig = new LateralVotingConfig
+                {
+                    ConvergenceThreshold = 0.6f,
+                    MaxIterations = 5,
+                },
+                UseDisplacementCells = false,
+            },
+            MaxSettlingIterations = 3,
+            ConvergenceThreshold = 0.8f,
+        });
+
+        // Also create a flat (non-hierarchical) engine for comparison
+        var flatEngine = new ThousandBrainsEngine(new ThousandBrainsConfig
+        {
+            ColumnCount = 4,
+            ColumnConfig = l1ColConfig,
+            VotingConfig = new LateralVotingConfig
+            {
+                ConvergenceThreshold = 0.6f,
+                MaxIterations = 5,
+            },
+        });
+
+        var featureEncoder = new CategoryEncoder(256, 15);
+
+        // --- Define objects with more features for differentiation ---
+        var objects = new Dictionary<string, string[]>
+        {
+            ["coffee_mug"]    = new[] { "ceramic", "handle", "rim", "base", "logo", "glaze" },
+            ["water_bottle"]  = new[] { "plastic", "cap", "label", "base", "grip", "spout" },
+            ["wine_glass"]    = new[] { "glass", "stem", "rim", "base", "bowl", "thin" },
+        };
+
+        // --- Learning phase (both engines) ---
+        Console.WriteLine("\nLearning objects...");
+        foreach (var (name, features) in objects)
+        {
+            Console.WriteLine($"  Learning: {name} ({features.Length} features)");
+
+            hierarchicalEngine.StartNewObject();
+            flatEngine.StartNewObject();
+
+            for (int t = 0; t < features.Length; t++)
+            {
+                var feature = featureEncoder.Encode(features[t]);
+                var patches = Enumerable.Repeat(feature, 4).ToArray();
+
+                hierarchicalEngine.Process(patches, moveDeltaX: 1.0f, moveDeltaY: 0.5f, learn: true);
+                flatEngine.Process(patches, 1.0f, 0.5f, learn: true);
+            }
+
+            hierarchicalEngine.LearnObject(name);
+            flatEngine.LearnObject(name);
+        }
+
+        // --- Recognition comparison ---
+        Console.WriteLine("\nRecognition test (partial observations — first 3 touches of each object):");
+        Console.WriteLine($"{"Object",-14} {"Touch",-6} {"Feature",-10} | {"Flat",15} | {"Hierarchical",20} | {"Settling",8}");
+        Console.WriteLine(new string('-', 82));
+
+        foreach (var (name, features) in objects)
+        {
+            hierarchicalEngine.StartNewObject();
+            flatEngine.StartNewObject();
+
+            int touchesToTest = Math.Min(4, features.Length);
+            for (int t = 0; t < touchesToTest; t++)
+            {
+                var feature = featureEncoder.Encode(features[t]);
+                var patches = Enumerable.Repeat(feature, 4).ToArray();
+
+                var flatResult = flatEngine.Process(patches, 1.0f, 0.5f, learn: false);
+                var hierResult = hierarchicalEngine.Process(patches, 1.0f, 0.5f, learn: false);
+
+                string flatRecog = flatResult.RecognizedObject ?? "unknown";
+                string hierRecog = hierResult.L1Output.RecognizedObject ?? "unknown";
+                float flatConf = flatResult.RecognitionConfidence;
+                float hierConf = hierResult.L1Output.RecognitionConfidence;
+
+                Console.WriteLine(
+                    $"{name,-14} {t + 1,-6} {features[t],-10} | " +
+                    $"{flatRecog,-10} {flatConf,3:P0} | " +
+                    $"{hierRecog,-10} {hierConf,3:P0}      | " +
+                    $"{hierResult.SettlingIterations,8}");
+            }
+        }
+
+        Console.WriteLine("\nExpected: hierarchical engine converges to correct object at least as fast");
+        Console.WriteLine("as the flat engine. L2 feedback provides top-down expectation that constrains");
+        Console.WriteLine("L1 cell selection, helping resolve ambiguity when early touches are shared");
+        Console.WriteLine("across objects (e.g., 'base' and 'rim' appear in multiple objects).");
     }
 }
