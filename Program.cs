@@ -18,6 +18,7 @@ using HierarchicalTemporalMemory.Enhanced;
 //   dotnet run 1000brains   — Thousand Brains object recognition
 //   dotnet run hierarchical — hierarchical temporal memory
 //   dotnet run gridcells    — grid cells, displacement cells, Thousand Brains
+//   dotnet run encoders     — GeospatialEncoder, DeltaEncoder, GPS route
 // ============================================================================
 
 var examples = new (string Name, string Description, Action Run)[]
@@ -30,6 +31,7 @@ var examples = new (string Name, string Description, Action Run)[]
     ("1000brains",   "Thousand Brains — multi-column object recognition",       HtmExamples.RunThousandBrainsDemo),
     ("hierarchical", "Hierarchical TM — multi-timescale sequence learning",     HtmExamples.RunHierarchicalDemo),
     ("gridcells",    "Grid Cells — path integration, displacement, 1000 Brains", HtmExamples.RunGridCellDemo),
+    ("encoders",     "Encoders — GeospatialEncoder + DeltaEncoder + GPS route",  HtmExamples.RunEncoderDemo),
 };
 
 string selected = args.Length > 0 ? args[0].ToLowerInvariant() : "";

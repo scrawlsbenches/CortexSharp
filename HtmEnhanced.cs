@@ -5862,4 +5862,238 @@ public static class HtmExamples
         Console.WriteLine("   complete model of every object, using grid cell reference frames for");
         Console.WriteLine("   location. Recognition emerges from consensus across columns.");
     }
+
+    /// Example 8: GeospatialEncoder and DeltaEncoder
+    ///
+    /// Exercises the two remaining untested encoder types:
+    ///   - GeospatialEncoder: multi-scale spatial encoding for GPS coordinates
+    ///   - DeltaEncoder: stateful encoder that encodes changes between values
+    ///
+    /// Both are combined into an anomaly detection pipeline tracking a vehicle
+    /// on a known route, with GPS and speed delta encoding.
+    public static void RunEncoderDemo()
+    {
+        Console.WriteLine("GeospatialEncoder & DeltaEncoder — Specialized Encoder Demo");
+        Console.WriteLine(new string('=', 72));
+
+        // ================================================================
+        // Section 1: GeospatialEncoder — Multi-scale GPS encoding
+        // ================================================================
+        Console.WriteLine("\n1. GEOSPATIAL ENCODER");
+        Console.WriteLine("   Encodes (lat, lon) at multiple spatial scales.");
+        Console.WriteLine("   Nearby locations share bits; distant ones don't.\n");
+
+        var geoEncoder = new GeospatialEncoder(
+            scales: 3,
+            bitsPerScale: 128,
+            activeBitsPerScale: 7,
+            maxRadiusDegrees: 1.0);
+
+        Console.WriteLine($"   Output size: {geoEncoder.OutputSize} bits, " +
+                          $"~{3 * 7} active bits per encoding");
+
+        // Encode several locations: NYC landmarks
+        var locations = new (string Name, double Lat, double Lon)[]
+        {
+            ("Times Square",    40.7580, -73.9855),
+            ("Central Park",    40.7829, -73.9654),  // ~2.8 km north
+            ("Brooklyn Bridge", 40.7061, -73.9969),  // ~6 km south
+            ("JFK Airport",     40.6413, -73.7781),  // ~20 km southeast
+            ("Times Square 2",  40.7580, -73.9855),  // Exact repeat
+        };
+
+        var geoSDRs = new SDR[locations.Length];
+        for (int i = 0; i < locations.Length; i++)
+        {
+            geoSDRs[i] = geoEncoder.Encode((locations[i].Lat, locations[i].Lon));
+            Console.WriteLine($"   {locations[i].Name,-18}: {geoSDRs[i].ActiveCount} active bits");
+        }
+
+        Console.WriteLine($"\n   {"A",-18} vs {"B",-18} | Overlap | Relationship");
+        Console.WriteLine($"   {"",18}    {"",18} |         |");
+
+        void ShowGeoOverlap(int a, int b, string relationship)
+        {
+            int overlap = geoSDRs[a].Overlap(geoSDRs[b]);
+            Console.WriteLine($"   {locations[a].Name,-18} vs {locations[b].Name,-18} | {overlap,7} | {relationship}");
+        }
+
+        ShowGeoOverlap(0, 4, "Exact same location → full match");
+        ShowGeoOverlap(0, 1, "~3 km apart → coarse scales share bits");
+        ShowGeoOverlap(0, 2, "~6 km apart → fewer shared bits");
+        ShowGeoOverlap(0, 3, "~20 km apart → no/minimal overlap");
+
+        // Smeared encoding: smooth transitions at grid boundaries
+        Console.Write("\n   Smeared encoding: ");
+        var smeared = geoEncoder.EncodeSmeared((40.7580, -73.9855));
+        Console.WriteLine($"{smeared.ActiveCount} active bits (vs {geoSDRs[0].ActiveCount} plain) — " +
+                          $"activates neighboring grid cells for smoother transitions");
+
+        // ================================================================
+        // Section 2: DeltaEncoder — Change-based encoding
+        // ================================================================
+        Console.WriteLine("\n2. DELTA ENCODER");
+        Console.WriteLine("   Encodes the change between consecutive values.");
+        Console.WriteLine("   Patterns in derivatives repeat regardless of baseline.\n");
+
+        var deltaEncoder = new DeltaEncoder(
+            size: 200, activeBits: 11, minDelta: -10, maxDelta: 10);
+
+        // Feed a signal with repeating delta pattern at different baselines
+        Console.WriteLine("   Signal: baseline shifts but delta pattern repeats");
+        Console.WriteLine($"   {"Step",5} | {"Value",6} | {"Delta",6} | Active bits");
+
+        double[] signal = {
+            // Rising pattern at baseline 0
+            0, 3, 5, 8, 5, 3, 0,
+            // Same pattern at baseline 50
+            50, 53, 55, 58, 55, 53, 50,
+        };
+
+        var deltaSdrs = new SDR[signal.Length];
+        deltaEncoder.Reset();
+        for (int i = 0; i < signal.Length; i++)
+        {
+            deltaSdrs[i] = deltaEncoder.Encode(signal[i]);
+            double delta = i > 0 ? signal[i] - signal[i - 1] : 0;
+            Console.WriteLine($"   {i,5} | {signal[i],6:F0} | {delta,+6:F0} | {deltaSdrs[i].ActiveCount}");
+        }
+
+        // Compare matching delta positions across baselines
+        Console.WriteLine($"\n   Same delta patterns at different baselines:");
+        Console.WriteLine($"   Step 1 (0→3)  vs Step 8 (50→53):  overlap = {deltaSdrs[1].Overlap(deltaSdrs[8])} " +
+                          $"(both Δ=+3)");
+        Console.WriteLine($"   Step 2 (3→5)  vs Step 9 (53→55):  overlap = {deltaSdrs[2].Overlap(deltaSdrs[9])} " +
+                          $"(both Δ=+2)");
+        Console.WriteLine($"   Step 4 (8→5)  vs Step 11 (58→55): overlap = {deltaSdrs[4].Overlap(deltaSdrs[11])} " +
+                          $"(both Δ=-3)");
+        Console.WriteLine($"   Step 1 (Δ=+3) vs Step 4 (Δ=-3):  overlap = {deltaSdrs[1].Overlap(deltaSdrs[4])} " +
+                          $"(opposite deltas → different)");
+        Console.WriteLine("   → Same deltas produce identical encodings regardless of absolute value.");
+
+        // ================================================================
+        // Section 3: Combined pipeline — GPS route anomaly detection
+        // ================================================================
+        Console.WriteLine("\n3. COMBINED PIPELINE: GPS ROUTE ANOMALY DETECTION");
+        Console.WriteLine("   A vehicle follows a known route. We encode GPS + speed delta");
+        Console.WriteLine("   and detect deviations using SP + TM.\n");
+
+        // Build a composite encoder with geospatial + delta
+        var speedDelta = new DeltaEncoder(size: 200, activeBits: 11, minDelta: -30, maxDelta: 30);
+        var routeEncoder = new CompositeEncoder()
+            .AddEncoder("location", geoEncoder)
+            .AddEncoder("speed_delta", speedDelta);
+
+        var sp = new SpatialPooler(new SpatialPoolerConfig
+        {
+            InputSize = routeEncoder.TotalSize,
+            ColumnCount = 1024,
+            TargetSparsity = 0.02f,
+        });
+        var tm = new TemporalMemory(new TemporalMemoryConfig
+        {
+            ColumnCount = 1024,
+            CellsPerColumn = 16,
+        });
+
+        // Define a simple route: 10 waypoints along a path
+        var route = new (double Lat, double Lon, double Speed)[]
+        {
+            (40.758, -73.985, 20),  // Times Sq, slow
+            (40.762, -73.980, 35),  // Accelerating north
+            (40.768, -73.975, 45),  // Cruising
+            (40.775, -73.968, 45),  // Cruising
+            (40.780, -73.964, 40),  // Approaching park
+            (40.783, -73.965, 25),  // Slowing for park
+            (40.783, -73.970, 20),  // Turning west
+            (40.780, -73.975, 30),  // Heading south
+            (40.770, -73.980, 40),  // Cruising south
+            (40.760, -73.984, 25),  // Slowing, back to start area
+        };
+
+        // Phase 1: SP pre-training
+        Console.Write("   SP pre-training (50 cycles)...");
+        speedDelta.Reset();
+        for (int c = 0; c < 50; c++)
+        {
+            speedDelta.Reset();
+            foreach (var (lat, lon, speed) in route)
+            {
+                var encoded = routeEncoder.Encode(new Dictionary<string, object>
+                {
+                    ["location"] = (lat, lon),
+                    ["speed_delta"] = speed,
+                });
+                sp.Compute(encoded, learn: true);
+            }
+        }
+        Console.WriteLine(" done");
+
+        // Phase 2: TM sequence learning
+        Console.Write("   TM learning (20 cycles)...");
+        for (int c = 0; c < 20; c++)
+        {
+            speedDelta.Reset();
+            tm.Reset();
+            foreach (var (lat, lon, speed) in route)
+            {
+                var encoded = routeEncoder.Encode(new Dictionary<string, object>
+                {
+                    ["location"] = (lat, lon),
+                    ["speed_delta"] = speed,
+                });
+                var cols = sp.Compute(encoded, learn: false);
+                tm.Compute(cols, learn: true);
+            }
+        }
+        Console.WriteLine(" done");
+
+        // Phase 3: Test with normal route + deviations
+        Console.WriteLine($"\n   {"Step",5} | {"Type",9} | {"Anomaly",7} | Location");
+
+        // Normal run
+        speedDelta.Reset();
+        tm.Reset();
+        float normalAvg = 0;
+        for (int i = 0; i < route.Length; i++)
+        {
+            var (lat, lon, speed) = route[i];
+            var encoded = routeEncoder.Encode(new Dictionary<string, object>
+            {
+                ["location"] = (lat, lon),
+                ["speed_delta"] = speed,
+            });
+            var cols = sp.Compute(encoded, learn: false);
+            var tmOut = tm.Compute(cols, learn: false);
+            normalAvg += tmOut.Anomaly;
+            if (i == 0 || i == route.Length - 1)
+                Console.WriteLine($"   {i,5} | {"Normal",9} | {tmOut.Anomaly * 100,5:F0} % | ({lat:F3}, {lon:F3})");
+        }
+        normalAvg /= route.Length;
+        Console.WriteLine($"   {"",5}   {"",9}   avg = {normalAvg * 100:F0} %");
+
+        // Deviated run: take a wrong turn at step 5
+        var devRoute = route.ToArray();
+        devRoute[5] = (40.790, -73.960, 50);  // Wrong direction, speeding
+        devRoute[6] = (40.795, -73.955, 55);  // Further off route
+
+        speedDelta.Reset();
+        tm.Reset();
+        for (int i = 0; i < devRoute.Length; i++)
+        {
+            var (lat, lon, speed) = devRoute[i];
+            var encoded = routeEncoder.Encode(new Dictionary<string, object>
+            {
+                ["location"] = (lat, lon),
+                ["speed_delta"] = speed,
+            });
+            var cols = sp.Compute(encoded, learn: false);
+            var tmOut = tm.Compute(cols, learn: false);
+            string kind = (i == 5 || i == 6) ? "DEVIATED" : "Normal";
+            if (i >= 4 && i <= 7)
+                Console.WriteLine($"   {i,5} | {kind,9} | {tmOut.Anomaly * 100,5:F0} % | ({lat:F3}, {lon:F3})");
+        }
+
+        Console.WriteLine("\n   Expected: low anomaly on the learned route, high anomaly at deviations.");
+    }
 }
