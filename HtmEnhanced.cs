@@ -1520,6 +1520,15 @@ public sealed class SpatialPoolerMetrics
 //   - Detailed per-step diagnostic output
 // ============================================================================
 
+// TODO: Add apical dendrite configuration parameters (ApicalActivationThreshold,
+// ApicalMinThreshold, ApicalMaxSegmentsPerCell, ApicalMaxSynapsesPerSegment,
+// ApicalPermanenceIncrement/Decrement, ApicalConnectedThreshold, ApicalBoostFactor).
+// Currently TemporalMemory only models proximal (feedforward) and distal (lateral/sequence)
+// dendrites. The biological pyramidal neuron has a third zone — apical dendrites extending
+// to L1 — that receives top-down feedback from higher cortical regions. Without apical
+// support here, the hierarchical pipeline (L1→L2) is purely feedforward: L2 can never send
+// predictions back down to modulate L1 cell selection. CorticalColumn has full apical
+// support; TemporalMemory needs parity to enable true multi-region hierarchy.
 public sealed class TemporalMemoryConfig
 {
     public int ColumnCount { get; init; } = 2048;
@@ -1549,11 +1558,18 @@ public sealed class TemporalMemory
     // --- Cell & Segment Storage ---
     // Each cell owns a CellSegmentManager that enforces max-segment limits
     private readonly CellSegmentManager[] _cellSegments;
+    // TODO: Add a separate CellSegmentManager[] for apical dendrite segments (one per cell),
+    // mirroring how CorticalColumn uses _l23ApicalCells. Apical segments store synapses
+    // from higher-region cells and enable top-down depolarization during cell activation.
 
     // --- State (current timestep) ---
     private HashSet<int> _activeCells = new();
     private HashSet<int> _winnerCells = new();
     private HashSet<int> _predictiveCells = new();
+    // TODO: Add _apicallyDepolarizedCells HashSet<int> to track cells that received
+    // sufficient apical input. During activation, apically depolarized cells should be
+    // preferred over non-depolarized cells (similar to how predicted cells win over
+    // bursting), implementing the biological priority: predicted+apical > predicted > burst.
 
     // --- State (previous timestep, for learning) ---
     private HashSet<int> _prevActiveCells = new();
@@ -1599,6 +1615,18 @@ public sealed class TemporalMemory
     private int CellInColumn(int cellIndex) => cellIndex % _config.CellsPerColumn;
 
     /// Main compute: process one timestep
+    // TODO: Extend signature to accept optional apical input:
+    //   public TemporalMemoryOutput Compute(SDR activeColumns, bool learn = true, SDR? apicalInput = null)
+    // When apicalInput is provided:
+    //   1. Build an apical segment activation cache (like BuildSegmentCaches but for apical segments)
+    //   2. Compute apically depolarized cells (cells whose apical segments match the input)
+    //   3. During Phase 1 (cell activation), use three-tier priority within each column:
+    //      - Tier 1: cells that are BOTH predicted (distal) AND apically depolarized (strongest context)
+    //      - Tier 2: cells that are predicted only (distal context matches)
+    //      - Tier 3: burst (no prediction matched)
+    //   4. During Phase 3 (learning), adapt apical synapses on winner cells and grow new
+    //      apical segments on bursting cells, mirroring distal learning logic.
+    // This enables hierarchical feedback: L2_TM predictions → L1_TM apical → faster L1 convergence.
     public TemporalMemoryOutput Compute(SDR activeColumns, bool learn = true)
     {
         _iteration++;
@@ -2836,6 +2864,14 @@ public sealed class CorticalColumnConfig
     public float L23ConnectedThreshold { get; init; } = 0.5f;
     public int L23MaxNewSynapses { get; init; } = 20;
     // Apical dendrites — top-down feedback from higher regions or consensus
+    // TODO: Currently apical input comes from lateral consensus (_prevConsensus in
+    // ThousandBrainsEngine), not from a true higher cortical region. When multi-region
+    // hierarchy is implemented, ApicalInputSize should match the higher region's cell
+    // SDR size, and the source should be hierarchical predictions rather than same-level
+    // consensus. The apical boost is also simplified — it applies a flat multiplier
+    // (ApicalBoostFactor=1.5) rather than implementing the biological mechanism where
+    // apical depolarization creates a distinct predictive state that interacts with
+    // distal predictions (predicted+apical > predicted-only > unpredicted).
     public int ApicalInputSize { get; init; } = 2048;      // Size of apical feedback SDR
     public int ApicalActivationThreshold { get; init; } = 6;  // Min synapses for apical depolarization
     public int ApicalMinThreshold { get; init; } = 4;         // Min synapses for learning match
@@ -3004,6 +3040,17 @@ public sealed class CorticalColumn
                 }
             }
 
+            // TODO: Replace flat apicalBoost multiplier with a proper three-way interaction model.
+            // Biologically, apical depolarization is a distinct state from distal depolarization.
+            // The correct priority should be:
+            //   1. Cells with BOTH distal AND apical depolarization (strongest prediction — context
+            //      from both sequence history and top-down expectation agree)
+            //   2. Cells with distal depolarization only (sequence context matches)
+            //   3. Cells with apical depolarization only (top-down expects, but no sequence match)
+            //   4. Cells with no depolarization (novel/bursting)
+            // Currently this is collapsed into a single score multiplication, which loses the
+            // categorical distinction between these states. A proper implementation would add
+            // Tier 0.5 (distal+apical) above Tier 1 (distal only) in the cell selection.
             float apicalBoost = (maxApicalActivity >= _config.ApicalActivationThreshold)
                 ? _config.ApicalBoostFactor : 1.0f;
 
@@ -3428,6 +3475,17 @@ public sealed class ThousandBrainsEngine
     // Previous consensus: used as apical (top-down) input to columns on the next step.
     // In a multi-region hierarchy this would come from higher cortical regions;
     // in a single-region system, the lateral consensus serves as the expectation signal.
+    // TODO: Replace consensus-as-apical with true hierarchical feedback. This requires:
+    //   1. A higher-level ThousandBrainsEngine (or equivalent region) that processes the
+    //      output of this engine and forms more abstract object representations.
+    //   2. The higher region's predictive state (which columns/cells it expects next)
+    //      becomes the apical input to THIS engine's columns.
+    //   3. The Process() method should accept an optional `SDR? hierarchicalFeedback`
+    //      parameter from the higher region, separate from the lateral consensus.
+    //   4. Apical input should be: hierarchicalFeedback when available, falling back to
+    //      lateral consensus only in single-region mode (not both conflated into one signal).
+    // The current self-referential loop (consensus→apical→cell selection→consensus) can
+    // reinforce representation errors: if consensus drifts, apical amplifies the drift.
     private SDR? _prevConsensus;
     private int _explorationSteps;
 
@@ -3540,6 +3598,18 @@ public sealed class ThousandBrainsEngine
         //    This implements the biological pathway: L2/3 apical dendrites extend to L1,
         //    where they receive feedback from higher regions. In a single-region system,
         //    the lateral consensus serves as the expectation/attention signal.
+        //
+        // TODO: This is the core simplification — lateral consensus is NOT top-down feedback.
+        // In the biological cortex, apical dendrites in L1 receive axons from HIGHER cortical
+        // regions (e.g., prefrontal → sensory, or V2 → V1). The higher region has already
+        // partially recognized the object and sends its prediction downward to constrain
+        // lower-region cell selection. Here we use same-level consensus instead, which:
+        //   (a) Cannot provide truly hierarchical context (no abstraction gradient)
+        //   (b) Creates a circular dependency (consensus depends on cell selection which
+        //       depends on consensus) that can amplify representation errors
+        //   (c) Provides no benefit on the FIRST touch (no previous consensus exists)
+        // Fix: Accept hierarchical feedback as a Process() parameter from a higher-level
+        // ThousandBrainsEngine and pass it as apicalInput instead of _prevConsensus.
         var columnOutputs = new CorticalColumnOutput[_config.ColumnCount];
         for (int i = 0; i < _config.ColumnCount; i++)
         {
@@ -3637,6 +3707,10 @@ public sealed class ThousandBrainsEngine
 
         // Save consensus as apical input for the next processing step.
         // This creates a feedback loop: consensus → apical → biased cell selection → better consensus.
+        // TODO: When hierarchical feedback is available, _prevConsensus should only be used
+        // as a fallback. The primary apical signal should come from the higher region.
+        // Consider storing both and letting CorticalColumn.Compute merge them, or removing
+        // the consensus-as-apical path entirely once the hierarchy is in place.
         _prevConsensus = consensus;
 
         return new ThousandBrainsOutput
@@ -3888,17 +3962,27 @@ public sealed class SPRegion : IRegion
 }
 
 /// Wraps the Temporal Memory as a NetworkAPI region
+// TODO: Add an "apicalIn" input port (PortType.SDR or PortType.CellActivity) so that
+// higher regions in a hierarchical pipeline can send top-down predictions to this TM.
+// This requires TemporalMemory.Compute to accept an optional apical SDR parameter first.
+// Once both are in place, CreateHierarchicalPipeline can wire:
+//   network.Link("L2_TM", "predictiveCells", "L1_TM", "apicalIn")
+// enabling true top-down modulation in the settling loop.
 public sealed class TMRegion : IRegion
 {
     public string Name { get; }
     private readonly TemporalMemoryConfig _config;
     private readonly TemporalMemory _tm;
     private SDR _input = new(0);
+    // TODO: Add _apicalInput field (SDR?) to store top-down feedback received via "apicalIn" port.
     private TemporalMemoryOutput? _lastOutput;
 
     public IReadOnlyList<RegionPort> InputPorts { get; } = new[]
     {
         new RegionPort("bottomUpIn", PortType.SDR),
+        // TODO: Add new RegionPort("apicalIn", PortType.CellActivity) for top-down feedback.
+        // PortType.CellActivity is appropriate since higher-region TM predictive cells are
+        // the natural apical signal — they represent what the higher region expects next.
     };
 
     public IReadOnlyList<RegionPort> OutputPorts { get; } = new[]
@@ -3918,6 +4002,8 @@ public sealed class TMRegion : IRegion
     public void SetInput(string portName, object value)
     {
         if (portName == "bottomUpIn") _input = (SDR)value;
+        // TODO: Handle "apicalIn" port — convert CellActivity (HashSet<int>) to SDR
+        // and store in _apicalInput for passing to _tm.Compute().
     }
 
     public object GetOutput(string portName) => portName switch
@@ -3928,6 +4014,8 @@ public sealed class TMRegion : IRegion
         _ => throw new ArgumentException($"Unknown port: {portName}"),
     };
 
+    // TODO: Pass _apicalInput to _tm.Compute() once TemporalMemory supports it:
+    //   _lastOutput = _tm.Compute(_input, learn, apicalInput: _apicalInput);
     public void Compute(bool learn = true)
         => _lastOutput = _tm.Compute(_input, learn);
 
@@ -4263,6 +4351,28 @@ public sealed class Network
     /// topological pass. For networks with feedback links, runs an initial
     /// feedforward pass followed by settling iterations until convergence
     /// or MaxSettlingIterations is reached.
+    // TODO: The settling loop is generic — it re-runs ALL regions on every iteration,
+    // propagating both feedforward and feedback links uniformly. For apical top-down
+    // feedback to work correctly, consider these refinements:
+    //
+    //   1. LEARNING DURING SETTLING: Currently settling passes set learn=false (line below).
+    //      This is correct for feedforward synapses, but apical synapses should potentially
+    //      learn during settling — the settling process IS the mechanism by which higher and
+    //      lower regions align their representations. If apical synapses only learn on the
+    //      initial (pre-settling) pass, they never see the converged feedback signal.
+    //      Consider: learn apical synapses on the LAST settling iteration (after convergence).
+    //
+    //   2. SELECTIVE RE-COMPUTATION: Not all regions need to re-run on every settling
+    //      iteration. Only regions that are feedback targets (receiving top-down input) and
+    //      their downstream dependents need recomputation. Regions upstream of the feedback
+    //      source don't change. This is an optimization, not a correctness issue.
+    //
+    //   3. APICAL vs FEEDFORWARD SEPARATION: During settling, lower regions should
+    //      recompute using their ORIGINAL feedforward input (unchanged) plus the UPDATED
+    //      apical input from the higher region. Currently ExecutePass re-propagates all
+    //      links, which could cause feedforward inputs to shift if lower regions' outputs
+    //      changed during settling. Consider caching feedforward inputs and only updating
+    //      apical inputs between settling iterations.
     public void Compute(bool learn = true)
     {
         _executionOrder ??= TopologicalSort();
@@ -4448,6 +4558,29 @@ public sealed class Network
     /// boundaries (anomaly spikes). Level 2 receives this slowly-changing
     /// input and learns sequence-of-sequences patterns on a longer timescale.
     /// This is the core hierarchical processing loop from BAMI.
+    ///
+    // TODO: This pipeline is PURELY FEEDFORWARD — information flows only upward
+    // (L1→L2). The biological cortex has extensive feedback connections from higher
+    // regions back to lower regions via apical dendrites. To implement this:
+    //
+    //   1. Add a feedback link from L2_TM back to L1_TM:
+    //        network.FeedbackLink("L2_TM", "predictiveCells", "L1_TM", "apicalIn");
+    //      This sends L2's predictions (what sequence-of-sequences pattern it expects
+    //      next) back to L1 as top-down context, helping L1 disambiguate transitions.
+    //
+    //   2. Prerequisite: TMRegion must support an "apicalIn" input port, and
+    //      TemporalMemory.Compute must accept an optional apical SDR parameter.
+    //
+    //   3. The Network's settling loop will then naturally propagate feedback:
+    //      Pass 1 (feedforward): L1→L2 computes bottom-up
+    //      Pass 2+ (settling): L2 predictions feed back to L1, L1 recomputes with
+    //      apical context, new L1 output feeds forward to L2, repeat until convergence.
+    //
+    //   4. Consider also adding a feedback link from L2_SP or L2_TM back to L1_TP
+    //      to modulate temporal pooling based on higher-level expectations.
+    //
+    // Without feedback, L2 is a passive consumer. With feedback, L2 actively shapes
+    // L1's representations — enabling attention, expectation, and top-down disambiguation.
     public static Network CreateHierarchicalPipeline(
         int inputSize,
         int l1ColumnCount = 2048, int l1CellsPerColumn = 32,
@@ -4488,6 +4621,11 @@ public sealed class Network
         }));
         network.Link("L1_TP", "bottomUpOut", "L2_SP", "bottomUpIn");
         network.Link("L2_SP", "bottomUpOut", "L2_TM", "bottomUpIn");
+
+        // TODO: Add feedback link from L2 back to L1 for true hierarchical processing:
+        //   network.FeedbackLink("L2_TM", "predictiveCells", "L1_TM", "apicalIn");
+        // This requires TMRegion to expose an "apicalIn" port and TemporalMemory to
+        // support apical dendrites. Without this, L2 learning cannot improve L1 predictions.
 
         return network;
     }
