@@ -353,6 +353,39 @@ public sealed class SDR : IEquatable<SDR>
         return new SDR(newSize, projected);
     }
 
+    // --- Sparsity Enforcement ---
+
+    /// Trim an SDR to at most `maxActiveBits` active bits.
+    /// Retains the lowest-index bits for deterministic, reproducible selection.
+    public SDR EnforceSparsity(int maxActiveBits)
+    {
+        if (ActiveCount <= maxActiveBits) return this;
+        // _activeBits is sorted, so Take(n) selects lowest indices — deterministic
+        return new SDR(_size, _activeBits.AsSpan()[..maxActiveBits]);
+    }
+
+    /// Union of two SDRs with a hard cap on active bit count.
+    /// Prefers bits present in BOTH SDRs (intersection), fills remainder from union.
+    /// This preserves the bits with strongest evidence while maintaining sparsity.
+    public static SDR UnionCapped(SDR a, SDR b, int maxActiveBits)
+    {
+        Debug.Assert(a._size == b._size);
+        var intersection = a.Intersect(b);
+        if (intersection.ActiveCount >= maxActiveBits)
+            return intersection.EnforceSparsity(maxActiveBits);
+
+        // Start with all intersection bits, fill from union
+        var result = new HashSet<int>(intersection.ActiveBits.ToArray());
+        var union = a.Union(b);
+        foreach (int bit in union.ActiveBits)
+        {
+            if (result.Count >= maxActiveBits) break;
+            result.Add(bit);
+        }
+
+        return new SDR(a._size, result);
+    }
+
     // --- Dense export ---
     public bool[] ToDense()
     {
