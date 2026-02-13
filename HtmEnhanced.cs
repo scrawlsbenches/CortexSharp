@@ -19,9 +19,6 @@
 // Based on Numenta's HTM/BAMI theory and Thousand Brains Framework.
 // ============================================================================
 
-#pragma warning disable CS8618 // Non-nullable field initialization
-#pragma warning disable CS8600 // Null conversion
-
 using System;
 using System.Buffers;
 using System.Collections.Concurrent;
@@ -93,6 +90,14 @@ public sealed class SDR : IEquatable<SDR>
             if (b >= 0 && b < size) list.Add(b);
         list.Sort();
         _activeBits = list.Distinct().ToArray();
+    }
+
+    /// Replace active bits in-place, invalidating cached representations.
+    public void SetActiveBits(IEnumerable<int> activeBits)
+    {
+        _activeBits = activeBits.Where(b => b >= 0 && b < _size).Distinct().OrderBy(x => x).ToArray();
+        _denseCache = null;
+        _version++;
     }
 
     /// Create from a dense boolean array
@@ -1971,9 +1976,9 @@ public sealed class TemporalMemory
 
 public record TemporalMemoryOutput
 {
-    public HashSet<int> ActiveCells { get; init; }
-    public HashSet<int> WinnerCells { get; init; }
-    public HashSet<int> PredictiveCells { get; init; }
+    public required HashSet<int> ActiveCells { get; init; }
+    public required HashSet<int> WinnerCells { get; init; }
+    public required HashSet<int> PredictiveCells { get; init; }
     public int ActiveColumnCount { get; init; }
     public int BurstingColumnCount { get; init; }
     public int PredictedActiveColumnCount { get; init; }
@@ -1996,6 +2001,7 @@ public sealed class TemporalMemoryMetrics
     public double AvgComputeMs => _computeCount > 0 ? _totalComputeMs / _computeCount : 0;
     public float AvgAnomaly => _avgAnomaly;
     public float AvgBurstFraction => _avgBurstFraction;
+    public float AvgPredictedFraction => _avgPredictedFraction;
     public int LastActiveCells => _lastActiveCells;
     public int LastPredictiveCells => _lastPredictiveCells;
     public long TotalPrunedSynapses => _totalPrunedSynapses;
@@ -2011,6 +2017,8 @@ public sealed class TemporalMemoryMetrics
         _avgAnomaly = (1 - alpha) * _avgAnomaly + alpha * anomaly;
         float burstFrac = activeCols > 0 ? (float)burstCols / activeCols : 0;
         _avgBurstFraction = (1 - alpha) * _avgBurstFraction + alpha * burstFrac;
+        float predictedFrac = activeCols > 0 ? (float)predictedCols / activeCols : 0;
+        _avgPredictedFraction = (1 - alpha) * _avgPredictedFraction + alpha * predictedFrac;
         _lastActiveCells = activeCells;
         _lastPredictiveCells = predictiveCells;
     }
@@ -2023,7 +2031,7 @@ public sealed class TemporalMemoryMetrics
 
     public override string ToString() =>
         $"TM Metrics: computes={ComputeCount}, avgMs={AvgComputeMs:F2}, " +
-        $"avgAnomaly={AvgAnomaly:P1}, avgBurst={AvgBurstFraction:P1}, " +
+        $"avgAnomaly={AvgAnomaly:P1}, avgBurst={AvgBurstFraction:P1}, avgPredicted={AvgPredictedFraction:P1}, " +
         $"activeCells={LastActiveCells}, predictiveCells={LastPredictiveCells}, " +
         $"prunedSynapses={TotalPrunedSynapses}, removedSegments={TotalRemovedSegments}";
 }
@@ -2060,7 +2068,7 @@ public sealed class TemporalPoolerConfig
 
 public record TemporalPoolerOutput
 {
-    public SDR PooledRepresentation { get; init; }
+    public required SDR PooledRepresentation { get; init; }
     public bool IsStable { get; init; }       // Output overlaps previous by ≥70%
     public bool WasReset { get; init; }       // Pool was cleared this step (sequence boundary)
     public int PooledCellCount { get; init; } // Number of cells with active evidence
@@ -2399,7 +2407,7 @@ public record SdrPrediction
     public int Step { get; init; }
     public double? BestPrediction { get; init; }
     public float Confidence { get; init; }
-    public Dictionary<int, float> Distribution { get; init; }
+    public required Dictionary<int, float> Distribution { get; init; }
 }
 
 
@@ -2914,9 +2922,9 @@ public sealed class CorticalColumn
 
 public record CorticalColumnOutput
 {
-    public HashSet<int> ActiveCells { get; init; }
-    public HashSet<int> PredictedCells { get; init; }
-    public SDR ObjectRepresentation { get; init; }
+    public required HashSet<int> ActiveCells { get; init; }
+    public required HashSet<int> PredictedCells { get; init; }
+    public required SDR ObjectRepresentation { get; init; }
     public float Anomaly { get; init; }
     public float Confidence { get; init; }
 }
@@ -3053,7 +3061,7 @@ public sealed class ThousandBrainsConfig
 {
     public int ColumnCount { get; init; } = 8;
     public CorticalColumnConfig ColumnConfig { get; init; } = new();
-    public GridCellModuleConfig[] GridModuleConfigs { get; init; }
+    public GridCellModuleConfig[] GridModuleConfigs { get; init; } = Array.Empty<GridCellModuleConfig>();
     public LateralVotingConfig VotingConfig { get; init; } = new();
     public bool UseDisplacementCells { get; init; } = true;
     public int DisplacementModuleSize { get; init; } = 40;
@@ -3090,7 +3098,7 @@ public sealed class ThousandBrainsEngine
                 Orientation = i * MathF.PI / config.ColumnCount, // Spread orientations
             }).ToArray();
 
-        var gridConfigs = config.GridModuleConfigs ?? defaultGridConfigs;
+        var gridConfigs = config.GridModuleConfigs.Length > 0 ? config.GridModuleConfigs : defaultGridConfigs;
 
         _gridModules = new GridCellModule[config.ColumnCount];
         _columns = new CorticalColumn[config.ColumnCount];
@@ -3239,12 +3247,12 @@ public sealed class ThousandBrainsEngine
 
 public record ThousandBrainsOutput
 {
-    public SDR Consensus { get; init; }
+    public required SDR Consensus { get; init; }
     public bool Converged { get; init; }
     public int VotingIterations { get; init; }
     public string? RecognizedObject { get; init; }
     public float RecognitionConfidence { get; init; }
-    public CorticalColumnOutput[] ColumnOutputs { get; init; }
+    public required CorticalColumnOutput[] ColumnOutputs { get; init; }
     public float AvgAnomaly { get; init; }
     public SDR? PredictedNextLocation { get; init; }
 }
@@ -3300,8 +3308,8 @@ public sealed class SPRegion : IRegion
     public string Name { get; }
     private readonly SpatialPoolerConfig _config;
     private readonly SpatialPooler _sp;
-    private SDR _input;
-    private SDR _output;
+    private SDR _input = new(0);
+    private SDR _output = new(0);
 
     public IReadOnlyList<RegionPort> InputPorts { get; } = new[]
     {
@@ -3414,8 +3422,8 @@ public sealed class TMRegion : IRegion
     public string Name { get; }
     private readonly TemporalMemoryConfig _config;
     private readonly TemporalMemory _tm;
-    private SDR _input;
-    private TemporalMemoryOutput _lastOutput;
+    private SDR _input = new(0);
+    private TemporalMemoryOutput? _lastOutput;
 
     public IReadOnlyList<RegionPort> InputPorts { get; } = new[]
     {
@@ -3537,8 +3545,8 @@ public sealed class EncoderRegion<T> : IRegion
 {
     public string Name { get; }
     private readonly IEncoder<T> _encoder;
-    private T _input;
-    private SDR _output;
+    private T _input = default!;
+    private SDR _output = new(0);
 
     public IReadOnlyList<RegionPort> InputPorts { get; } = new[]
     {
@@ -3587,10 +3595,10 @@ public sealed class PredictorRegion : IRegion
     public string Name { get; }
     private readonly SdrPredictor _predictor;
     private readonly int[] _steps;
-    private HashSet<int> _activeCells;
+    private HashSet<int> _activeCells = new();
     private double _actualValue;
     private bool _hasActualValue;
-    private Dictionary<int, SdrPrediction> _predictions;
+    private Dictionary<int, SdrPrediction>? _predictions;
 
     public IReadOnlyList<RegionPort> InputPorts { get; } = new[]
     {
@@ -3662,7 +3670,7 @@ public sealed class TemporalPoolerRegion : IRegion
     private readonly TemporalPooler _tp;
     private HashSet<int> _predictiveCells = new();
     private float _anomaly;
-    private TemporalPoolerOutput _lastOutput;
+    private TemporalPoolerOutput? _lastOutput;
 
     public IReadOnlyList<RegionPort> InputPorts { get; } = new[]
     {
@@ -4512,28 +4520,28 @@ public record SystemHealthReport
 
 public record StreamConfig
 {
-    public string StreamId { get; init; }
-    public CompositeEncoder Encoder { get; init; }
-    public SpatialPoolerConfig SPConfig { get; init; }
-    public TemporalMemoryConfig TMConfig { get; init; }
+    public required string StreamId { get; init; }
+    public required CompositeEncoder Encoder { get; init; }
+    public required SpatialPoolerConfig SPConfig { get; init; }
+    public required TemporalMemoryConfig TMConfig { get; init; }
     public int[] PredictionSteps { get; init; } = new[] { 1, 5 };
     public double PredictorResolution { get; init; } = 1.0;
 }
 
 public record StreamDataPoint
 {
-    public string StreamId { get; init; }
-    public Dictionary<string, object> Data { get; init; }
+    public required string StreamId { get; init; }
+    public required Dictionary<string, object> Data { get; init; }
     public DateTime Timestamp { get; init; }
 }
 
 public record StreamResult
 {
-    public string StreamId { get; init; }
+    public required string StreamId { get; init; }
     public DateTime Timestamp { get; init; }
     public float RawAnomaly { get; init; }
     public float AnomalyLikelihood { get; init; }
-    public Dictionary<int, SdrPrediction> Predictions { get; init; }
+    public required Dictionary<int, SdrPrediction> Predictions { get; init; }
     public int ActiveCellCount { get; init; }
     public int PredictiveCellCount { get; init; }
 }
@@ -4775,7 +4783,7 @@ public record MultiStreamStats
 
 public sealed class HtmEngineConfig
 {
-    public CompositeEncoder Encoder { get; init; }
+    public required CompositeEncoder Encoder { get; init; }
     public int ColumnCount { get; init; } = 2048;
     public int CellsPerColumn { get; init; } = 32;
     public float Sparsity { get; init; } = 0.02f;
@@ -4796,12 +4804,12 @@ public sealed class HtmEngineConfig
 
 public record HtmResult
 {
-    public SDR EncodedInput { get; init; }
-    public SDR ActiveColumns { get; init; }
-    public TemporalMemoryOutput TmOutput { get; init; }
-    public TemporalPoolerOutput TpOutput { get; init; }
+    public required SDR EncodedInput { get; init; }
+    public required SDR ActiveColumns { get; init; }
+    public required TemporalMemoryOutput TmOutput { get; init; }
+    public required TemporalPoolerOutput TpOutput { get; init; }
     public float AnomalyLikelihood { get; init; }
-    public Dictionary<int, SdrPrediction> Predictions { get; init; }
+    public required Dictionary<int, SdrPrediction> Predictions { get; init; }
     public int Iteration { get; init; }
 }
 
@@ -6391,7 +6399,7 @@ public static class HtmExamples
         foreach (var (prefix, explanation) in prefixes)
         {
             tm.Reset();
-            TemporalMemoryOutput lastOutput = null;
+            TemporalMemoryOutput? lastOutput = null;
             foreach (char ch in prefix)
             {
                 var cols = sp.Compute(charEncoder.Encode(ch.ToString()), learn: false);
@@ -6452,7 +6460,7 @@ public static class HtmExamples
         foreach (string seed in seeds)
         {
             tm.Reset();
-            TemporalMemoryOutput lastOutput = null;
+            TemporalMemoryOutput? lastOutput = null;
             foreach (char ch in seed)
             {
                 var cols = sp.Compute(charEncoder.Encode(ch.ToString()), learn: false);
