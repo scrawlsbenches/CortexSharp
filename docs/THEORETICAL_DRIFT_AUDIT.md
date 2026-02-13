@@ -286,25 +286,27 @@ SDR union operations (used in `AccumulateObjectEvidence` and elsewhere) can prod
 
 ## Summary Table
 
-| # | Issue | Severity | Category |
-|---|-------|----------|----------|
-| 1 | Grid cells labeled allocentric (should be object-centric) | Critical | Naming/Conceptual |
-| 2 | Evidence accumulation grows instead of narrows | Critical | Recognition |
-| 3 | Feature + location combined into single SP (collapses layers) | Critical | Architecture |
-| 4 | Lateral voting uses blending instead of intersection | Critical | Voting |
-| 5 | Apical dendrites missing entirely | Major | Dendrites |
-| 6 | Square grid cells instead of hexagonal | Major | Grid Cells |
-| 7 | One grid module per column instead of multiple | Major | Grid Cells |
-| 8 | Object memory uses hash-table instead of SDR associations | Major | Object Layer |
-| 9 | Displacement prediction is sequence replay, not structural | Major | Displacement Cells |
-| 10 | Boosting disabled by default (BoostStrength=0.0) | Major | Spatial Pooler |
-| 11 | Sensory patches shared/wrapped across columns | Major | Architecture |
-| 12 | Grid anchoring uses hash-code lookup | Minor | Grid Cells |
-| 13 | No minicolumn abstraction (32 cells vs 80–120) | Minor | Architecture |
-| 14 | SP permanence initialization range | Minor | Spatial Pooler |
-| 15 | Recognition by threshold instead of convergence | Minor | Recognition |
-| 16 | No learning rate decay | Minor | Learning |
-| 17 | SDR unions may violate sparsity | Minor | SDR |
+| # | Issue | Severity | Category | Status |
+|---|-------|----------|----------|--------|
+| 1 | Grid cells labeled allocentric (should be object-centric) | Critical | Naming/Conceptual | RESOLVED |
+| 2 | Evidence accumulation grows instead of narrows | Critical | Recognition | RESOLVED |
+| 3 | Feature + location combined into single SP (collapses layers) | Critical | Architecture | RESOLVED |
+| 4 | Lateral voting uses blending instead of intersection | Critical | Voting | RESOLVED |
+| 5 | Apical dendrites missing entirely | Major | Dendrites | RESOLVED |
+| 6 | Square grid cells instead of hexagonal | Major | Grid Cells | RESOLVED |
+| 7 | One grid module per column instead of multiple | Major | Grid Cells | RESOLVED |
+| 8 | Object memory uses hash-table instead of SDR associations | Major | Object Layer | RESOLVED |
+| 9 | Displacement prediction is sequence replay, not structural | Major | Displacement Cells | RESOLVED |
+| 10 | Boosting disabled by default (BoostStrength=0.0) | Major | Spatial Pooler | RESOLVED |
+| 11 | Sensory patches shared/wrapped across columns | Major | Architecture | RESOLVED |
+| 12 | Grid anchoring uses hash-code lookup | Minor | Grid Cells | RESOLVED |
+| 13 | No minicolumn abstraction (32 cells vs 80–120) | Minor | Architecture | ACCEPTED |
+| 14 | SP permanence initialization range | Minor | Spatial Pooler | RESOLVED |
+| 15 | Recognition by threshold instead of convergence | Minor | Recognition | RESOLVED |
+| 16 | No learning rate decay | Minor | Learning | RESOLVED |
+| 17 | SDR unions may violate sparsity | Minor | SDR | RESOLVED |
+
+All 17 items addressed. 16 resolved via code changes, 1 accepted as standard deviation (#13).
 
 ---
 
