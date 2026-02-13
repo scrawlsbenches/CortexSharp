@@ -2815,90 +2815,184 @@ public sealed class CorticalColumnConfig
 {
     public int InputSize { get; init; } = 512;
     public int LocationSize { get; init; } = 1600;     // Grid cell module output size
-    public int ColumnCount { get; init; } = 1024;
+    public int L4ColumnCount { get; init; } = 1024;    // L4 SP columns
     public int CellsPerColumn { get; init; } = 16;
     public int ObjectRepresentationSize { get; init; } = 2048;
     public int ObjectActiveBits { get; init; } = 40;
-    public float LateralInfluence { get; init; } = 0.3f; // Reserved for future use (intersection-based voting doesn't need a blend weight)
+    // L2/3 object layer config
+    public int L23ActivationThreshold { get; init; } = 8;   // Min synapses for segment activation
+    public int L23MinThreshold { get; init; } = 5;          // Min synapses for learning match
+    public int L23MaxSegmentsPerCell { get; init; } = 32;
+    public int L23MaxSynapsesPerSegment { get; init; } = 40;
+    public float L23PermanenceIncrement { get; init; } = 0.1f;
+    public float L23PermanenceDecrement { get; init; } = 0.02f;
+    public float L23InitialPermanence { get; init; } = 0.21f;
+    public float L23ConnectedThreshold { get; init; } = 0.5f;
+    public int L23MaxNewSynapses { get; init; } = 20;
+    // Backward compatibility
+    public int ColumnCount { get => L4ColumnCount; init => L4ColumnCount = value; }
 }
 
+/// Models a single cortical column in the Thousand Brains framework with
+/// biologically distinct layers:
+///
+///   L4 (Input Layer):  Spatial Pooler processes ONLY sensory features.
+///                      Produces a sparse representation of "what feature is here."
+///
+///   TM (Sequence):     Temporal Memory on L4 output adds sequence context.
+///                      Distinguishes the same feature in different temporal contexts.
+///
+///   L2/3 (Object Layer): Receives L4/TM feature output AND location SDR from grid cells
+///                        through separate pathways (not concatenated into the SP).
+///                        Uses distal dendrite segments to learn (feature, location) → object
+///                        associations via Hebbian permanence-based learning.
+///                        Active L2/3 cells = the object representation.
+///
+/// This architecture matches the theory: L4 is feedforward-only,
+/// location enters at L2/3 via a separate pathway, and object memory
+/// is stored in synaptic permanences (not a hash table).
 public sealed class CorticalColumn
 {
     private readonly CorticalColumnConfig _config;
-    private readonly SpatialPooler _featureSP;
-    private readonly TemporalMemory _sequenceTM;
+    private readonly SpatialPooler _l4SP;             // L4: sensory input only
+    private readonly TemporalMemory _sequenceTM;       // TM: sequence context on L4
     private readonly Random _rng;
 
-    // Object layer: maps (feature SDR, location SDR) → object SDR
-    // This is a simplified associative memory
-    private readonly Dictionary<int, HashSet<int>> _objectMemory = new();
+    // L2/3 Object Layer: SDR-based associative memory using dendrite segments.
+    // Each cell has distal segments that learn (feature + location) associations.
+    private readonly CellSegmentManager[] _l23Cells;
+    private readonly int _l23InputSize;                // L4 SP output size + location SDR size
 
     // Current state
     private SDR _currentObjectRepresentation;
-    private SDR _lastSensoryInput;
-    private SDR _lastLocationInput;
     private float _confidence;
-
-    // Pool of known object representations
-    private readonly List<(string Label, SDR Representation)> _knownObjects = new();
 
     public CorticalColumn(CorticalColumnConfig config, int seed = 42)
     {
         _config = config;
         _rng = new Random(seed);
 
-        _featureSP = new SpatialPooler(new SpatialPoolerConfig
+        // L4: Spatial Pooler processes ONLY sensory input (not combined with location)
+        _l4SP = new SpatialPooler(new SpatialPoolerConfig
         {
-            InputSize = config.InputSize + config.LocationSize, // Combined input
-            ColumnCount = config.ColumnCount,
+            InputSize = config.InputSize,          // Sensory input only — NOT combined with location
+            ColumnCount = config.L4ColumnCount,
             TargetSparsity = 0.02f,
             Inhibition = InhibitionMode.Global,
         });
 
+        // TM: Temporal Memory for sequence context on L4 output
         _sequenceTM = new TemporalMemory(new TemporalMemoryConfig
         {
-            ColumnCount = config.ColumnCount,
+            ColumnCount = config.L4ColumnCount,
             CellsPerColumn = config.CellsPerColumn,
             MaxSegmentsPerCell = 64,
             MaxSynapsesPerSegment = 32,
         });
 
+        // L2/3 Object Layer: cells with distal segments
+        // Input to L2/3 is the concatenation of L4 feature SDR + location SDR
+        _l23InputSize = config.L4ColumnCount + config.LocationSize;
+        _l23Cells = new CellSegmentManager[config.ObjectRepresentationSize];
+        for (int i = 0; i < config.ObjectRepresentationSize; i++)
+        {
+            _l23Cells[i] = new CellSegmentManager(
+                config.L23MaxSegmentsPerCell,
+                config.L23MaxSynapsesPerSegment);
+        }
+
         _currentObjectRepresentation = new SDR(config.ObjectRepresentationSize);
-        _lastSensoryInput = new SDR(config.InputSize);
-        _lastLocationInput = new SDR(config.LocationSize);
     }
 
     /// Process one sensory observation with its associated location.
     public CorticalColumnOutput Compute(SDR sensoryInput, SDR locationInput, bool learn = true)
     {
-        _lastSensoryInput = sensoryInput;
-        _lastLocationInput = locationInput;
+        // ---- L4: Feature extraction (sensory input only) ----
+        var l4ActiveColumns = _l4SP.Compute(sensoryInput, learn);
 
-        // Step 1: Combine sensory feature and location into a single input
-        var combinedInput = CombineFeatureAndLocation(sensoryInput, locationInput);
+        // ---- TM: Sequence context ----
+        var tmOutput = _sequenceTM.Compute(l4ActiveColumns, learn);
 
-        // Step 2: Spatial Pooler — create sparse representation of feature-at-location
-        var activeColumns = _featureSP.Compute(combinedInput, learn);
+        // ---- L2/3: Object layer ----
+        // L2/3 receives BOTH the L4 feature representation AND the location signal
+        // through separate pathways, combined here for segment matching.
+        var l23Input = CombineL4AndLocation(l4ActiveColumns, locationInput);
+        var l23InputBits = l23Input.ActiveBits.ToArray().ToHashSet();
 
-        // Step 3: Temporal Memory — add sequence context
-        var tmOutput = _sequenceTM.Compute(activeColumns, learn);
+        // Find L2/3 cells whose distal segments match the (feature, location) input
+        var candidateCells = new List<(int CellIdx, int Activity)>();
+        for (int c = 0; c < _config.ObjectRepresentationSize; c++)
+        {
+            int maxActivity = 0;
+            foreach (var segment in _l23Cells[c].Segments)
+            {
+                int activity = segment.ComputeActivity(l23InputBits, _config.L23ConnectedThreshold);
+                maxActivity = Math.Max(maxActivity, activity);
+            }
+            if (maxActivity >= _config.L23ActivationThreshold)
+                candidateCells.Add((c, maxActivity));
+        }
 
-        // Step 4: Generate object representation from TM cell activity
-        // Hash the active cells to produce a compact object-layer representation
-        var objectSDR = ProjectToObjectLayer(tmOutput.ActiveCells);
+        // Select active L2/3 cells: competitive inhibition (top-k)
+        var newL23Active = new HashSet<int>();
+        if (candidateCells.Count > 0)
+        {
+            foreach (var (cellIdx, _) in candidateCells
+                .OrderByDescending(c => c.Activity)
+                .Take(_config.ObjectActiveBits))
+            {
+                newL23Active.Add(cellIdx);
+            }
+        }
+        else
+        {
+            // Novel input: no segments match. Activate cells with fewest segments
+            // (least-used) to maximize representational capacity.
+            var available = Enumerable.Range(0, _config.ObjectRepresentationSize)
+                .OrderBy(c => _l23Cells[c].SegmentCount)
+                .ThenBy(_ => _rng.Next())
+                .Take(_config.ObjectActiveBits);
+            foreach (int c in available)
+                newL23Active.Add(c);
+        }
 
-        // Step 5: Update running object representation (accumulate evidence)
-        _currentObjectRepresentation = AccumulateObjectEvidence(
-            _currentObjectRepresentation, objectSDR);
-
-        // Step 6: Learn feature-at-location → object association
+        // L2/3 Learning: reinforce/grow segments that associate (feature, location) with object
         if (learn)
         {
-            int featureLocationHash = HashCode.Combine(
-                sensoryInput.GetHashCode(), locationInput.GetHashCode());
-            _objectMemory[featureLocationHash] = new HashSet<int>(
-                _currentObjectRepresentation.ActiveBits.ToArray());
+            foreach (int cellIdx in newL23Active)
+            {
+                DendriteSegment? bestSegment = null;
+                int bestActivity = 0;
+                foreach (var segment in _l23Cells[cellIdx].Segments)
+                {
+                    int activity = segment.ComputeActivity(l23InputBits, _config.L23ConnectedThreshold);
+                    if (activity > bestActivity)
+                    {
+                        bestActivity = activity;
+                        bestSegment = segment;
+                    }
+                }
+
+                if (bestSegment != null && bestActivity >= _config.L23MinThreshold)
+                {
+                    bestSegment.AdaptSynapses(l23InputBits,
+                        _config.L23PermanenceIncrement, _config.L23PermanenceDecrement);
+                    GrowL23Synapses(bestSegment, l23InputBits);
+                }
+                else
+                {
+                    var newSegment = _l23Cells[cellIdx].CreateSegment(cellIdx, 0);
+                    GrowL23Synapses(newSegment, l23InputBits);
+                }
+            }
         }
+
+        // Object representation = active L2/3 cells
+        var objectSDR = new SDR(_config.ObjectRepresentationSize, newL23Active);
+
+        // Accumulate evidence across observations (intersection-based narrowing)
+        _currentObjectRepresentation = AccumulateObjectEvidence(
+            _currentObjectRepresentation, objectSDR);
 
         _confidence = 1.0f - tmOutput.Anomaly;
 
@@ -2913,8 +3007,6 @@ public sealed class CorticalColumn
     }
 
     /// Incorporate lateral input from other columns (voting).
-    /// Per the Thousand Brains Theory, columns narrow their candidate sets
-    /// by intersecting with the consensus — keeping only mutually supported bits.
     public void ReceiveLateralInput(SDR consensusRepresentation)
     {
         if (consensusRepresentation.ActiveCount == 0) return;
@@ -2924,23 +3016,15 @@ public sealed class CorticalColumn
 
         if (intersection.ActiveCount > 0)
         {
-            // Bits supported by both this column and the consensus survive.
-            // This narrows the candidate set — the core voting mechanism.
             _currentObjectRepresentation = intersection.EnforceSparsity(_config.ObjectActiveBits);
         }
         else if (_confidence < 0.5f)
         {
-            // No overlap and low confidence: this column has no useful information.
-            // Defer to the collective wisdom of other columns.
             _currentObjectRepresentation = consensusRepresentation;
         }
-        // else: no overlap but high confidence — this column disagrees with consensus.
-        // Keep its representation; further observations will resolve the conflict.
     }
 
-    /// Reset object evidence and temporal state (e.g., when starting to explore a new object).
-    /// Clears TM predictions so that sequence context from the previous object
-    /// does not produce spurious predictions on the first touch of the new one.
+    /// Reset object evidence and temporal state.
     public void ResetObjectRepresentation()
     {
         _currentObjectRepresentation = new SDR(_config.ObjectRepresentationSize);
@@ -2952,60 +3036,38 @@ public sealed class CorticalColumn
 
     // --- Internals ---
 
-    private SDR CombineFeatureAndLocation(SDR feature, SDR location)
+    /// Combine L4 feature columns and location SDR into L2/3 input space.
+    private SDR CombineL4AndLocation(SDR l4Columns, SDR location)
     {
-        int totalSize = _config.InputSize + _config.LocationSize;
-        var combined = new List<int>(feature.ActiveBits.ToArray());
+        var combined = new List<int>(l4Columns.ActiveBits.ToArray());
         foreach (int bit in location.ActiveBits)
-            combined.Add(bit + _config.InputSize);
-        return new SDR(totalSize, combined);
+            combined.Add(bit + _config.L4ColumnCount);
+        return new SDR(_l23InputSize, combined);
     }
 
-    /// Project TM cell activity into the object representation space
-    /// using a deterministic hash-based projection
-    private SDR ProjectToObjectLayer(HashSet<int> activeCells)
+    /// Grow synapses on an L2/3 segment toward active input bits not yet connected.
+    private void GrowL23Synapses(DendriteSegment segment, HashSet<int> inputBits)
     {
-        var objectBits = new HashSet<int>();
-        foreach (int cell in activeCells)
-        {
-            // Hash each active cell to 2-3 bits in object space
-            int hash = HashCode.Combine(cell, 0xDEADBEEF);
-            objectBits.Add(((hash & 0x7FFFFFFF) % _config.ObjectRepresentationSize));
-            hash = HashCode.Combine(cell, 0xCAFEBABE);
-            objectBits.Add(((hash & 0x7FFFFFFF) % _config.ObjectRepresentationSize));
-        }
+        var candidates = inputBits
+            .Where(b => !segment.HasSynapseTo(b))
+            .OrderBy(_ => _rng.Next())
+            .Take(_config.L23MaxNewSynapses);
 
-        // Subsample to maintain target sparsity — use deterministic selection
-        // (lowest bit indices) so the same TM cells always produce the same
-        // object SDR regardless of RNG state.
-        if (objectBits.Count > _config.ObjectActiveBits)
-        {
-            var sampled = objectBits.OrderBy(b => b).Take(_config.ObjectActiveBits);
-            return new SDR(_config.ObjectRepresentationSize, sampled);
-        }
-
-        return new SDR(_config.ObjectRepresentationSize, objectBits);
+        foreach (int target in candidates)
+            segment.AddSynapse(new Synapse(target, _config.L23InitialPermanence));
+        segment.EnforceMaxSynapses(_config.L23MaxSynapsesPerSegment);
     }
 
-    /// Accumulate object evidence: narrow the candidate set with each observation.
-    /// Each new observation eliminates inconsistent candidates via intersection.
-    /// If the intersection is too sparse (new object or conflicting observation),
-    /// reset to the current observation — start a new candidate set.
+    /// Accumulate object evidence via intersection-based narrowing.
     private SDR AccumulateObjectEvidence(SDR previous, SDR current)
     {
         if (previous.ActiveCount == 0) return current;
 
-        // Intersection: only bits supported by BOTH previous and current survive.
-        // This implements the theory's "progressive narrowing" of candidates.
         var intersection = previous.Intersect(current);
-
-        // If enough bits survive, the observation is consistent — narrow the set
         int minViableBits = Math.Max(1, _config.ObjectActiveBits / 4);
         if (intersection.ActiveCount >= minViableBits)
             return intersection.EnforceSparsity(_config.ObjectActiveBits);
 
-        // Too few bits survived: this observation is inconsistent with accumulated
-        // evidence. Reset to current observation (new candidate set).
         return current;
     }
 
@@ -3174,10 +3236,11 @@ public sealed class ThousandBrainsEngine
 
     // Known objects for recognition
     private readonly Dictionary<string, SDR> _objectLibrary = new();
-    // Learned object structure: object label → list of (displacement SDR) for predicting next location
-    private readonly Dictionary<string, List<SDR>> _objectDisplacements = new();
-    // Current object's displacement sequence being accumulated during learning
-    private readonly List<SDR> _currentDisplacements = new();
+    // Learned object structure: object label → list of (sourceLocation, displacement, targetLocation)
+    // Displacement predictions are keyed by source location (SDR overlap), not sequence order.
+    private readonly Dictionary<string, List<(SDR SourceLocation, SDR Displacement, SDR TargetLocation)>> _objectStructure = new();
+    // Current object's structural observations being accumulated during learning
+    private readonly List<(SDR SourceLocation, SDR Displacement, SDR TargetLocation)> _currentStructure = new();
     // Previous grid cell locations for displacement computation
     private SDR[]? _prevGridLocations;
     private int _explorationSteps;
@@ -3222,11 +3285,19 @@ public sealed class ThousandBrainsEngine
         {
             InputSize = config.ColumnConfig.InputSize,
             LocationSize = _totalLocationSize,
-            ColumnCount = config.ColumnConfig.ColumnCount,
+            L4ColumnCount = config.ColumnConfig.L4ColumnCount,
             CellsPerColumn = config.ColumnConfig.CellsPerColumn,
             ObjectRepresentationSize = config.ColumnConfig.ObjectRepresentationSize,
             ObjectActiveBits = config.ColumnConfig.ObjectActiveBits,
-            LateralInfluence = config.ColumnConfig.LateralInfluence,
+            L23ActivationThreshold = config.ColumnConfig.L23ActivationThreshold,
+            L23MinThreshold = config.ColumnConfig.L23MinThreshold,
+            L23MaxSegmentsPerCell = config.ColumnConfig.L23MaxSegmentsPerCell,
+            L23MaxSynapsesPerSegment = config.ColumnConfig.L23MaxSynapsesPerSegment,
+            L23PermanenceIncrement = config.ColumnConfig.L23PermanenceIncrement,
+            L23PermanenceDecrement = config.ColumnConfig.L23PermanenceDecrement,
+            L23InitialPermanence = config.ColumnConfig.L23InitialPermanence,
+            L23ConnectedThreshold = config.ColumnConfig.L23ConnectedThreshold,
+            L23MaxNewSynapses = config.ColumnConfig.L23MaxNewSynapses,
         };
 
         for (int i = 0; i < config.ColumnCount; i++)
@@ -3311,7 +3382,9 @@ public sealed class ThousandBrainsEngine
         }
 
         // 5. Compute displacement predictions if enabled
-        // Uses the first module of the first column as the reference for displacement
+        // Structure-based: predictions are conditioned on current location (SDR overlap),
+        // not on step count. This means exploring an object in a different order
+        // than during learning still produces correct predictions.
         SDR? predictedNextLocation = null;
         if (_displacementModule != null && _explorationSteps > 1 && _prevGridLocations != null)
         {
@@ -3323,19 +3396,35 @@ public sealed class ThousandBrainsEngine
 
             if (learn)
             {
-                // During learning: accumulate displacements for the current object
-                _currentDisplacements.Add(displacement);
+                // During learning: store structural observation (source → displacement → target)
+                _currentStructure.Add((prevLoc, displacement, currentLoc));
             }
 
             if (recognizedObject != null
-                && _objectDisplacements.TryGetValue(recognizedObject, out var learnedDisps)
-                && learnedDisps.Count > 0)
+                && _objectStructure.TryGetValue(recognizedObject, out var structure)
+                && structure.Count > 0)
             {
-                // During recognition: use the most recently matched displacement
-                // to predict the next location based on learned object structure
-                int nextIdx = (_explorationSteps - 1) % learnedDisps.Count;
-                predictedNextLocation = _displacementModule.PredictTarget(
-                    currentLoc, learnedDisps[nextIdx]);
+                // During recognition: find the stored structural entry whose source
+                // location best matches the current location (by SDR overlap)
+                int bestOverlap = 0;
+                (SDR SourceLocation, SDR Displacement, SDR TargetLocation)? bestEntry = null;
+
+                foreach (var entry in structure)
+                {
+                    int overlap = currentLoc.Overlap(entry.SourceLocation);
+                    if (overlap > bestOverlap)
+                    {
+                        bestOverlap = overlap;
+                        bestEntry = entry;
+                    }
+                }
+
+                if (bestEntry.HasValue && bestOverlap > 0)
+                {
+                    // Predict next location from current position + best-matching displacement
+                    predictedNextLocation = _displacementModule.PredictTarget(
+                        currentLoc, bestEntry.Value.Displacement);
+                }
             }
         }
 
@@ -3364,9 +3453,9 @@ public sealed class ThousandBrainsEngine
         var consensus = _voting.ComputeConsensus(votes);
         _objectLibrary[label] = consensus;
 
-        // Store learned displacement sequence for this object
-        if (_displacementModule != null && _currentDisplacements.Count > 0)
-            _objectDisplacements[label] = new List<SDR>(_currentDisplacements);
+        // Store learned object structure (location → displacement → target)
+        if (_displacementModule != null && _currentStructure.Count > 0)
+            _objectStructure[label] = new List<(SDR, SDR, SDR)>(_currentStructure);
     }
 
     /// Reset all columns and grid cells for exploring a new object.
@@ -3379,7 +3468,7 @@ public sealed class ThousandBrainsEngine
     {
         _explorationSteps = 0;
         _prevGridLocations = null;
-        _currentDisplacements.Clear();
+        _currentStructure.Clear();
         foreach (var column in _columns)
             column.ResetObjectRepresentation();
         for (int i = 0; i < _config.ColumnCount; i++)
