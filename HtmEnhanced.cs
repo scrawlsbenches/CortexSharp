@@ -1022,6 +1022,12 @@ public sealed class DendriteSegment
         => _synapses.Any(s => s.PresynapticIndex == presynapticIndex);
 }
 
+/// The three functionally distinct dendritic zones of a pyramidal neuron.
+///   Proximal — close to soma, receives feedforward input, drives activation (SP models this)
+///   Distal   — basal dendrites, receives lateral input, produces depolarization / prediction (TM models this)
+///   Apical   — extends to L1, receives top-down feedback from higher regions, provides contextual modulation
+public enum DendriteType { Proximal, Distal, Apical }
+
 /// Manages the dendrite segments for a single cell, enforcing max-segment limits
 /// and providing LRU eviction of least-recently-used segments.
 public sealed class CellSegmentManager
@@ -2829,6 +2835,18 @@ public sealed class CorticalColumnConfig
     public float L23InitialPermanence { get; init; } = 0.21f;
     public float L23ConnectedThreshold { get; init; } = 0.5f;
     public int L23MaxNewSynapses { get; init; } = 20;
+    // Apical dendrites — top-down feedback from higher regions or consensus
+    public int ApicalInputSize { get; init; } = 2048;      // Size of apical feedback SDR
+    public int ApicalActivationThreshold { get; init; } = 6;  // Min synapses for apical depolarization
+    public int ApicalMinThreshold { get; init; } = 4;         // Min synapses for learning match
+    public int ApicalMaxSegmentsPerCell { get; init; } = 16;
+    public int ApicalMaxSynapsesPerSegment { get; init; } = 32;
+    public float ApicalPermanenceIncrement { get; init; } = 0.1f;
+    public float ApicalPermanenceDecrement { get; init; } = 0.02f;
+    public float ApicalInitialPermanence { get; init; } = 0.21f;
+    public float ApicalConnectedThreshold { get; init; } = 0.5f;
+    public int ApicalMaxNewSynapses { get; init; } = 16;
+    public float ApicalBoostFactor { get; init; } = 1.5f;     // How much apical depolarization boosts cell priority
     // Backward compatibility
     public int ColumnCount { get => L4ColumnCount; init => L4ColumnCount = value; }
 }
@@ -2846,11 +2864,20 @@ public sealed class CorticalColumnConfig
 ///                        through separate pathways (not concatenated into the SP).
 ///                        Uses distal dendrite segments to learn (feature, location) → object
 ///                        associations via Hebbian permanence-based learning.
+///                        Apical dendrite segments receive top-down feedback (consensus/
+///                        higher-region expectations) and provide contextual modulation.
 ///                        Active L2/3 cells = the object representation.
 ///
 /// This architecture matches the theory: L4 is feedforward-only,
-/// location enters at L2/3 via a separate pathway, and object memory
-/// is stored in synaptic permanences (not a hash table).
+/// location enters at L2/3 via a separate pathway, object memory
+/// is stored in synaptic permanences (not a hash table), and apical
+/// dendrites carry top-down attention/expectation signals.
+///
+/// Dendritic zones modeled:
+///   Proximal (L4 SP)  — feedforward sensory input drives column activation
+///   Distal   (L2/3)   — lateral (feature+location) context drives prediction
+///   Apical   (L2/3)   — top-down feedback from higher regions or consensus
+///                        depolarizes cells, biasing competitive selection
 public sealed class CorticalColumn
 {
     private readonly CorticalColumnConfig _config;
@@ -2858,10 +2885,14 @@ public sealed class CorticalColumn
     private readonly TemporalMemory _sequenceTM;       // TM: sequence context on L4
     private readonly Random _rng;
 
-    // L2/3 Object Layer: SDR-based associative memory using dendrite segments.
-    // Each cell has distal segments that learn (feature + location) associations.
+    // L2/3 Object Layer — Distal dendrites: learn (feature + location) associations.
     private readonly CellSegmentManager[] _l23Cells;
     private readonly int _l23InputSize;                // L4 SP output size + location SDR size
+
+    // L2/3 Object Layer — Apical dendrites: receive top-down feedback.
+    // Apical depolarization biases which L2/3 cells win during competitive selection,
+    // implementing attention/expectation from higher cortical regions.
+    private readonly CellSegmentManager[] _l23ApicalCells;
 
     // Current state
     private SDR _currentObjectRepresentation;
@@ -2890,8 +2921,7 @@ public sealed class CorticalColumn
             MaxSynapsesPerSegment = 32,
         });
 
-        // L2/3 Object Layer: cells with distal segments
-        // Input to L2/3 is the concatenation of L4 feature SDR + location SDR
+        // L2/3 Distal dendrites: learn (feature + location) → object associations
         _l23InputSize = config.L4ColumnCount + config.LocationSize;
         _l23Cells = new CellSegmentManager[config.ObjectRepresentationSize];
         for (int i = 0; i < config.ObjectRepresentationSize; i++)
@@ -2901,11 +2931,25 @@ public sealed class CorticalColumn
                 config.L23MaxSynapsesPerSegment);
         }
 
+        // L2/3 Apical dendrites: top-down feedback modulation
+        _l23ApicalCells = new CellSegmentManager[config.ObjectRepresentationSize];
+        for (int i = 0; i < config.ObjectRepresentationSize; i++)
+        {
+            _l23ApicalCells[i] = new CellSegmentManager(
+                config.ApicalMaxSegmentsPerCell,
+                config.ApicalMaxSynapsesPerSegment);
+        }
+
         _currentObjectRepresentation = new SDR(config.ObjectRepresentationSize);
     }
 
     /// Process one sensory observation with its associated location.
-    public CorticalColumnOutput Compute(SDR sensoryInput, SDR locationInput, bool learn = true)
+    /// apicalInput: optional top-down feedback SDR from higher regions or consensus.
+    ///   Apical input depolarizes L2/3 cells via apical dendrite segments,
+    ///   biasing competitive selection toward expected/attended cells.
+    ///   This models the biological role of apical dendrites extending to L1.
+    public CorticalColumnOutput Compute(SDR sensoryInput, SDR locationInput,
+        bool learn = true, SDR? apicalInput = null)
     {
         // ---- L4: Feature extraction (sensory input only) ----
         var l4ActiveColumns = _l4SP.Compute(sensoryInput, learn);
@@ -2913,24 +2957,54 @@ public sealed class CorticalColumn
         // ---- TM: Sequence context ----
         var tmOutput = _sequenceTM.Compute(l4ActiveColumns, learn);
 
-        // ---- L2/3: Object layer ----
-        // L2/3 receives BOTH the L4 feature representation AND the location signal
-        // through separate pathways, combined here for segment matching.
+        // ---- L2/3: Object layer with three dendritic zones ----
+        // Distal: receives L4 feature representation + location signal
         var l23Input = CombineL4AndLocation(l4ActiveColumns, locationInput);
         var l23InputBits = l23Input.ActiveBits.ToArray().ToHashSet();
 
-        // Find L2/3 cells whose distal segments match the (feature, location) input
-        var candidateCells = new List<(int CellIdx, int Activity)>();
+        // Apical: receives top-down feedback (when available)
+        HashSet<int>? apicalInputBits = null;
+        if (apicalInput != null && apicalInput.ActiveCount > 0)
+            apicalInputBits = apicalInput.ActiveBits.ToArray().ToHashSet();
+
+        // Score each L2/3 cell based on distal AND apical depolarization.
+        // Distal segments: match (feature + location) → cell knows this pattern
+        // Apical segments: match top-down feedback → cell is expected/attended
+        // A cell with BOTH distal and apical depolarization is in the
+        // strongest predictive state (biology: proximal + distal + apical).
+        var candidateCells = new List<(int CellIdx, float Score)>();
         for (int c = 0; c < _config.ObjectRepresentationSize; c++)
         {
-            int maxActivity = 0;
+            // Distal activity: does this cell recognize the (feature, location)?
+            int maxDistalActivity = 0;
             foreach (var segment in _l23Cells[c].Segments)
             {
                 int activity = segment.ComputeActivity(l23InputBits, _config.L23ConnectedThreshold);
-                maxActivity = Math.Max(maxActivity, activity);
+                maxDistalActivity = Math.Max(maxDistalActivity, activity);
             }
-            if (maxActivity >= _config.L23ActivationThreshold)
-                candidateCells.Add((c, maxActivity));
+
+            // Apical activity: is this cell expected by top-down feedback?
+            int maxApicalActivity = 0;
+            if (apicalInputBits != null)
+            {
+                foreach (var segment in _l23ApicalCells[c].Segments)
+                {
+                    int activity = segment.ComputeActivity(
+                        apicalInputBits, _config.ApicalConnectedThreshold);
+                    maxApicalActivity = Math.Max(maxApicalActivity, activity);
+                }
+            }
+
+            // Cell must meet distal threshold to be a candidate at all.
+            // Apical depolarization boosts priority but cannot activate alone
+            // (matching biology: apical depolarization is modulatory, not driving).
+            if (maxDistalActivity >= _config.L23ActivationThreshold)
+            {
+                float score = maxDistalActivity;
+                if (maxApicalActivity >= _config.ApicalActivationThreshold)
+                    score *= _config.ApicalBoostFactor;
+                candidateCells.Add((c, score));
+            }
         }
 
         // Select active L2/3 cells: competitive inhibition (top-k)
@@ -2938,7 +3012,7 @@ public sealed class CorticalColumn
         if (candidateCells.Count > 0)
         {
             foreach (var (cellIdx, _) in candidateCells
-                .OrderByDescending(c => c.Activity)
+                .OrderByDescending(c => c.Score)
                 .Take(_config.ObjectActiveBits))
             {
                 newL23Active.Add(cellIdx);
@@ -2946,19 +3020,35 @@ public sealed class CorticalColumn
         }
         else
         {
-            // Novel input: no segments match. Activate cells with fewest segments
-            // (least-used) to maximize representational capacity.
+            // Novel input: no distal segments match. Activate least-used cells.
+            // Apical depolarization can still bias selection among novel candidates.
             var available = Enumerable.Range(0, _config.ObjectRepresentationSize)
-                .OrderBy(c => _l23Cells[c].SegmentCount)
+                .Select(c =>
+                {
+                    int apicalActivity = 0;
+                    if (apicalInputBits != null)
+                    {
+                        foreach (var seg in _l23ApicalCells[c].Segments)
+                        {
+                            int a = seg.ComputeActivity(
+                                apicalInputBits, _config.ApicalConnectedThreshold);
+                            apicalActivity = Math.Max(apicalActivity, a);
+                        }
+                    }
+                    return (CellIdx: c, SegCount: _l23Cells[c].SegmentCount, Apical: apicalActivity);
+                })
+                .OrderByDescending(c => c.Apical >= _config.ApicalActivationThreshold ? 1 : 0)
+                .ThenBy(c => c.SegCount)
                 .ThenBy(_ => _rng.Next())
                 .Take(_config.ObjectActiveBits);
-            foreach (int c in available)
-                newL23Active.Add(c);
+            foreach (var c in available)
+                newL23Active.Add(c.CellIdx);
         }
 
-        // L2/3 Learning: reinforce/grow segments that associate (feature, location) with object
+        // ---- L2/3 Learning ----
         if (learn)
         {
+            // Distal learning: reinforce/grow segments for (feature, location) → object
             foreach (int cellIdx in newL23Active)
             {
                 DendriteSegment? bestSegment = null;
@@ -2983,6 +3073,40 @@ public sealed class CorticalColumn
                 {
                     var newSegment = _l23Cells[cellIdx].CreateSegment(cellIdx, 0);
                     GrowL23Synapses(newSegment, l23InputBits);
+                }
+            }
+
+            // Apical learning: reinforce/grow segments for top-down → object associations.
+            // Active L2/3 cells learn to recognize the apical context they were active in,
+            // so future top-down feedback can bias them toward being re-selected.
+            if (apicalInputBits != null)
+            {
+                foreach (int cellIdx in newL23Active)
+                {
+                    DendriteSegment? bestSegment = null;
+                    int bestActivity = 0;
+                    foreach (var segment in _l23ApicalCells[cellIdx].Segments)
+                    {
+                        int activity = segment.ComputeActivity(
+                            apicalInputBits, _config.ApicalConnectedThreshold);
+                        if (activity > bestActivity)
+                        {
+                            bestActivity = activity;
+                            bestSegment = segment;
+                        }
+                    }
+
+                    if (bestSegment != null && bestActivity >= _config.ApicalMinThreshold)
+                    {
+                        bestSegment.AdaptSynapses(apicalInputBits,
+                            _config.ApicalPermanenceIncrement, _config.ApicalPermanenceDecrement);
+                        GrowApicalSynapses(bestSegment, apicalInputBits);
+                    }
+                    else
+                    {
+                        var newSegment = _l23ApicalCells[cellIdx].CreateSegment(cellIdx, 0);
+                        GrowApicalSynapses(newSegment, apicalInputBits);
+                    }
                 }
             }
         }
@@ -3045,7 +3169,7 @@ public sealed class CorticalColumn
         return new SDR(_l23InputSize, combined);
     }
 
-    /// Grow synapses on an L2/3 segment toward active input bits not yet connected.
+    /// Grow synapses on an L2/3 distal segment toward active input bits not yet connected.
     private void GrowL23Synapses(DendriteSegment segment, HashSet<int> inputBits)
     {
         var candidates = inputBits
@@ -3056,6 +3180,19 @@ public sealed class CorticalColumn
         foreach (int target in candidates)
             segment.AddSynapse(new Synapse(target, _config.L23InitialPermanence));
         segment.EnforceMaxSynapses(_config.L23MaxSynapsesPerSegment);
+    }
+
+    /// Grow synapses on an L2/3 apical segment toward active top-down bits not yet connected.
+    private void GrowApicalSynapses(DendriteSegment segment, HashSet<int> apicalBits)
+    {
+        var candidates = apicalBits
+            .Where(b => !segment.HasSynapseTo(b))
+            .OrderBy(_ => _rng.Next())
+            .Take(_config.ApicalMaxNewSynapses);
+
+        foreach (int target in candidates)
+            segment.AddSynapse(new Synapse(target, _config.ApicalInitialPermanence));
+        segment.EnforceMaxSynapses(_config.ApicalMaxSynapsesPerSegment);
     }
 
     /// Accumulate object evidence via intersection-based narrowing.
@@ -3243,6 +3380,10 @@ public sealed class ThousandBrainsEngine
     private readonly List<(SDR SourceLocation, SDR Displacement, SDR TargetLocation)> _currentStructure = new();
     // Previous grid cell locations for displacement computation
     private SDR[]? _prevGridLocations;
+    // Previous consensus: used as apical (top-down) input to columns on the next step.
+    // In a multi-region hierarchy this would come from higher cortical regions;
+    // in a single-region system, the lateral consensus serves as the expectation signal.
+    private SDR? _prevConsensus;
     private int _explorationSteps;
 
     public ThousandBrainsEngine(ThousandBrainsConfig config)
@@ -3280,7 +3421,7 @@ public sealed class ThousandBrainsEngine
             _totalLocationSize += gc.TotalCells;
         }
 
-        // Override column config's LocationSize to match the combined grid output
+        // Override column config's LocationSize and ApicalInputSize to match computed sizes
         var adjustedColumnConfig = new CorticalColumnConfig
         {
             InputSize = config.ColumnConfig.InputSize,
@@ -3298,6 +3439,18 @@ public sealed class ThousandBrainsEngine
             L23InitialPermanence = config.ColumnConfig.L23InitialPermanence,
             L23ConnectedThreshold = config.ColumnConfig.L23ConnectedThreshold,
             L23MaxNewSynapses = config.ColumnConfig.L23MaxNewSynapses,
+            // Apical input = ObjectRepresentationSize (consensus is in object SDR space)
+            ApicalInputSize = config.ColumnConfig.ObjectRepresentationSize,
+            ApicalActivationThreshold = config.ColumnConfig.ApicalActivationThreshold,
+            ApicalMinThreshold = config.ColumnConfig.ApicalMinThreshold,
+            ApicalMaxSegmentsPerCell = config.ColumnConfig.ApicalMaxSegmentsPerCell,
+            ApicalMaxSynapsesPerSegment = config.ColumnConfig.ApicalMaxSynapsesPerSegment,
+            ApicalPermanenceIncrement = config.ColumnConfig.ApicalPermanenceIncrement,
+            ApicalPermanenceDecrement = config.ColumnConfig.ApicalPermanenceDecrement,
+            ApicalInitialPermanence = config.ColumnConfig.ApicalInitialPermanence,
+            ApicalConnectedThreshold = config.ColumnConfig.ApicalConnectedThreshold,
+            ApicalMaxNewSynapses = config.ColumnConfig.ApicalMaxNewSynapses,
+            ApicalBoostFactor = config.ColumnConfig.ApicalBoostFactor,
         };
 
         for (int i = 0; i < config.ColumnCount; i++)
@@ -3337,18 +3490,22 @@ public sealed class ThousandBrainsEngine
             foreach (var module in _gridModules[i])
                 module.Move(moveDeltaX, moveDeltaY);
 
-        // 2. Each column processes its sensory patch with composite location
+        // 2. Each column processes its sensory patch with composite location.
+        //    The previous consensus is fed as apical (top-down) input to each column.
+        //    This implements the biological pathway: L2/3 apical dendrites extend to L1,
+        //    where they receive feedback from higher regions. In a single-region system,
+        //    the lateral consensus serves as the expectation/attention signal.
         var columnOutputs = new CorticalColumnOutput[_config.ColumnCount];
         for (int i = 0; i < _config.ColumnCount; i++)
         {
-            // Concatenate all grid module outputs into a single location SDR
             var locationSDR = GetCompositeLocation(i);
             columnOutputs[i] = _columns[i].Compute(
                 sensoryPatches.Length == _config.ColumnCount
                     ? sensoryPatches[i]
                     : sensoryPatches[i % sensoryPatches.Length],
                 locationSDR,
-                learn);
+                learn,
+                apicalInput: _prevConsensus);
         }
 
         // 3. Lateral voting: columns exchange representations and converge
@@ -3433,6 +3590,10 @@ public sealed class ThousandBrainsEngine
         for (int i = 0; i < _config.ColumnCount; i++)
             _prevGridLocations[i] = _gridModules[i][0].GetCurrentLocation();
 
+        // Save consensus as apical input for the next processing step.
+        // This creates a feedback loop: consensus → apical → biased cell selection → better consensus.
+        _prevConsensus = consensus;
+
         return new ThousandBrainsOutput
         {
             Consensus = consensus,
@@ -3468,6 +3629,7 @@ public sealed class ThousandBrainsEngine
     {
         _explorationSteps = 0;
         _prevGridLocations = null;
+        _prevConsensus = null;  // No top-down expectation for new object
         _currentStructure.Clear();
         foreach (var column in _columns)
             column.ResetObjectRepresentation();
