@@ -369,14 +369,13 @@ static void RunSerializationDemo()
 
 
 // ============================================================================
-// Example: Hot Gym — Single-stream anomaly detection
-// This uses simultaneous SP+TM learning (via HtmEngine), which converges
-// more slowly than two-phase training.  See 'monitoring' for the
-// recommended approach with SP pre-training.
+// Example: Hot Gym — Single-stream anomaly detection with two-phase training
+// Phase 1: SP pre-training stabilizes column assignments
+// Phase 2: TM learns sequences on stable columns
 // ============================================================================
 static void RunHotGym()
 {
-    Console.WriteLine("Hot Gym — Single-Stream Anomaly Detection (1000 steps)");
+    Console.WriteLine("Hot Gym — Single-Stream Anomaly Detection (Two-Phase Training)");
     Console.WriteLine(new string('=', 72));
 
     var encoder = new CompositeEncoder()
@@ -395,7 +394,25 @@ static void RunHotGym()
     var rng = new Random(42);
     var baseTime = new DateTime(2024, 1, 1);
 
-    Console.WriteLine();
+    // Phase 1: Generate one full day of training data for SP pre-training
+    var trainingData = new List<Dictionary<string, object>>();
+    for (int i = 0; i < 24; i++)
+    {
+        var ts = baseTime.AddHours(i);
+        trainingData.Add(new Dictionary<string, object>
+        {
+            ["timestamp"] = ts,
+            ["value"] = 50.0 + 30.0 * Math.Sin(2 * Math.PI * ts.Hour / 24.0),
+        });
+    }
+
+    Console.Write("\n  Phase 1: SP pre-training (50 cycles x 24 hours)...");
+    engine.PreTrainSP(trainingData, cycles: 50);
+    Console.WriteLine(" done");
+
+    // Phase 2: TM sequence learning (SP learn=false)
+    Console.WriteLine("  Phase 2: TM sequence learning (1000 steps)\n");
+
     for (int i = 0; i < 1000; i++)
     {
         var timestamp = baseTime.AddHours(i);
@@ -418,8 +435,4 @@ static void RunHotGym()
                 $"burst={result.TmOutput.BurstingColumnCount}");
         }
     }
-
-    Console.WriteLine("\nNote: This example uses simultaneous SP+TM learning, which converges");
-    Console.WriteLine("slowly due to SP column instability during early training. See the");
-    Console.WriteLine("'monitoring' example for the recommended two-phase approach.");
 }

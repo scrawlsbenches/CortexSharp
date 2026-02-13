@@ -1096,7 +1096,7 @@ public sealed record SpatialPoolerConfig
     public InhibitionMode Inhibition { get; init; } = InhibitionMode.Global;
     public int InhibitionRadius { get; init; } = 50;       // For local inhibition
     public BoostingStrategy Boosting { get; init; } = BoostingStrategy.Exponential;
-    public float BoostStrength { get; init; } = 1.0f;
+    public float BoostStrength { get; init; } = 0.0f;   // 0 = disabled (NuPIC default)
     public float MinPctOverlapDutyCycles { get; init; } = 0.001f;
     public int DutyCyclePeriod { get; init; } = 1000;
     public int Seed { get; init; } = 42;
@@ -4771,6 +4771,7 @@ public sealed class HtmEngineConfig
     public int InhibitionRadius { get; init; } = 50;
     public int MaxSegmentsPerCell { get; init; } = 128;
     public int MaxSynapsesPerSegment { get; init; } = 64;
+    public float BoostStrength { get; init; } = 0.0f;
 
     // Temporal Pooler — produces stable sequence-level representations
     public float TpAnomalyResetThreshold { get; init; } = 0.5f;
@@ -4819,6 +4820,7 @@ public sealed class HtmEngine
             TargetSparsity = config.Sparsity,
             Inhibition = config.Inhibition,
             InhibitionRadius = config.InhibitionRadius,
+            BoostStrength = config.BoostStrength,
         };
 
         _tmConfig = new TemporalMemoryConfig
@@ -4843,6 +4845,10 @@ public sealed class HtmEngine
         _anomalyLikelihood = new AnomalyLikelihood();
     }
 
+    /// When true, SP learning is frozen — only TM learns during Compute.
+    /// Set this after PreTrainSP to stabilize column assignments.
+    public bool FreezeSPLearning { get; set; }
+
     /// Process one timestep through the full pipeline:
     /// Encode → SP → TM → TP → Predictor → Anomaly
     public HtmResult Compute(Dictionary<string, object> inputData, bool learn = true)
@@ -4851,7 +4857,7 @@ public sealed class HtmEngine
 
         // Encode → SP → TM
         SDR encoded = _encoder.Encode(inputData);
-        SDR activeColumns = _sp.Compute(encoded, learn);
+        SDR activeColumns = _sp.Compute(encoded, learn && !FreezeSPLearning);
         var tmOutput = _tm.Compute(activeColumns, learn);
 
         // Temporal Pooling — stable sequence-level representation
@@ -4882,6 +4888,21 @@ public sealed class HtmEngine
         };
     }
 
+    /// Run SP-only learning (no TM) on the given data stream.
+    /// Call this before the main Compute loop to stabilize column assignments.
+    /// After pre-training, FreezeSPLearning is set to true so that subsequent
+    /// Compute calls only train the TM on stable column assignments.
+    public void PreTrainSP(IEnumerable<Dictionary<string, object>> data, int cycles = 50)
+    {
+        for (int c = 0; c < cycles; c++)
+            foreach (var record in data)
+            {
+                SDR encoded = _encoder.Encode(record);
+                _sp.Compute(encoded, learn: true);
+            }
+        FreezeSPLearning = true;
+    }
+
     /// Get comprehensive system health report
     public SystemHealthReport GetHealth()
         => HtmDiagnostics.GetSystemHealth(_sp, _tm);
@@ -4910,6 +4931,7 @@ public sealed class HtmEngine
 public static class HtmExamples
 {
     /// Example 1: Single-stream anomaly detection (Hot Gym pattern)
+    /// Uses two-phase training: SP pre-training → TM sequence learning
     public static void RunSingleStreamDemo()
     {
         // --- Configure Encoders ---
@@ -4932,11 +4954,29 @@ public static class HtmExamples
             MaxSynapsesPerSegment = 64,
         });
 
-        // --- Process Stream ---
+        // --- Phase 1: SP pre-training on representative data ---
+        var baseTime = new DateTime(2024, 1, 1);
+        var trainingData = new List<Dictionary<string, object>>();
+        for (int h = 0; h < 168; h++) // One full week (24 * 7)
+        {
+            var ts = baseTime.AddHours(h);
+            trainingData.Add(new Dictionary<string, object>
+            {
+                ["timestamp"] = ts,
+                ["value"] = 50.0 + 20.0 * Math.Sin(2 * Math.PI * h / 24)
+                           + 10.0 * Math.Sin(2 * Math.PI * h / 168),
+            });
+        }
+
+        Console.Write("SP pre-training (30 cycles x 168 hours)...");
+        engine.PreTrainSP(trainingData, cycles: 30);
+        Console.WriteLine(" done");
+
+        // --- Phase 2: TM sequence learning ---
         var rng = new Random(42);
         for (int i = 0; i < 5000; i++)
         {
-            var timestamp = DateTime.Now.AddHours(i);
+            var timestamp = baseTime.AddHours(i);
             double consumption = 50 + 20 * Math.Sin(2 * Math.PI * i / 24)  // Daily cycle
                                + 10 * Math.Sin(2 * Math.PI * i / 168)       // Weekly cycle
                                + rng.NextDouble() * 5;                       // Noise
@@ -5024,9 +5064,9 @@ public static class HtmExamples
     }
 
     /// Example 3: NetworkAPI — declarative pipeline construction
+    /// Uses two-phase training via Network.Compute(learn:) control
     public static void RunNetworkApiDemo()
     {
-        // Build a two-level hierarchy: SP1 → TM1 → SP2 → TM2
         var network = new Network();
 
         network.AddRegion(new SPRegion("L1_SP", new SpatialPoolerConfig
@@ -5040,15 +5080,33 @@ public static class HtmExamples
 
         network.Link("L1_SP", "bottomUpOut", "L1_TM", "bottomUpIn");
 
-        // Run
         var encoder = new ScalarEncoder(400, 21, 0, 100);
+
+        // Phase 1: SP pre-training (TM also receives input but learns patterns
+        // that will be overwritten — the key is stabilizing SP columns)
+        Console.Write("SP pre-training (50 cycles x 50 steps)...");
+        for (int c = 0; c < 50; c++)
+        {
+            for (int i = 0; i < 50; i++)
+            {
+                double value = 50 + 30 * Math.Sin(2 * Math.PI * i / 50);
+                network.SetInput("L1_SP", "bottomUpIn", encoder.Encode(value));
+                network.Compute(learn: true);
+            }
+            // Reset TM between pre-training cycles to avoid cross-cycle sequence learning
+            network.Reset();
+        }
+        Console.WriteLine(" done");
+
+        // Phase 2: TM sequence learning on stable SP columns
+        network.Reset();
         for (int i = 0; i < 1000; i++)
         {
             double value = 50 + 30 * Math.Sin(2 * Math.PI * i / 50);
             SDR encoded = encoder.Encode(value);
 
             network.SetInput("L1_SP", "bottomUpIn", encoded);
-            network.Compute();
+            network.Compute(learn: true);
 
             var anomaly = (float)network.GetOutput("L1_TM", "anomaly");
             if (i % 100 == 0)
@@ -5167,7 +5225,22 @@ public static class HtmExamples
             l2ColumnCount: 512, l2CellsPerColumn: 16,
             tpConfig: tpConfig);
 
-        // --- Run ---
+        // --- Phase 1: SP pre-training on all unique values ---
+        var allValues = subsequences.SelectMany(s => s).Distinct().ToArray();
+        Console.Write("SP pre-training (50 cycles)...");
+        for (int c = 0; c < 50; c++)
+        {
+            foreach (double v in allValues)
+            {
+                network.SetInput("L1_SP", "bottomUpIn", encoder.Encode(v));
+                network.Compute(learn: true);
+            }
+            network.Reset();
+        }
+        Console.WriteLine(" done");
+        network.Reset();
+
+        // --- Phase 2: Sequence learning ---
         int totalSteps = 2000;
         int step = 0;
 
@@ -5187,7 +5260,7 @@ public static class HtmExamples
                     SDR encoded = encoder.Encode(value);
 
                     network.SetInput("L1_SP", "bottomUpIn", encoded);
-                    network.Compute();
+                    network.Compute(learn: true);
 
                     float l1Anomaly = (float)network.GetOutput("L1_TM", "anomaly");
                     float l2Anomaly = (float)network.GetOutput("L2_TM", "anomaly");
