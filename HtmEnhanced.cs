@@ -353,6 +353,39 @@ public sealed class SDR : IEquatable<SDR>
         return new SDR(newSize, projected);
     }
 
+    // --- Sparsity Enforcement ---
+
+    /// Trim an SDR to at most `maxActiveBits` active bits.
+    /// Retains the lowest-index bits for deterministic, reproducible selection.
+    public SDR EnforceSparsity(int maxActiveBits)
+    {
+        if (ActiveCount <= maxActiveBits) return this;
+        // _activeBits is sorted, so Take(n) selects lowest indices — deterministic
+        return new SDR(_size, _activeBits.AsSpan()[..maxActiveBits]);
+    }
+
+    /// Union of two SDRs with a hard cap on active bit count.
+    /// Prefers bits present in BOTH SDRs (intersection), fills remainder from union.
+    /// This preserves the bits with strongest evidence while maintaining sparsity.
+    public static SDR UnionCapped(SDR a, SDR b, int maxActiveBits)
+    {
+        Debug.Assert(a._size == b._size);
+        var intersection = a.Intersect(b);
+        if (intersection.ActiveCount >= maxActiveBits)
+            return intersection.EnforceSparsity(maxActiveBits);
+
+        // Start with all intersection bits, fill from union
+        var result = new HashSet<int>(intersection.ActiveBits.ToArray());
+        var union = a.Union(b);
+        foreach (int bit in union.ActiveBits)
+        {
+            if (result.Count >= maxActiveBits) break;
+            result.Add(bit);
+        }
+
+        return new SDR(a._size, result);
+    }
+
     // --- Dense export ---
     public bool[] ToDense()
     {
@@ -989,6 +1022,12 @@ public sealed class DendriteSegment
         => _synapses.Any(s => s.PresynapticIndex == presynapticIndex);
 }
 
+/// The three functionally distinct dendritic zones of a pyramidal neuron.
+///   Proximal — close to soma, receives feedforward input, drives activation (SP models this)
+///   Distal   — basal dendrites, receives lateral input, produces depolarization / prediction (TM models this)
+///   Apical   — extends to L1, receives top-down feedback from higher regions, provides contextual modulation
+public enum DendriteType { Proximal, Distal, Apical }
+
 /// Manages the dendrite segments for a single cell, enforcing max-segment limits
 /// and providing LRU eviction of least-recently-used segments.
 public sealed class CellSegmentManager
@@ -1101,9 +1140,11 @@ public sealed record SpatialPoolerConfig
     public InhibitionMode Inhibition { get; init; } = InhibitionMode.Global;
     public int InhibitionRadius { get; init; } = 50;       // For local inhibition
     public BoostingStrategy Boosting { get; init; } = BoostingStrategy.Exponential;
-    public float BoostStrength { get; init; } = 0.0f;   // 0 = disabled (NuPIC default)
+    public float BoostStrength { get; init; } = 1.0f;   // Active boosting (ensures all columns participate)
     public float MinPctOverlapDutyCycles { get; init; } = 0.001f;
     public int DutyCyclePeriod { get; init; } = 1000;
+    public float LearningRateDecay { get; init; } = 1.0f;           // 1.0 = no decay; < 1.0 decays per iteration
+    public int LearningRateDecayStartIteration { get; init; } = 0;  // Iteration at which decay begins
     public int Seed { get; init; } = 42;
 }
 
@@ -1217,7 +1258,7 @@ public sealed class SpatialPooler
 
             foreach (int inputIdx in selected)
             {
-                float perm = _config.ConnectedThreshold + (float)(_rng.NextDouble() * 0.1 - 0.05);
+                float perm = _config.ConnectedThreshold + (float)(_rng.NextDouble() * 0.2 - 0.1);
                 _proximalDendrites[col].AddSynapse(
                     new Synapse(inputIdx, Math.Clamp(perm, 0f, 1f)));
             }
@@ -1244,12 +1285,18 @@ public sealed class SpatialPooler
         // Phase 4: Learning
         if (learn)
         {
+            float decayFactor = (_config.LearningRateDecay < 1.0f && _iteration > _config.LearningRateDecayStartIteration)
+                ? MathF.Pow(_config.LearningRateDecay, _iteration - _config.LearningRateDecayStartIteration)
+                : 1.0f;
+            float effectiveIncrement = _config.PermanenceIncrement * decayFactor;
+            float effectiveDecrement = _config.PermanenceDecrement * decayFactor;
+
             foreach (int col in activeColumns)
             {
                 _proximalDendrites[col].AdaptSynapses(
                     input.ActiveBits.ToArray().ToHashSet(),
-                    _config.PermanenceIncrement,
-                    _config.PermanenceDecrement);
+                    effectiveIncrement,
+                    effectiveDecrement);
             }
 
             UpdateDutyCycles(activeColumns, overlaps);
@@ -1477,6 +1524,8 @@ public sealed class TemporalMemoryConfig
 {
     public int ColumnCount { get; init; } = 2048;
     public int CellsPerColumn { get; init; } = 32;
+
+    // Distal dendrite parameters (lateral/sequence context)
     public int ActivationThreshold { get; init; } = 13;
     public int MinThreshold { get; init; } = 10;
     public int MaxNewSynapseCount { get; init; } = 20;
@@ -1490,7 +1539,28 @@ public sealed class TemporalMemoryConfig
     public float SynapsePruneThreshold { get; init; } = 0.01f;
     public int SegmentCleanupInterval { get; init; } = 1000;   // Cleanup every N iterations
     public int MinSynapsesForViableSegment { get; init; } = 3;
+    public float LearningRateDecay { get; init; } = 1.0f;           // 1.0 = no decay; < 1.0 decays per iteration
+    public int LearningRateDecayStartIteration { get; init; } = 0;  // Iteration at which decay begins
     public int Seed { get; init; } = 42;
+
+    // Apical dendrite parameters — top-down feedback from higher cortical regions.
+    // Apical dendrites extend to L1 where they receive axons from higher regions.
+    // Apical depolarization biases cell selection: cells with both distal AND apical
+    // depolarization fire first (strongest context), then distal-only, then burst.
+    // Set ApicalInputSize = 0 to disable apical support (backward compatible default).
+    public int ApicalInputSize { get; init; } = 0;                  // 0 = disabled; set to higher-region cell SDR size to enable
+    public int ApicalActivationThreshold { get; init; } = 6;        // Min connected synapses for apical depolarization
+    public int ApicalMinThreshold { get; init; } = 4;               // Min potential synapses for apical learning match
+    public int ApicalMaxSegmentsPerCell { get; init; } = 16;
+    public int ApicalMaxSynapsesPerSegment { get; init; } = 32;
+    public int ApicalMaxNewSynapseCount { get; init; } = 16;
+    public float ApicalConnectedThreshold { get; init; } = 0.5f;
+    public float ApicalInitialPermanence { get; init; } = 0.21f;
+    public float ApicalPermanenceIncrement { get; init; } = 0.1f;
+    public float ApicalPermanenceDecrement { get; init; } = 0.02f;
+    public float ApicalPredictedDecrement { get; init; } = 0.005f;  // Punishment for incorrect apical predictions
+
+    public bool ApicalEnabled => ApicalInputSize > 0;
 }
 
 public sealed class TemporalMemory
@@ -1499,12 +1569,20 @@ public sealed class TemporalMemory
 
     // --- Cell & Segment Storage ---
     // Each cell owns a CellSegmentManager that enforces max-segment limits
+    // Distal segments: lateral connections from other TM cells (sequence context)
     private readonly CellSegmentManager[] _cellSegments;
+    // Apical segments: top-down connections from higher-region cells (hierarchical feedback)
+    // Only allocated when config.ApicalEnabled is true.
+    private readonly CellSegmentManager[]? _apicalSegments;
 
     // --- State (current timestep) ---
     private HashSet<int> _activeCells = new();
     private HashSet<int> _winnerCells = new();
     private HashSet<int> _predictiveCells = new();
+    // Cells depolarized by apical input (top-down expectation from higher region).
+    // Used during cell activation to implement the biological priority:
+    //   predicted+apical > predicted-only > burst
+    private HashSet<int> _apicallyDepolarizedCells = new();
 
     // --- State (previous timestep, for learning) ---
     private HashSet<int> _prevActiveCells = new();
@@ -1514,9 +1592,16 @@ public sealed class TemporalMemory
     // --- Matching cache: segments that are active or matching this timestep ---
     private readonly Dictionary<int, List<(DendriteSegment Segment, int Activity)>> _activeSegmentCache = new();
     private readonly Dictionary<int, List<(DendriteSegment Segment, int PotentialActivity)>> _matchingSegmentCache = new();
+    // Apical segment caches (only used when apical is enabled)
+    private readonly Dictionary<int, List<(DendriteSegment Segment, int Activity)>> _apicalActiveSegmentCache = new();
+    private readonly Dictionary<int, List<(DendriteSegment Segment, int PotentialActivity)>> _apicalMatchingSegmentCache = new();
 
     private readonly Random _rng;
     private int _iteration;
+
+    // --- Effective learning rates (updated each compute step, supports decay) ---
+    private float _effectiveIncrement;
+    private float _effectiveDecrement;
 
     // --- Outputs ---
     public float Anomaly { get; private set; }
@@ -1533,6 +1618,15 @@ public sealed class TemporalMemory
         _cellSegments = new CellSegmentManager[config.ColumnCount * config.CellsPerColumn];
         for (int i = 0; i < _cellSegments.Length; i++)
             _cellSegments[i] = new CellSegmentManager(config.MaxSegmentsPerCell, config.MaxSynapsesPerSegment);
+
+        // Apical segments: only allocate when enabled (ApicalInputSize > 0)
+        if (config.ApicalEnabled)
+        {
+            _apicalSegments = new CellSegmentManager[config.ColumnCount * config.CellsPerColumn];
+            for (int i = 0; i < _apicalSegments.Length; i++)
+                _apicalSegments[i] = new CellSegmentManager(
+                    config.ApicalMaxSegmentsPerCell, config.ApicalMaxSynapsesPerSegment);
+        }
     }
 
     // --- Coordinate helpers ---
@@ -1545,8 +1639,12 @@ public sealed class TemporalMemory
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private int CellInColumn(int cellIndex) => cellIndex % _config.CellsPerColumn;
 
-    /// Main compute: process one timestep
-    public TemporalMemoryOutput Compute(SDR activeColumns, bool learn = true)
+    /// Main compute: process one timestep.
+    /// apicalInput: optional top-down feedback SDR from a higher cortical region.
+    /// When provided, cells depolarized by BOTH distal (sequence) AND apical (top-down)
+    /// context are preferred over cells with only distal depolarization, implementing
+    /// the biological priority: predicted+apical > predicted-only > burst.
+    public TemporalMemoryOutput Compute(SDR activeColumns, bool learn = true, SDR? apicalInput = null)
     {
         _iteration++;
         var sw = Stopwatch.StartNew();
@@ -1556,8 +1654,22 @@ public sealed class TemporalMemory
         _prevWinnerCells = _winnerCells;
         _prevPredictiveCells = _predictiveCells;
 
-        // Build segment caches against PREVIOUS active cells
+        // Build distal segment caches against PREVIOUS active cells
         BuildSegmentCaches();
+
+        // Build apical segment caches against current apical input (if enabled)
+        HashSet<int>? apicalInputBits = null;
+        if (_config.ApicalEnabled && apicalInput != null && apicalInput.ActiveCount > 0)
+        {
+            apicalInputBits = apicalInput.ActiveBits.ToArray().ToHashSet();
+            BuildApicalSegmentCaches(apicalInputBits);
+        }
+        else
+        {
+            _apicalActiveSegmentCache.Clear();
+            _apicalMatchingSegmentCache.Clear();
+            _apicallyDepolarizedCells.Clear();
+        }
 
         var predictedColumns = GetPredictedColumns();
         var newActiveCells = new HashSet<int>();
@@ -1566,21 +1678,55 @@ public sealed class TemporalMemory
         int predictedActiveCount = 0;
 
         // ---- Phase 1: Activate cells ----
+        // Three-tier priority within each active column:
+        //   Tier 1: cells predicted by distal AND depolarized by apical (strongest context)
+        //   Tier 2: cells predicted by distal only (sequence context matches)
+        //   Tier 3: burst — no cell was predicted (all cells fire, one winner chosen for learning)
         foreach (int col in activeColumns.ActiveBits)
         {
             bool wasPredicted = predictedColumns.Contains(col);
 
             if (wasPredicted)
             {
-                // CORRECTLY PREDICTED: activate only predicted cells
+                // Column was predicted. Check if any predicted cells also have apical support.
                 predictedActiveCount++;
-                for (int c = 0; c < _config.CellsPerColumn; c++)
+
+                if (_apicallyDepolarizedCells.Count > 0)
                 {
-                    int cellIdx = CellIndex(col, c);
-                    if (_predictiveCells.Contains(cellIdx))
+                    // Tier 1: collect cells with BOTH distal prediction AND apical depolarization
+                    var tier1 = new List<int>();
+                    var tier2 = new List<int>();
+                    for (int c = 0; c < _config.CellsPerColumn; c++)
+                    {
+                        int cellIdx = CellIndex(col, c);
+                        if (_predictiveCells.Contains(cellIdx))
+                        {
+                            if (_apicallyDepolarizedCells.Contains(cellIdx))
+                                tier1.Add(cellIdx);
+                            else
+                                tier2.Add(cellIdx);
+                        }
+                    }
+
+                    // Prefer Tier 1 if available, otherwise fall back to Tier 2
+                    var winners = tier1.Count > 0 ? tier1 : tier2;
+                    foreach (int cellIdx in winners)
                     {
                         newActiveCells.Add(cellIdx);
                         newWinnerCells.Add(cellIdx);
+                    }
+                }
+                else
+                {
+                    // No apical input — standard behavior: all predicted cells activate
+                    for (int c = 0; c < _config.CellsPerColumn; c++)
+                    {
+                        int cellIdx = CellIndex(col, c);
+                        if (_predictiveCells.Contains(cellIdx))
+                        {
+                            newActiveCells.Add(cellIdx);
+                            newWinnerCells.Add(cellIdx);
+                        }
                     }
                 }
             }
@@ -1591,7 +1737,9 @@ public sealed class TemporalMemory
                 for (int c = 0; c < _config.CellsPerColumn; c++)
                     newActiveCells.Add(CellIndex(col, c));
 
-                // Pick one winner cell for learning
+                // Pick one winner cell for learning.
+                // When apical input is available, prefer apically depolarized cells
+                // even in bursting columns — top-down context can guide learning.
                 int winner = SelectBestMatchingCell(col);
                 newWinnerCells.Add(winner);
             }
@@ -1605,9 +1753,23 @@ public sealed class TemporalMemory
         // ---- Phase 3: Learning ----
         if (learn)
         {
+            float decayFactor = (_config.LearningRateDecay < 1.0f && _iteration > _config.LearningRateDecayStartIteration)
+                ? MathF.Pow(_config.LearningRateDecay, _iteration - _config.LearningRateDecayStartIteration)
+                : 1.0f;
+            _effectiveIncrement = _config.PermanenceIncrement * decayFactor;
+            _effectiveDecrement = _config.PermanenceDecrement * decayFactor;
+
+            // Distal learning (sequence context)
             LearnOnActiveSegments(newActiveCells);
             LearnOnBurstingColumns(activeColumns, newWinnerCells);
             PunishIncorrectPredictions(activeColumns);
+
+            // Apical learning (top-down context from higher region)
+            if (_config.ApicalEnabled && apicalInputBits != null)
+            {
+                LearnApicalOnWinnerCells(newWinnerCells, apicalInputBits);
+                PunishIncorrectApicalPredictions(activeColumns, apicalInputBits);
+            }
         }
 
         // ---- Phase 4: Compute next predictions ----
@@ -1629,6 +1791,7 @@ public sealed class TemporalMemory
             ActiveCells = new HashSet<int>(_activeCells),
             WinnerCells = new HashSet<int>(_winnerCells),
             PredictiveCells = new HashSet<int>(_predictiveCells),
+            ApicallyDepolarizedCells = new HashSet<int>(_apicallyDepolarizedCells),
             ActiveColumnCount = activeColumns.ActiveCount,
             BurstingColumnCount = burstCount,
             PredictedActiveColumnCount = predictedActiveCount,
@@ -1749,7 +1912,7 @@ public sealed class TemporalMemory
             foreach (var (segment, _) in segments)
             {
                 segment.AdaptSynapses(_prevActiveCells,
-                    _config.PermanenceIncrement, _config.PermanenceDecrement);
+                    _effectiveIncrement, _effectiveDecrement);
                 segment.LastActivatedIteration = _iteration;
 
                 // Grow new synapses to previously active cells not yet connected
@@ -1792,7 +1955,7 @@ public sealed class TemporalMemory
             {
                 var bestMatch = matches.OrderByDescending(m => m.PotentialActivity).First();
                 bestMatch.Segment.AdaptSynapses(_prevActiveCells,
-                    _config.PermanenceIncrement, _config.PermanenceDecrement);
+                    _effectiveIncrement, _effectiveDecrement);
                 bestMatch.Segment.LastActivatedIteration = _iteration;
                 GrowSynapses(bestMatch.Segment, _prevWinnerCells);
             }
@@ -1834,6 +1997,133 @@ public sealed class TemporalMemory
         segment.EnforceMaxSynapses(_config.MaxSynapsesPerSegment);
     }
 
+    // ---- Apical dendrite methods ----
+
+    /// Build caches of active and matching apical segments against current apical input.
+    /// Apical segments are evaluated against the CURRENT apical input (top-down feedback
+    /// from a higher region), unlike distal segments which are evaluated against PREVIOUS
+    /// active cells. This is because apical input represents the higher region's current
+    /// expectation, not a temporal prediction from the previous timestep.
+    private void BuildApicalSegmentCaches(HashSet<int> apicalInputBits)
+    {
+        _apicalActiveSegmentCache.Clear();
+        _apicalMatchingSegmentCache.Clear();
+        _apicallyDepolarizedCells.Clear();
+
+        if (_apicalSegments == null) return;
+
+        for (int cellIdx = 0; cellIdx < _apicalSegments.Length; cellIdx++)
+        {
+            foreach (var segment in _apicalSegments[cellIdx].Segments)
+            {
+                int activity = segment.ComputeActivity(apicalInputBits, _config.ApicalConnectedThreshold);
+
+                if (activity >= _config.ApicalActivationThreshold)
+                {
+                    if (!_apicalActiveSegmentCache.TryGetValue(cellIdx, out var list))
+                    {
+                        list = new List<(DendriteSegment, int)>();
+                        _apicalActiveSegmentCache[cellIdx] = list;
+                    }
+                    list.Add((segment, activity));
+                    _apicallyDepolarizedCells.Add(cellIdx);
+                }
+
+                int potentialActivity = segment.ComputePotentialActivity(apicalInputBits);
+                if (potentialActivity >= _config.ApicalMinThreshold)
+                {
+                    if (!_apicalMatchingSegmentCache.TryGetValue(cellIdx, out var mlist))
+                    {
+                        mlist = new List<(DendriteSegment, int)>();
+                        _apicalMatchingSegmentCache[cellIdx] = mlist;
+                    }
+                    mlist.Add((segment, potentialActivity));
+                }
+            }
+        }
+    }
+
+    /// Learn apical associations on winner cells: reinforce existing apical segments
+    /// that match the current apical input, or create new ones. This teaches each
+    /// cell which higher-region patterns co-occur with its activation, enabling
+    /// future top-down depolarization.
+    private void LearnApicalOnWinnerCells(HashSet<int> winnerCells, HashSet<int> apicalInputBits)
+    {
+        if (_apicalSegments == null) return;
+
+        foreach (int cellIdx in winnerCells)
+        {
+            // Find best matching apical segment (by potential activity)
+            DendriteSegment? bestSegment = null;
+            int bestPotential = 0;
+
+            if (_apicalMatchingSegmentCache.TryGetValue(cellIdx, out var matches))
+            {
+                foreach (var (segment, potentialActivity) in matches)
+                {
+                    if (potentialActivity > bestPotential)
+                    {
+                        bestPotential = potentialActivity;
+                        bestSegment = segment;
+                    }
+                }
+            }
+
+            if (bestSegment != null && bestPotential >= _config.ApicalMinThreshold)
+            {
+                // Reinforce existing apical segment
+                bestSegment.AdaptSynapses(apicalInputBits,
+                    _config.ApicalPermanenceIncrement, _config.ApicalPermanenceDecrement);
+                bestSegment.LastActivatedIteration = _iteration;
+                GrowApicalSynapses(bestSegment, apicalInputBits);
+            }
+            else
+            {
+                // Create a new apical segment
+                var newSegment = _apicalSegments[cellIdx].CreateSegment(cellIdx, _iteration);
+                GrowApicalSynapses(newSegment, apicalInputBits);
+            }
+        }
+    }
+
+    /// Grow synapses on an apical segment toward active apical input bits not yet connected.
+    private void GrowApicalSynapses(DendriteSegment segment, HashSet<int> apicalBits)
+    {
+        var candidates = apicalBits
+            .Where(b => !segment.HasSynapseTo(b))
+            .OrderBy(_ => _rng.Next())
+            .Take(_config.ApicalMaxNewSynapseCount);
+
+        foreach (int target in candidates)
+            segment.AddSynapse(new Synapse(target, _config.ApicalInitialPermanence, _iteration));
+
+        segment.EnforceMaxSynapses(_config.ApicalMaxSynapsesPerSegment);
+    }
+
+    /// Punish apical segments on cells that were apically depolarized but whose
+    /// columns did not become active. This prevents apical segments from reinforcing
+    /// incorrect top-down expectations.
+    private void PunishIncorrectApicalPredictions(SDR activeColumns, HashSet<int> apicalInputBits)
+    {
+        if (_apicalSegments == null) return;
+        var activeColumnSet = activeColumns.ActiveBits.ToArray().ToHashSet();
+
+        foreach (int cellIdx in _apicallyDepolarizedCells)
+        {
+            int col = CellColumn(cellIdx);
+            if (activeColumnSet.Contains(col)) continue; // Column was active — no punishment
+
+            foreach (var segment in _apicalSegments[cellIdx].Segments)
+            {
+                if (segment.ComputeActivity(apicalInputBits, _config.ApicalConnectedThreshold)
+                    >= _config.ApicalActivationThreshold)
+                {
+                    segment.PunishSynapses(apicalInputBits, _config.ApicalPredictedDecrement);
+                }
+            }
+        }
+    }
+
     /// Punish segments that predicted columns which did NOT become active
     private void PunishIncorrectPredictions(SDR activeColumns)
     {
@@ -1850,7 +2140,10 @@ public sealed class TemporalMemory
                 if (segment.ComputeActivity(_prevActiveCells, _config.ConnectedThreshold)
                     >= _config.ActivationThreshold)
                 {
-                    segment.PunishSynapses(_prevActiveCells, _config.PredictedDecrement);
+                    float effectivePunishment = (_config.LearningRateDecay < 1.0f && _iteration > _config.LearningRateDecayStartIteration)
+                        ? _config.PredictedDecrement * MathF.Pow(_config.LearningRateDecay, _iteration - _config.LearningRateDecayStartIteration)
+                        : _config.PredictedDecrement;
+                    segment.PunishSynapses(_prevActiveCells, effectivePunishment);
                 }
             }
         }
@@ -1863,6 +2156,7 @@ public sealed class TemporalMemory
         int totalPruned = 0;
         int totalRemoved = 0;
 
+        // Clean distal segments
         for (int i = 0; i < _cellSegments.Length; i++)
         {
             var result = _cellSegments[i].Maintain(
@@ -1872,6 +2166,19 @@ public sealed class TemporalMemory
             totalRemoved += result.RemovedSegments;
         }
 
+        // Clean apical segments (same thresholds)
+        if (_apicalSegments != null)
+        {
+            for (int i = 0; i < _apicalSegments.Length; i++)
+            {
+                var result = _apicalSegments[i].Maintain(
+                    _config.SynapsePruneThreshold,
+                    _config.MinSynapsesForViableSegment);
+                totalPruned += result.PrunedSynapses;
+                totalRemoved += result.RemovedSegments;
+            }
+        }
+
         Metrics.RecordCleanup(totalPruned, totalRemoved);
     }
 
@@ -1879,6 +2186,7 @@ public sealed class TemporalMemory
     public HashSet<int> GetActiveCells() => new(_activeCells);
     public HashSet<int> GetWinnerCells() => new(_winnerCells);
     public HashSet<int> GetPredictiveCells() => new(_predictiveCells);
+    public HashSet<int> GetApicallyDepolarizedCells() => new(_apicallyDepolarizedCells);
 
     /// Reset transient cell state for sequence boundary (e.g., between independent
     /// sequences). Clears active/winner/predictive cells and segment caches so the
@@ -1894,18 +2202,26 @@ public sealed class TemporalMemory
         _prevPredictiveCells.Clear();
         _activeSegmentCache.Clear();
         _matchingSegmentCache.Clear();
+        _apicallyDepolarizedCells.Clear();
+        _apicalActiveSegmentCache.Clear();
+        _apicalMatchingSegmentCache.Clear();
     }
 
     /// Get the predicted columns for the NEXT timestep
     public HashSet<int> GetPredictedColumns()
         => _predictiveCells.Select(CellColumn).ToHashSet();
 
-    /// Total segment count across all cells (for monitoring growth)
+    /// Total segment count across all cells (distal + apical, for monitoring growth)
     public int TotalSegmentCount
-        => _cellSegments.Sum(cs => cs.SegmentCount);
+        => _cellSegments.Sum(cs => cs.SegmentCount)
+         + (_apicalSegments?.Sum(cs => cs.SegmentCount) ?? 0);
 
     public int TotalSynapseCount
-        => _cellSegments.Sum(cs => cs.Segments.Sum(s => s.SynapseCount));
+        => _cellSegments.Sum(cs => cs.Segments.Sum(s => s.SynapseCount))
+         + (_apicalSegments?.Sum(cs => cs.Segments.Sum(s => s.SynapseCount)) ?? 0);
+
+    public int ApicalSegmentCount
+        => _apicalSegments?.Sum(cs => cs.SegmentCount) ?? 0;
 
     // --- Serialization ---
 
@@ -1916,12 +2232,24 @@ public sealed class TemporalMemory
         bw.Write(_config.CellsPerColumn);
         bw.Write(_iteration);
 
-        // Cell segments
+        // Distal segments
         for (int i = 0; i < _cellSegments.Length; i++)
         {
             bw.Write(_cellSegments[i].SegmentCount);
             foreach (var seg in _cellSegments[i].Segments)
                 HtmSerializer.WriteSegment(bw, seg);
+        }
+
+        // Apical segments (write flag + data if enabled)
+        bw.Write(_config.ApicalEnabled);
+        if (_config.ApicalEnabled && _apicalSegments != null)
+        {
+            for (int i = 0; i < _apicalSegments.Length; i++)
+            {
+                bw.Write(_apicalSegments[i].SegmentCount);
+                foreach (var seg in _apicalSegments[i].Segments)
+                    HtmSerializer.WriteSegment(bw, seg);
+            }
         }
 
         // Current cell state (becomes prev on next Compute call)
@@ -1942,13 +2270,37 @@ public sealed class TemporalMemory
 
         _iteration = br.ReadInt32();
 
-        // Cell segments
+        // Distal segments
         for (int i = 0; i < _cellSegments.Length; i++)
         {
             _cellSegments[i].ClearSegments();
             int segCount = br.ReadInt32();
             for (int s = 0; s < segCount; s++)
                 _cellSegments[i].RestoreSegment(HtmSerializer.ReadSegment(br));
+        }
+
+        // Apical segments (read flag + data if present)
+        bool hasApical = br.ReadBoolean();
+        if (hasApical && _apicalSegments != null)
+        {
+            for (int i = 0; i < _apicalSegments.Length; i++)
+            {
+                _apicalSegments[i].ClearSegments();
+                int segCount = br.ReadInt32();
+                for (int s = 0; s < segCount; s++)
+                    _apicalSegments[i].RestoreSegment(HtmSerializer.ReadSegment(br));
+            }
+        }
+        else if (hasApical)
+        {
+            // Serialized data has apical but this TM doesn't — skip the data
+            int totalCells = columnCount * cellsPerColumn;
+            for (int i = 0; i < totalCells; i++)
+            {
+                int segCount = br.ReadInt32();
+                for (int s = 0; s < segCount; s++)
+                    HtmSerializer.ReadSegment(br); // discard
+            }
         }
 
         // Current cell state
@@ -1979,6 +2331,9 @@ public record TemporalMemoryOutput
     public required HashSet<int> ActiveCells { get; init; }
     public required HashSet<int> WinnerCells { get; init; }
     public required HashSet<int> PredictiveCells { get; init; }
+    /// Cells depolarized by apical (top-down) input from a higher cortical region.
+    /// Empty when apical input is not provided or apical is disabled.
+    public HashSet<int> ApicallyDepolarizedCells { get; init; } = new();
     public int ActiveColumnCount { get; init; }
     public int BurstingColumnCount { get; init; }
     public int PredictedActiveColumnCount { get; init; }
@@ -2414,13 +2769,15 @@ public record SdrPrediction
 // ============================================================================
 // SECTION 8: Grid Cell Module
 // ============================================================================
-// Grid cells provide allocentric (world-centered) location reference frames.
-// Each module tiles 2D space with a hexagonal grid at a specific scale and
+// Grid cells provide object-centric (object-relative) location reference frames.
+// In the Thousand Brains Theory, each cortical column maintains its own
+// reference frame relative to the object being sensed, NOT in world coordinates.
+// Each module tiles 2D space with a periodic grid at a specific scale and
 // orientation. Multiple modules at different scales/orientations together
 // provide a unique location code (like Fourier components).
 //
 // The grid cell representation is an SDR where the active bits encode the
-// current position within the module's periodic tiling of space.
+// current position within the module's periodic tiling of the object's surface.
 //
 // Path integration: movement displaces the active bump across the grid.
 // Anchoring: sensory input can reset the grid to a known position.
@@ -2428,7 +2785,7 @@ public record SdrPrediction
 
 public sealed class GridCellModuleConfig
 {
-    public int ModuleSize { get; init; } = 40;          // Width of the square module
+    public int ModuleSize { get; init; } = 40;          // Side length N of the hexagonal module (N×N cells in axial coords)
     public int CellsPerAxis => ModuleSize;
     public int TotalCells => ModuleSize * ModuleSize;
     public int ActiveCellCount { get; init; } = 10;     // Cells in the active "bump"
@@ -2438,22 +2795,43 @@ public sealed class GridCellModuleConfig
     public float PathIntegrationNoise { get; init; } = 0.01f;
 }
 
+/// Grid cell module using hexagonal tiling.
+///
+/// Biological grid cells fire in regular hexagonal lattice patterns (Moser & Moser, 2014).
+/// This module uses axial coordinates (q, r) to arrange cells on a hex grid within a
+/// parallelogram-shaped torus. The hexagonal distance metric provides more uniform spatial
+/// coverage than a square grid.
+///
+/// Coordinate system:
+///   - Cells are at integer (q, r) positions, q ∈ [0, N), r ∈ [0, N)
+///   - Cell index = q * N + r  (compatible with existing downstream code)
+///   - TotalCells = N × N  (same count as the previous square implementation)
+///   - Hex distance² = 3 * (dq² + dq*dr + dr²)  (Euclidean distance in hex space)
+///   - Toroidal wrapping: both q and r wrap at N
+///
+/// Path integration converts Cartesian movement deltas to axial coordinate deltas,
+/// then wraps toroidally.
 public sealed class GridCellModule
 {
     private readonly GridCellModuleConfig _config;
     private readonly Random _rng;
 
-    // Current position in module-local coordinates (continuous)
-    private float _posX;
-    private float _posY;
+    // Current position in continuous axial coordinates (q, r), wrapping at ModuleSize
+    private float _posQ;
+    private float _posR;
 
     // Precomputed rotation matrix for this module's orientation
     private readonly float _cosTheta, _sinTheta;
 
+    // Constant for Cartesian ↔ axial conversion
+    private static readonly float Sqrt3 = MathF.Sqrt(3.0f);
+
     public int OutputSize => _config.TotalCells;
 
-    // Learned associations: sensory feature hash → grid position
-    private readonly Dictionary<int, (float X, float Y)> _anchorMemory = new();
+    // Learned associations: sensory pattern → grid position (SDR-overlap-based)
+    private readonly List<(SDR Pattern, float Q, float R)> _anchorMemory = new();
+    private const int MaxAnchors = 256;
+    private const int AnchorOverlapThreshold = 5; // Minimum overlap to trigger recall
 
     public GridCellModule(GridCellModuleConfig config, int seed = 42)
     {
@@ -2463,13 +2841,14 @@ public sealed class GridCellModule
         _sinTheta = MathF.Sin(config.Orientation);
 
         // Start at random position
-        _posX = (float)(_rng.NextDouble() * config.ModuleSize);
-        _posY = (float)(_rng.NextDouble() * config.ModuleSize);
+        _posQ = (float)(_rng.NextDouble() * config.ModuleSize);
+        _posR = (float)(_rng.NextDouble() * config.ModuleSize);
     }
 
     /// Path integration: update position based on movement vector.
-    /// The movement is first rotated by the module's orientation, then
-    /// scaled by the module's spatial period, and wrapped toroidally.
+    /// The Cartesian movement is first rotated by the module's orientation,
+    /// then scaled by the module's spatial period, converted to axial hex
+    /// coordinates, and wrapped toroidally.
     public void Move(float deltaX, float deltaY)
     {
         // Rotate movement into module's reference frame
@@ -2484,30 +2863,41 @@ public sealed class GridCellModule
         rotX += (float)(_rng.NextDouble() * 2 - 1) * _config.PathIntegrationNoise;
         rotY += (float)(_rng.NextDouble() * 2 - 1) * _config.PathIntegrationNoise;
 
+        // Convert Cartesian delta to axial hex coordinate delta
+        // From pointy-top hex: q = x/sqrt(3) - y/3, r = 2y/3
+        float dq = rotX / Sqrt3 - rotY / 3.0f;
+        float dr = 2.0f * rotY / 3.0f;
+
         // Update position with toroidal wrapping
-        _posX = Mod(_posX + rotX, _config.ModuleSize);
-        _posY = Mod(_posY + rotY, _config.ModuleSize);
+        _posQ = Mod(_posQ + dq, _config.ModuleSize);
+        _posR = Mod(_posR + dr, _config.ModuleSize);
     }
 
     /// Compute the current grid cell SDR: a Gaussian bump centered
-    /// at the current position on the toroidal grid surface.
+    /// at the current position on the toroidal hexagonal grid surface.
     public SDR GetCurrentLocation()
     {
         var activations = new List<(int Index, float Weight)>();
         float sigma2 = _config.BumpSigma * _config.BumpSigma;
+        int n = _config.ModuleSize;
 
-        for (int gx = 0; gx < _config.ModuleSize; gx++)
+        for (int q = 0; q < n; q++)
         {
-            for (int gy = 0; gy < _config.ModuleSize; gy++)
+            for (int r = 0; r < n; r++)
             {
-                // Toroidal distance from current position to grid cell
-                float dx = ToroidalDist(gx - _posX, _config.ModuleSize);
-                float dy = ToroidalDist(gy - _posY, _config.ModuleSize);
-                float dist2 = dx * dx + dy * dy;
+                // Toroidal distance in axial coordinates
+                float dq = ToroidalDist(q - _posQ, n);
+                float dr = ToroidalDist(r - _posR, n);
+
+                // Hexagonal Euclidean distance²:
+                // For pointy-top hexagons, the squared Euclidean distance between
+                // two points separated by (dq, dr) in axial coordinates is:
+                //   dist² = 3 * (dq² + dq*dr + dr²)
+                float dist2 = 3.0f * (dq * dq + dq * dr + dr * dr);
 
                 float activation = MathF.Exp(-dist2 / (2 * sigma2));
                 if (activation > 0.01f) // Threshold for sparsity
-                    activations.Add((gx * _config.ModuleSize + gy, activation));
+                    activations.Add((q * n + r, activation));
             }
         }
 
@@ -2521,32 +2911,49 @@ public sealed class GridCellModule
     }
 
     /// Anchor the grid to a known position based on a sensory input.
+    /// Uses SDR overlap matching (noise-tolerant) instead of hash lookup.
     /// This corrects accumulated path integration drift.
     public void Anchor(SDR sensoryInput)
     {
-        int hash = sensoryInput.GetHashCode();
+        // Find best-matching stored anchor via SDR overlap
+        int bestOverlap = 0;
+        int bestIdx = -1;
 
-        if (_anchorMemory.TryGetValue(hash, out var remembered))
+        for (int i = 0; i < _anchorMemory.Count; i++)
+        {
+            int overlap = sensoryInput.Overlap(_anchorMemory[i].Pattern);
+            if (overlap > bestOverlap)
+            {
+                bestOverlap = overlap;
+                bestIdx = i;
+            }
+        }
+
+        if (bestOverlap >= AnchorOverlapThreshold && bestIdx >= 0)
         {
             // Snap to remembered position (error correction)
-            _posX = remembered.X;
-            _posY = remembered.Y;
+            _posQ = _anchorMemory[bestIdx].Q;
+            _posR = _anchorMemory[bestIdx].R;
         }
         else
         {
             // Learn this sensory input → position association
-            _anchorMemory[hash] = (_posX, _posY);
+            if (_anchorMemory.Count >= MaxAnchors)
+                _anchorMemory.RemoveAt(0); // Evict oldest
+            _anchorMemory.Add((sensoryInput, _posQ, _posR));
         }
     }
 
-    /// Reset to a specific position (for testing / initialization)
+    /// Reset to a specific position (in axial hex coordinates).
+    /// For compatibility: (0, 0) is the origin; values wrap at ModuleSize.
     public void SetPosition(float x, float y)
     {
-        _posX = Mod(x, _config.ModuleSize);
-        _posY = Mod(y, _config.ModuleSize);
+        _posQ = Mod(x, _config.ModuleSize);
+        _posR = Mod(y, _config.ModuleSize);
     }
 
-    public (float X, float Y) GetPosition() => (_posX, _posY);
+    /// Get current position in axial hex coordinates.
+    public (float X, float Y) GetPosition() => (_posQ, _posR);
 
     private static float Mod(float a, float m) => ((a % m) + m) % m;
 
@@ -2562,7 +2969,7 @@ public sealed class GridCellModule
 // SECTION 9: Displacement Cells
 // ============================================================================
 // Displacement cells encode the relative offset between two locations,
-// enabling the system to represent object-relative (allocentric) structure.
+// enabling the system to represent object-relative structure.
 // For example: "the handle is 5cm to the right of the cup's center."
 //
 // They compute the displacement vector between a "source" grid cell
@@ -2707,90 +3114,366 @@ public sealed class CorticalColumnConfig
 {
     public int InputSize { get; init; } = 512;
     public int LocationSize { get; init; } = 1600;     // Grid cell module output size
-    public int ColumnCount { get; init; } = 1024;
+    public int L4ColumnCount { get; init; } = 1024;    // L4 SP columns
     public int CellsPerColumn { get; init; } = 16;
     public int ObjectRepresentationSize { get; init; } = 2048;
     public int ObjectActiveBits { get; init; } = 40;
-    public float LateralInfluence { get; init; } = 0.3f; // How much lateral input affects state
+    // L2/3 object layer config
+    public int L23ActivationThreshold { get; init; } = 8;   // Min synapses for segment activation
+    public int L23MinThreshold { get; init; } = 5;          // Min synapses for learning match
+    public int L23MaxSegmentsPerCell { get; init; } = 32;
+    public int L23MaxSynapsesPerSegment { get; init; } = 40;
+    public float L23PermanenceIncrement { get; init; } = 0.1f;
+    public float L23PermanenceDecrement { get; init; } = 0.02f;
+    public float L23InitialPermanence { get; init; } = 0.21f;
+    public float L23ConnectedThreshold { get; init; } = 0.5f;
+    public int L23MaxNewSynapses { get; init; } = 20;
+    // Apical dendrites — top-down feedback from higher regions or consensus
+    // TODO: Currently apical input comes from lateral consensus (_prevConsensus in
+    // ThousandBrainsEngine), not from a true higher cortical region. When multi-region
+    // hierarchy is implemented, ApicalInputSize should match the higher region's cell
+    // SDR size, and the source should be hierarchical predictions rather than same-level
+    // consensus. The apical boost is also simplified — it applies a flat multiplier
+    // (ApicalBoostFactor=1.5) rather than implementing the biological mechanism where
+    // apical depolarization creates a distinct predictive state that interacts with
+    // distal predictions (predicted+apical > predicted-only > unpredicted).
+    public int ApicalInputSize { get; init; } = 2048;      // Size of apical feedback SDR
+    public int ApicalActivationThreshold { get; init; } = 6;  // Min synapses for apical depolarization
+    public int ApicalMinThreshold { get; init; } = 4;         // Min synapses for learning match
+    public int ApicalMaxSegmentsPerCell { get; init; } = 16;
+    public int ApicalMaxSynapsesPerSegment { get; init; } = 32;
+    public float ApicalPermanenceIncrement { get; init; } = 0.1f;
+    public float ApicalPermanenceDecrement { get; init; } = 0.02f;
+    public float ApicalInitialPermanence { get; init; } = 0.21f;
+    public float ApicalConnectedThreshold { get; init; } = 0.5f;
+    public int ApicalMaxNewSynapses { get; init; } = 16;
+    public float ApicalBoostFactor { get; init; } = 1.5f;     // How much apical depolarization boosts cell priority
+    // Backward compatibility
+    public int ColumnCount { get => L4ColumnCount; init => L4ColumnCount = value; }
 }
 
+/// Models a single cortical column in the Thousand Brains framework with
+/// biologically distinct layers:
+///
+///   L4 (Input Layer):  Spatial Pooler processes ONLY sensory features.
+///                      Produces a sparse representation of "what feature is here."
+///
+///   TM (Sequence):     Temporal Memory on L4 output adds sequence context.
+///                      Distinguishes the same feature in different temporal contexts.
+///
+///   L2/3 (Object Layer): Receives L4/TM feature output AND location SDR from grid cells
+///                        through separate pathways (not concatenated into the SP).
+///                        Uses distal dendrite segments to learn (feature, location) → object
+///                        associations via Hebbian permanence-based learning.
+///                        Apical dendrite segments receive top-down feedback (consensus/
+///                        higher-region expectations) and provide contextual modulation.
+///                        Active L2/3 cells = the object representation.
+///
+/// This architecture matches the theory: L4 is feedforward-only,
+/// location enters at L2/3 via a separate pathway, object memory
+/// is stored in synaptic permanences (not a hash table), and apical
+/// dendrites carry top-down attention/expectation signals.
+///
+/// Dendritic zones modeled:
+///   Proximal (L4 SP)  — feedforward sensory input drives column activation
+///   Distal   (L2/3)   — lateral (feature+location) context drives prediction
+///   Apical   (L2/3)   — top-down feedback from higher regions or consensus
+///                        depolarizes cells, biasing competitive selection
 public sealed class CorticalColumn
 {
     private readonly CorticalColumnConfig _config;
-    private readonly SpatialPooler _featureSP;
-    private readonly TemporalMemory _sequenceTM;
+    private readonly SpatialPooler _l4SP;             // L4: sensory input only
+    private readonly TemporalMemory _sequenceTM;       // TM: sequence context on L4
     private readonly Random _rng;
 
-    // Object layer: maps (feature SDR, location SDR) → object SDR
-    // This is a simplified associative memory
-    private readonly Dictionary<int, HashSet<int>> _objectMemory = new();
+    // L2/3 Object Layer — Distal dendrites: learn (feature + location) associations.
+    private readonly CellSegmentManager[] _l23Cells;
+    private readonly int _l23InputSize;                // L4 SP output size + location SDR size
+
+    // L2/3 Object Layer — Apical dendrites: receive top-down feedback.
+    // Apical depolarization biases which L2/3 cells win during competitive selection,
+    // implementing attention/expectation from higher cortical regions.
+    private readonly CellSegmentManager[] _l23ApicalCells;
 
     // Current state
     private SDR _currentObjectRepresentation;
-    private SDR _lastSensoryInput;
-    private SDR _lastLocationInput;
     private float _confidence;
-
-    // Pool of known object representations
-    private readonly List<(string Label, SDR Representation)> _knownObjects = new();
 
     public CorticalColumn(CorticalColumnConfig config, int seed = 42)
     {
         _config = config;
         _rng = new Random(seed);
 
-        _featureSP = new SpatialPooler(new SpatialPoolerConfig
+        // L4: Spatial Pooler processes ONLY sensory input (not combined with location)
+        _l4SP = new SpatialPooler(new SpatialPoolerConfig
         {
-            InputSize = config.InputSize + config.LocationSize, // Combined input
-            ColumnCount = config.ColumnCount,
+            InputSize = config.InputSize,          // Sensory input only — NOT combined with location
+            ColumnCount = config.L4ColumnCount,
             TargetSparsity = 0.02f,
             Inhibition = InhibitionMode.Global,
         });
 
+        // TM: Temporal Memory for sequence context on L4 output
         _sequenceTM = new TemporalMemory(new TemporalMemoryConfig
         {
-            ColumnCount = config.ColumnCount,
+            ColumnCount = config.L4ColumnCount,
             CellsPerColumn = config.CellsPerColumn,
             MaxSegmentsPerCell = 64,
             MaxSynapsesPerSegment = 32,
         });
 
+        // L2/3 Distal dendrites: learn (feature + location) → object associations
+        _l23InputSize = config.L4ColumnCount + config.LocationSize;
+        _l23Cells = new CellSegmentManager[config.ObjectRepresentationSize];
+        for (int i = 0; i < config.ObjectRepresentationSize; i++)
+        {
+            _l23Cells[i] = new CellSegmentManager(
+                config.L23MaxSegmentsPerCell,
+                config.L23MaxSynapsesPerSegment);
+        }
+
+        // L2/3 Apical dendrites: top-down feedback modulation
+        _l23ApicalCells = new CellSegmentManager[config.ObjectRepresentationSize];
+        for (int i = 0; i < config.ObjectRepresentationSize; i++)
+        {
+            _l23ApicalCells[i] = new CellSegmentManager(
+                config.ApicalMaxSegmentsPerCell,
+                config.ApicalMaxSynapsesPerSegment);
+        }
+
         _currentObjectRepresentation = new SDR(config.ObjectRepresentationSize);
-        _lastSensoryInput = new SDR(config.InputSize);
-        _lastLocationInput = new SDR(config.LocationSize);
     }
 
     /// Process one sensory observation with its associated location.
-    public CorticalColumnOutput Compute(SDR sensoryInput, SDR locationInput, bool learn = true)
+    /// apicalInput: optional top-down feedback SDR from higher regions or consensus.
+    ///   Apical input depolarizes L2/3 cells via apical dendrite segments,
+    ///   biasing competitive selection toward expected/attended cells.
+    ///   This models the biological role of apical dendrites extending to L1.
+    public CorticalColumnOutput Compute(SDR sensoryInput, SDR locationInput,
+        bool learn = true, SDR? apicalInput = null)
     {
-        _lastSensoryInput = sensoryInput;
-        _lastLocationInput = locationInput;
+        // ---- L4: Feature extraction (sensory input only) ----
+        var l4ActiveColumns = _l4SP.Compute(sensoryInput, learn);
 
-        // Step 1: Combine sensory feature and location into a single input
-        var combinedInput = CombineFeatureAndLocation(sensoryInput, locationInput);
+        // ---- TM: Sequence context ----
+        var tmOutput = _sequenceTM.Compute(l4ActiveColumns, learn);
 
-        // Step 2: Spatial Pooler — create sparse representation of feature-at-location
-        var activeColumns = _featureSP.Compute(combinedInput, learn);
+        // ---- L2/3: Object layer with three dendritic zones ----
+        // Distal: receives L4 feature representation + location signal
+        var l23Input = CombineL4AndLocation(l4ActiveColumns, locationInput);
+        var l23InputBits = l23Input.ActiveBits.ToArray().ToHashSet();
 
-        // Step 3: Temporal Memory — add sequence context
-        var tmOutput = _sequenceTM.Compute(activeColumns, learn);
+        // Apical: receives top-down feedback (when available)
+        HashSet<int>? apicalInputBits = null;
+        if (apicalInput != null && apicalInput.ActiveCount > 0)
+            apicalInputBits = apicalInput.ActiveBits.ToArray().ToHashSet();
 
-        // Step 4: Generate object representation from TM cell activity
-        // Hash the active cells to produce a compact object-layer representation
-        var objectSDR = ProjectToObjectLayer(tmOutput.ActiveCells);
+        // Score each L2/3 cell using the TM's dual-threshold approach:
+        //   - Connected activity (>= ConnectedThreshold): cell has mature segments → activates
+        //   - Potential activity (all synapses incl. sub-threshold): cell has developing segments
+        //
+        // This three-tier priority ensures cells with developing segments are preferentially
+        // re-selected, allowing permanences to be reinforced across training cycles:
+        //   Tier 1: Cells with connected activity >= ActivationThreshold (known patterns)
+        //   Tier 2: Cells with potential activity >= MinThreshold (developing associations)
+        //   Tier 3: Cells with fewest segments (truly novel — least-used allocation)
+        var tier1Cells = new List<(int CellIdx, float Score)>();  // Mature segments
+        var tier2Cells = new List<(int CellIdx, float Score)>();  // Developing segments
+        for (int c = 0; c < _config.ObjectRepresentationSize; c++)
+        {
+            // Distal connected activity: mature segments with strong synapses
+            int maxConnectedActivity = 0;
+            // Distal potential activity: developing segments (including sub-threshold)
+            int maxPotentialActivity = 0;
+            foreach (var segment in _l23Cells[c].Segments)
+            {
+                int connected = segment.ComputeActivity(l23InputBits, _config.L23ConnectedThreshold);
+                int potential = segment.ComputePotentialActivity(l23InputBits);
+                maxConnectedActivity = Math.Max(maxConnectedActivity, connected);
+                maxPotentialActivity = Math.Max(maxPotentialActivity, potential);
+            }
 
-        // Step 5: Update running object representation (accumulate evidence)
-        _currentObjectRepresentation = AccumulateObjectEvidence(
-            _currentObjectRepresentation, objectSDR);
+            // Apical activity: is this cell expected by top-down feedback?
+            int maxApicalActivity = 0;
+            if (apicalInputBits != null)
+            {
+                foreach (var segment in _l23ApicalCells[c].Segments)
+                {
+                    int activity = segment.ComputeActivity(
+                        apicalInputBits, _config.ApicalConnectedThreshold);
+                    maxApicalActivity = Math.Max(maxApicalActivity, activity);
+                }
+            }
 
-        // Step 6: Learn feature-at-location → object association
+            // TODO: Replace flat apicalBoost multiplier with a proper three-way interaction model.
+            // Biologically, apical depolarization is a distinct state from distal depolarization.
+            // The correct priority should be:
+            //   1. Cells with BOTH distal AND apical depolarization (strongest prediction — context
+            //      from both sequence history and top-down expectation agree)
+            //   2. Cells with distal depolarization only (sequence context matches)
+            //   3. Cells with apical depolarization only (top-down expects, but no sequence match)
+            //   4. Cells with no depolarization (novel/bursting)
+            // Currently this is collapsed into a single score multiplication, which loses the
+            // categorical distinction between these states. A proper implementation would add
+            // Tier 0.5 (distal+apical) above Tier 1 (distal only) in the cell selection.
+            float apicalBoost = (maxApicalActivity >= _config.ApicalActivationThreshold)
+                ? _config.ApicalBoostFactor : 1.0f;
+
+            // Tier 1: mature segments (connected activity meets threshold)
+            if (maxConnectedActivity >= _config.L23ActivationThreshold)
+            {
+                tier1Cells.Add((c, maxConnectedActivity * apicalBoost));
+            }
+            // Tier 2: developing segments (potential activity meets min threshold)
+            // These cells have segments with the right synapses but permanences
+            // haven't crossed the connection threshold yet. Re-selecting them
+            // allows learning to reinforce their synapses.
+            else if (maxPotentialActivity >= _config.L23MinThreshold)
+            {
+                tier2Cells.Add((c, maxPotentialActivity * apicalBoost));
+            }
+        }
+
+        // Select active L2/3 cells using tiered priority.
+        //
+        // During LEARNING: Tier 0 (highest) = cells already in the current object
+        // representation. These stay active so they accumulate segments for every
+        // (feature, location) pair of the object being learned. This models the
+        // biological recurrent maintenance of L2/3 object representations — once
+        // cells are activated for an object, they stay active until a new object
+        // is started. Each touch teaches them a new (feature, location) association.
+        //
+        // During RECOGNITION: No Tier 0 bias. Cells activate purely from trained
+        // segments, and evidence accumulation narrows the representation across
+        // touches (as the theory requires for candidate elimination).
+        var newL23Active = new HashSet<int>();
+        int slotsRemaining = _config.ObjectActiveBits;
+
+        // Tier 0 (learning only): cells already representing the current object
+        if (learn && _currentObjectRepresentation.ActiveCount > 0)
+        {
+            foreach (int bit in _currentObjectRepresentation.ActiveBits)
+            {
+                if (newL23Active.Count >= _config.ObjectActiveBits) break;
+                newL23Active.Add(bit);
+            }
+            slotsRemaining = _config.ObjectActiveBits - newL23Active.Count;
+        }
+
+        // Tier 1: cells with mature connected segments (highest priority for recognition)
+        if (slotsRemaining > 0 && tier1Cells.Count > 0)
+        {
+            foreach (var (cellIdx, _) in tier1Cells
+                .Where(c => !newL23Active.Contains(c.CellIdx))
+                .OrderByDescending(c => c.Score)
+                .Take(slotsRemaining))
+            {
+                newL23Active.Add(cellIdx);
+            }
+            slotsRemaining = _config.ObjectActiveBits - newL23Active.Count;
+        }
+
+        // Tier 2: cells with developing segments (re-select to reinforce learning)
+        if (slotsRemaining > 0 && tier2Cells.Count > 0)
+        {
+            foreach (var (cellIdx, _) in tier2Cells
+                .Where(c => !newL23Active.Contains(c.CellIdx))
+                .OrderByDescending(c => c.Score)
+                .Take(slotsRemaining))
+            {
+                newL23Active.Add(cellIdx);
+            }
+            slotsRemaining = _config.ObjectActiveBits - newL23Active.Count;
+        }
+
+        // Tier 3: truly novel — no relevant segments at all. Allocate least-used cells.
+        if (slotsRemaining > 0)
+        {
+            var available = Enumerable.Range(0, _config.ObjectRepresentationSize)
+                .Where(c => !newL23Active.Contains(c))
+                .OrderBy(c => _l23Cells[c].SegmentCount)
+                .ThenBy(_ => _rng.Next())
+                .Take(slotsRemaining);
+            foreach (int c in available)
+                newL23Active.Add(c);
+        }
+
+        // ---- L2/3 Learning ----
         if (learn)
         {
-            int featureLocationHash = HashCode.Combine(
-                sensoryInput.GetHashCode(), locationInput.GetHashCode());
-            _objectMemory[featureLocationHash] = new HashSet<int>(
-                _currentObjectRepresentation.ActiveBits.ToArray());
+            // Distal learning: reinforce/grow segments for (feature, location) → object.
+            // Uses ComputePotentialActivity (all synapses including sub-threshold) to find
+            // segments to reinforce — matching the TM's proven dual-threshold approach.
+            // This allows segments with sub-threshold permanences to be found and reinforced,
+            // raising their permanences toward the connection threshold over multiple exposures.
+            foreach (int cellIdx in newL23Active)
+            {
+                DendriteSegment? bestSegment = null;
+                int bestPotential = 0;
+                foreach (var segment in _l23Cells[cellIdx].Segments)
+                {
+                    int potential = segment.ComputePotentialActivity(l23InputBits);
+                    if (potential > bestPotential)
+                    {
+                        bestPotential = potential;
+                        bestSegment = segment;
+                    }
+                }
+
+                if (bestSegment != null && bestPotential >= _config.L23MinThreshold)
+                {
+                    // Reinforce existing segment: strengthen matching synapses,
+                    // weaken non-matching ones, grow new synapses to uncovered input bits
+                    bestSegment.AdaptSynapses(l23InputBits,
+                        _config.L23PermanenceIncrement, _config.L23PermanenceDecrement);
+                    GrowL23Synapses(bestSegment, l23InputBits);
+                }
+                else
+                {
+                    // No matching segment — create a new one
+                    var newSegment = _l23Cells[cellIdx].CreateSegment(cellIdx, 0);
+                    GrowL23Synapses(newSegment, l23InputBits);
+                }
+            }
+
+            // Apical learning: same dual-threshold approach for top-down associations.
+            if (apicalInputBits != null)
+            {
+                foreach (int cellIdx in newL23Active)
+                {
+                    DendriteSegment? bestSegment = null;
+                    int bestPotential = 0;
+                    foreach (var segment in _l23ApicalCells[cellIdx].Segments)
+                    {
+                        int potential = segment.ComputePotentialActivity(apicalInputBits);
+                        if (potential > bestPotential)
+                        {
+                            bestPotential = potential;
+                            bestSegment = segment;
+                        }
+                    }
+
+                    if (bestSegment != null && bestPotential >= _config.ApicalMinThreshold)
+                    {
+                        bestSegment.AdaptSynapses(apicalInputBits,
+                            _config.ApicalPermanenceIncrement, _config.ApicalPermanenceDecrement);
+                        GrowApicalSynapses(bestSegment, apicalInputBits);
+                    }
+                    else
+                    {
+                        var newSegment = _l23ApicalCells[cellIdx].CreateSegment(cellIdx, 0);
+                        GrowApicalSynapses(newSegment, apicalInputBits);
+                    }
+                }
+            }
         }
+
+        // Object representation = active L2/3 cells
+        var objectSDR = new SDR(_config.ObjectRepresentationSize, newL23Active);
+
+        // Accumulate evidence across observations (intersection-based narrowing)
+        _currentObjectRepresentation = AccumulateObjectEvidence(
+            _currentObjectRepresentation, objectSDR);
 
         _confidence = 1.0f - tmOutput.Anomaly;
 
@@ -2804,33 +3487,25 @@ public sealed class CorticalColumn
         };
     }
 
-    /// Incorporate lateral input from other columns (voting)
+    /// Incorporate lateral input from other columns (voting).
     public void ReceiveLateralInput(SDR consensusRepresentation)
     {
-        // Narrow the current object representation toward consensus
-        // by intersecting or blending with the incoming signal
         if (consensusRepresentation.ActiveCount == 0) return;
+        if (_currentObjectRepresentation.ActiveCount == 0) return;
 
-        int overlap = _currentObjectRepresentation.Overlap(consensusRepresentation);
-        float similarity = _currentObjectRepresentation.MatchScore(consensusRepresentation);
+        var intersection = _currentObjectRepresentation.Intersect(consensusRepresentation);
 
-        if (similarity > 0.3f)
+        if (intersection.ActiveCount > 0)
         {
-            // Strong agreement: move toward consensus
-            _currentObjectRepresentation = BlendSDRs(
-                _currentObjectRepresentation, consensusRepresentation,
-                _config.LateralInfluence);
+            _currentObjectRepresentation = intersection.EnforceSparsity(_config.ObjectActiveBits);
         }
-        else if (similarity < 0.1f && _confidence < 0.5f)
+        else if (_confidence < 0.5f)
         {
-            // Low confidence + low agreement: reset to consensus
             _currentObjectRepresentation = consensusRepresentation;
         }
     }
 
-    /// Reset object evidence and temporal state (e.g., when starting to explore a new object).
-    /// Clears TM predictions so that sequence context from the previous object
-    /// does not produce spurious predictions on the first touch of the new one.
+    /// Reset object evidence and temporal state.
     public void ResetObjectRepresentation()
     {
         _currentObjectRepresentation = new SDR(_config.ObjectRepresentationSize);
@@ -2842,82 +3517,54 @@ public sealed class CorticalColumn
 
     // --- Internals ---
 
-    private SDR CombineFeatureAndLocation(SDR feature, SDR location)
+    /// Combine L4 feature columns and location SDR into L2/3 input space.
+    private SDR CombineL4AndLocation(SDR l4Columns, SDR location)
     {
-        int totalSize = _config.InputSize + _config.LocationSize;
-        var combined = new List<int>(feature.ActiveBits.ToArray());
+        var combined = new List<int>(l4Columns.ActiveBits.ToArray());
         foreach (int bit in location.ActiveBits)
-            combined.Add(bit + _config.InputSize);
-        return new SDR(totalSize, combined);
+            combined.Add(bit + _config.L4ColumnCount);
+        return new SDR(_l23InputSize, combined);
     }
 
-    /// Project TM cell activity into the object representation space
-    /// using a deterministic hash-based projection
-    private SDR ProjectToObjectLayer(HashSet<int> activeCells)
+    /// Grow synapses on an L2/3 distal segment toward active input bits not yet connected.
+    private void GrowL23Synapses(DendriteSegment segment, HashSet<int> inputBits)
     {
-        var objectBits = new HashSet<int>();
-        foreach (int cell in activeCells)
-        {
-            // Hash each active cell to 2-3 bits in object space
-            int hash = HashCode.Combine(cell, 0xDEADBEEF);
-            objectBits.Add(((hash & 0x7FFFFFFF) % _config.ObjectRepresentationSize));
-            hash = HashCode.Combine(cell, 0xCAFEBABE);
-            objectBits.Add(((hash & 0x7FFFFFFF) % _config.ObjectRepresentationSize));
-        }
+        var candidates = inputBits
+            .Where(b => !segment.HasSynapseTo(b))
+            .OrderBy(_ => _rng.Next())
+            .Take(_config.L23MaxNewSynapses);
 
-        // Subsample to maintain target sparsity — use deterministic selection
-        // (lowest bit indices) so the same TM cells always produce the same
-        // object SDR regardless of RNG state.
-        if (objectBits.Count > _config.ObjectActiveBits)
-        {
-            var sampled = objectBits.OrderBy(b => b).Take(_config.ObjectActiveBits);
-            return new SDR(_config.ObjectRepresentationSize, sampled);
-        }
-
-        return new SDR(_config.ObjectRepresentationSize, objectBits);
+        foreach (int target in candidates)
+            segment.AddSynapse(new Synapse(target, _config.L23InitialPermanence));
+        segment.EnforceMaxSynapses(_config.L23MaxSynapsesPerSegment);
     }
 
-    /// Accumulate object evidence: blend previous representation with new observation
+    /// Grow synapses on an L2/3 apical segment toward active top-down bits not yet connected.
+    private void GrowApicalSynapses(DendriteSegment segment, HashSet<int> apicalBits)
+    {
+        var candidates = apicalBits
+            .Where(b => !segment.HasSynapseTo(b))
+            .OrderBy(_ => _rng.Next())
+            .Take(_config.ApicalMaxNewSynapses);
+
+        foreach (int target in candidates)
+            segment.AddSynapse(new Synapse(target, _config.ApicalInitialPermanence));
+        segment.EnforceMaxSynapses(_config.ApicalMaxSynapsesPerSegment);
+    }
+
+    /// Accumulate object evidence via intersection-based narrowing.
     private SDR AccumulateObjectEvidence(SDR previous, SDR current)
     {
         if (previous.ActiveCount == 0) return current;
 
-        // Keep bits that are supported by EITHER previous or current evidence,
-        // with preference for bits supported by both (intersection-boosted union)
         var intersection = previous.Intersect(current);
-        var union = previous.Union(current);
+        int minViableBits = Math.Max(1, _config.ObjectActiveBits / 4);
+        if (intersection.ActiveCount >= minViableBits)
+            return intersection.EnforceSparsity(_config.ObjectActiveBits);
 
-        if (union.ActiveCount <= _config.ObjectActiveBits)
-            return union;
-
-        // Prioritize intersection bits, fill remainder from union
-        var result = new HashSet<int>(intersection.ActiveBits.ToArray());
-        foreach (int bit in union.ActiveBits)
-        {
-            if (result.Count >= _config.ObjectActiveBits) break;
-            result.Add(bit);
-        }
-
-        return new SDR(_config.ObjectRepresentationSize, result);
+        return current;
     }
 
-    /// Blend two SDRs: select bits from each based on blendFactor.
-    /// Uses deterministic selection (lowest bit indices) so the same
-    /// inputs always produce the same output regardless of RNG state.
-    private SDR BlendSDRs(SDR a, SDR b, float bWeight)
-    {
-        var result = new HashSet<int>();
-        int targetBits = Math.Max(a.ActiveCount, b.ActiveCount);
-
-        // Take (1-bWeight) fraction from a, bWeight fraction from b
-        int fromB = (int)(targetBits * bWeight);
-        int fromA = targetBits - fromB;
-
-        result.UnionWith(a.ActiveBits.ToArray().OrderBy(x => x).Take(fromA));
-        result.UnionWith(b.ActiveBits.ToArray().OrderBy(x => x).Take(fromB));
-
-        return new SDR(a.Size, result);
-    }
 }
 
 public record CorticalColumnOutput
@@ -3050,8 +3697,9 @@ public sealed class LateralVotingMechanism
 // SECTION 12: Thousand Brains Engine
 // ============================================================================
 // The complete Thousand Brains architecture. Orchestrates multiple cortical
-// columns, each with its own grid cell module and sensory input, plus
-// lateral voting for consensus-based object recognition.
+// columns, each with its own set of grid cell modules (multiple modules
+// per column at different scales/orientations for richer location encoding),
+// plus lateral voting for consensus-based object recognition.
 //
 // Object learning: explore an object, accumulate evidence, converge, label.
 // Object recognition: observe features at locations, vote, converge to ID.
@@ -3060,6 +3708,7 @@ public sealed class LateralVotingMechanism
 public sealed class ThousandBrainsConfig
 {
     public int ColumnCount { get; init; } = 8;
+    public int ModulesPerColumn { get; init; } = 3;     // Multiple modules per column provide richer location codes
     public CorticalColumnConfig ColumnConfig { get; init; } = new();
     public GridCellModuleConfig[] GridModuleConfigs { get; init; } = Array.Empty<GridCellModuleConfig>();
     public LateralVotingConfig VotingConfig { get; init; } = new();
@@ -3071,18 +3720,27 @@ public sealed class ThousandBrainsEngine
 {
     private readonly ThousandBrainsConfig _config;
     private readonly CorticalColumn[] _columns;
-    private readonly GridCellModule[] _gridModules;
+    // Multiple grid cell modules per column: _gridModules[columnIdx][moduleIdx]
+    // The theory proposes that each column has several modules at different
+    // scales/orientations, whose combined output provides a unique location code.
+    private readonly GridCellModule[][] _gridModules;
+    private readonly int _totalLocationSize; // Sum of all module OutputSizes for one column
     private readonly DisplacementCellModule? _displacementModule;
     private readonly LateralVotingMechanism _voting;
 
     // Known objects for recognition
     private readonly Dictionary<string, SDR> _objectLibrary = new();
-    // Learned object structure: object label → list of (displacement SDR) for predicting next location
-    private readonly Dictionary<string, List<SDR>> _objectDisplacements = new();
-    // Current object's displacement sequence being accumulated during learning
-    private readonly List<SDR> _currentDisplacements = new();
+    // Learned object structure: object label → list of (sourceLocation, displacement, targetLocation)
+    // Displacement predictions are keyed by source location (SDR overlap), not sequence order.
+    private readonly Dictionary<string, List<(SDR SourceLocation, SDR Displacement, SDR TargetLocation)>> _objectStructure = new();
+    // Current object's structural observations being accumulated during learning
+    private readonly List<(SDR SourceLocation, SDR Displacement, SDR TargetLocation)> _currentStructure = new();
     // Previous grid cell locations for displacement computation
     private SDR[]? _prevGridLocations;
+    // Previous consensus: lateral fallback for apical input (used only in single-region mode).
+    // When Process() receives hierarchicalFeedback from a higher region, that takes priority
+    // over _prevConsensus. See Process() for the apical signal priority logic.
+    private SDR? _prevConsensus;
     private int _explorationSteps;
 
     public ThousandBrainsEngine(ThousandBrainsConfig config)
@@ -3090,24 +3748,77 @@ public sealed class ThousandBrainsEngine
         _config = config;
         _voting = new LateralVotingMechanism(config.VotingConfig);
 
-        // Create grid cell modules (one per column, varying scale/orientation)
-        var defaultGridConfigs = Enumerable.Range(0, config.ColumnCount)
-            .Select(i => new GridCellModuleConfig
-            {
-                Scale = 1.0f + i * 0.5f,     // Increasing scales
-                Orientation = i * MathF.PI / config.ColumnCount, // Spread orientations
-            }).ToArray();
+        int modulesPerCol = config.ModulesPerColumn;
 
-        var gridConfigs = config.GridModuleConfigs.Length > 0 ? config.GridModuleConfigs : defaultGridConfigs;
+        // Build grid module configs: each column gets `modulesPerCol` modules
+        // at different scales and orientations for richer location encoding
+        GridCellModuleConfig[] baseConfigs;
+        if (config.GridModuleConfigs.Length > 0)
+        {
+            baseConfigs = config.GridModuleConfigs;
+        }
+        else
+        {
+            baseConfigs = Enumerable.Range(0, modulesPerCol)
+                .Select(m => new GridCellModuleConfig
+                {
+                    Scale = 1.0f + m * 0.7f,     // Increasing scales across modules
+                    Orientation = m * MathF.PI / modulesPerCol, // Spread orientations
+                }).ToArray();
+        }
 
-        _gridModules = new GridCellModule[config.ColumnCount];
+        _gridModules = new GridCellModule[config.ColumnCount][];
         _columns = new CorticalColumn[config.ColumnCount];
+        _totalLocationSize = 0;
+
+        // Compute total location size from the first column's modules
+        for (int m = 0; m < modulesPerCol; m++)
+        {
+            var gc = baseConfigs[m % baseConfigs.Length];
+            _totalLocationSize += gc.TotalCells;
+        }
+
+        // Override column config's LocationSize and ApicalInputSize to match computed sizes
+        var adjustedColumnConfig = new CorticalColumnConfig
+        {
+            InputSize = config.ColumnConfig.InputSize,
+            LocationSize = _totalLocationSize,
+            L4ColumnCount = config.ColumnConfig.L4ColumnCount,
+            CellsPerColumn = config.ColumnConfig.CellsPerColumn,
+            ObjectRepresentationSize = config.ColumnConfig.ObjectRepresentationSize,
+            ObjectActiveBits = config.ColumnConfig.ObjectActiveBits,
+            L23ActivationThreshold = config.ColumnConfig.L23ActivationThreshold,
+            L23MinThreshold = config.ColumnConfig.L23MinThreshold,
+            L23MaxSegmentsPerCell = config.ColumnConfig.L23MaxSegmentsPerCell,
+            L23MaxSynapsesPerSegment = config.ColumnConfig.L23MaxSynapsesPerSegment,
+            L23PermanenceIncrement = config.ColumnConfig.L23PermanenceIncrement,
+            L23PermanenceDecrement = config.ColumnConfig.L23PermanenceDecrement,
+            L23InitialPermanence = config.ColumnConfig.L23InitialPermanence,
+            L23ConnectedThreshold = config.ColumnConfig.L23ConnectedThreshold,
+            L23MaxNewSynapses = config.ColumnConfig.L23MaxNewSynapses,
+            // Apical input = ObjectRepresentationSize (consensus is in object SDR space)
+            ApicalInputSize = config.ColumnConfig.ObjectRepresentationSize,
+            ApicalActivationThreshold = config.ColumnConfig.ApicalActivationThreshold,
+            ApicalMinThreshold = config.ColumnConfig.ApicalMinThreshold,
+            ApicalMaxSegmentsPerCell = config.ColumnConfig.ApicalMaxSegmentsPerCell,
+            ApicalMaxSynapsesPerSegment = config.ColumnConfig.ApicalMaxSynapsesPerSegment,
+            ApicalPermanenceIncrement = config.ColumnConfig.ApicalPermanenceIncrement,
+            ApicalPermanenceDecrement = config.ColumnConfig.ApicalPermanenceDecrement,
+            ApicalInitialPermanence = config.ColumnConfig.ApicalInitialPermanence,
+            ApicalConnectedThreshold = config.ColumnConfig.ApicalConnectedThreshold,
+            ApicalMaxNewSynapses = config.ColumnConfig.ApicalMaxNewSynapses,
+            ApicalBoostFactor = config.ColumnConfig.ApicalBoostFactor,
+        };
 
         for (int i = 0; i < config.ColumnCount; i++)
         {
-            _gridModules[i] = new GridCellModule(
-                gridConfigs[i % gridConfigs.Length], seed: 42 + i);
-            _columns[i] = new CorticalColumn(config.ColumnConfig, seed: 100 + i);
+            _gridModules[i] = new GridCellModule[modulesPerCol];
+            for (int m = 0; m < modulesPerCol; m++)
+            {
+                _gridModules[i][m] = new GridCellModule(
+                    baseConfigs[m % baseConfigs.Length], seed: 42 + i * modulesPerCol + m);
+            }
+            _columns[i] = new CorticalColumn(adjustedColumnConfig, seed: 100 + i);
         }
 
         if (config.UseDisplacementCells)
@@ -3120,25 +3831,51 @@ public sealed class ThousandBrainsEngine
     /// Process one sensory observation during exploration or recognition.
     /// Each column receives its local sensory patch.
     /// Grid cells update via path integration from the movement vector.
+    ///
+    /// hierarchicalFeedback: optional top-down SDR from a HIGHER cortical region.
+    /// When provided, this is used as the apical input to each column instead of
+    /// the lateral consensus. This implements the biological pathway where apical
+    /// dendrites in L1 receive feedback from higher regions (e.g., V2 → V1).
+    /// When null, falls back to lateral consensus as the apical signal (single-region mode).
     public ThousandBrainsOutput Process(
         SDR[] sensoryPatches, float moveDeltaX, float moveDeltaY,
-        bool learn = true)
+        bool learn = true, SDR? hierarchicalFeedback = null)
     {
+        if (sensoryPatches.Length != _config.ColumnCount && sensoryPatches.Length != 1)
+            throw new ArgumentException(
+                $"Expected {_config.ColumnCount} sensory patches (one per column) or 1 (broadcast), " +
+                $"got {sensoryPatches.Length}. Each column should process its own sensory patch.");
+
         _explorationSteps++;
 
-        // 1. Update grid cell locations via path integration
-        foreach (var module in _gridModules)
-            module.Move(moveDeltaX, moveDeltaY);
+        // 1. Update grid cell locations via path integration (all modules, all columns)
+        for (int i = 0; i < _config.ColumnCount; i++)
+            foreach (var module in _gridModules[i])
+                module.Move(moveDeltaX, moveDeltaY);
 
-        // 2. Each column processes its sensory patch with location
+        // 2. Each column processes its sensory patch with composite location.
+        //    Apical input priority:
+        //      (a) hierarchicalFeedback — true top-down from a higher cortical region
+        //      (b) _prevConsensus — lateral consensus fallback (single-region mode)
+        //    When hierarchical feedback is available, it provides genuinely top-down context:
+        //    the higher region has already partially recognized the object at a more abstract
+        //    level and sends that downward to constrain lower-region cell selection.
+        //    The lateral consensus fallback is retained for single-region systems where no
+        //    higher region exists — it still provides useful expectation priming, though it
+        //    lacks the abstraction gradient of true hierarchical feedback.
+        SDR? apicalSignal = hierarchicalFeedback ?? _prevConsensus;
+
         var columnOutputs = new CorticalColumnOutput[_config.ColumnCount];
         for (int i = 0; i < _config.ColumnCount; i++)
         {
-            var locationSDR = _gridModules[i].GetCurrentLocation();
+            var locationSDR = GetCompositeLocation(i);
             columnOutputs[i] = _columns[i].Compute(
-                sensoryPatches[i % sensoryPatches.Length],
+                sensoryPatches.Length == _config.ColumnCount
+                    ? sensoryPatches[i]
+                    : sensoryPatches[i % sensoryPatches.Length],
                 locationSDR,
-                learn);
+                learn,
+                apicalInput: apicalSignal);
         }
 
         // 3. Lateral voting: columns exchange representations and converge
@@ -3146,25 +3883,39 @@ public sealed class ThousandBrainsEngine
             _columns,
             col => col.GetObjectRepresentation());
 
-        // 4. Attempt recognition against known objects
+        // 4. Attempt recognition: only recognize when columns have converged.
+        // Convergence IS recognition — it means columns agree on the object.
         string? recognizedObject = null;
         float bestMatch = 0;
 
-        foreach (var (label, objSDR) in _objectLibrary)
+        if (converged && consensus.ActiveCount > 0)
         {
-            float match = consensus.MatchScore(objSDR);
-            if (match > bestMatch && match > 0.5f)
+            foreach (var (label, objSDR) in _objectLibrary)
             {
-                bestMatch = match;
-                recognizedObject = label;
+                float match = consensus.MatchScore(objSDR);
+                if (match > bestMatch)
+                {
+                    bestMatch = match;
+                    recognizedObject = label;
+                }
+            }
+
+            // Require strong match — convergence + high similarity = confident recognition
+            if (bestMatch < 0.3f)
+            {
+                recognizedObject = null;
+                bestMatch = 0;
             }
         }
 
         // 5. Compute displacement predictions if enabled
+        // Structure-based: predictions are conditioned on current location (SDR overlap),
+        // not on step count. This means exploring an object in a different order
+        // than during learning still produces correct predictions.
         SDR? predictedNextLocation = null;
         if (_displacementModule != null && _explorationSteps > 1 && _prevGridLocations != null)
         {
-            var currentLoc = _gridModules[0].GetCurrentLocation();
+            var currentLoc = _gridModules[0][0].GetCurrentLocation();
             var prevLoc = _prevGridLocations[0];
 
             // Compute the displacement from previous to current location
@@ -3172,26 +3923,48 @@ public sealed class ThousandBrainsEngine
 
             if (learn)
             {
-                // During learning: accumulate displacements for the current object
-                _currentDisplacements.Add(displacement);
+                // During learning: store structural observation (source → displacement → target)
+                _currentStructure.Add((prevLoc, displacement, currentLoc));
             }
 
             if (recognizedObject != null
-                && _objectDisplacements.TryGetValue(recognizedObject, out var learnedDisps)
-                && learnedDisps.Count > 0)
+                && _objectStructure.TryGetValue(recognizedObject, out var structure)
+                && structure.Count > 0)
             {
-                // During recognition: use the most recently matched displacement
-                // to predict the next location based on learned object structure
-                int nextIdx = (_explorationSteps - 1) % learnedDisps.Count;
-                predictedNextLocation = _displacementModule.PredictTarget(
-                    currentLoc, learnedDisps[nextIdx]);
+                // During recognition: find the stored structural entry whose source
+                // location best matches the current location (by SDR overlap)
+                int bestOverlap = 0;
+                (SDR SourceLocation, SDR Displacement, SDR TargetLocation)? bestEntry = null;
+
+                foreach (var entry in structure)
+                {
+                    int overlap = currentLoc.Overlap(entry.SourceLocation);
+                    if (overlap > bestOverlap)
+                    {
+                        bestOverlap = overlap;
+                        bestEntry = entry;
+                    }
+                }
+
+                if (bestEntry.HasValue && bestOverlap > 0)
+                {
+                    // Predict next location from current position + best-matching displacement
+                    predictedNextLocation = _displacementModule.PredictTarget(
+                        currentLoc, bestEntry.Value.Displacement);
+                }
             }
         }
 
-        // Save current grid locations for next step's displacement computation
+        // Save current first-module locations for next step's displacement computation
         _prevGridLocations = new SDR[_config.ColumnCount];
         for (int i = 0; i < _config.ColumnCount; i++)
-            _prevGridLocations[i] = _gridModules[i].GetCurrentLocation();
+            _prevGridLocations[i] = _gridModules[i][0].GetCurrentLocation();
+
+        // Save consensus as apical fallback for the next processing step.
+        // When hierarchicalFeedback is provided to Process(), _prevConsensus is ignored
+        // in favor of the true top-down signal. In single-region mode (no higher region),
+        // consensus still provides useful expectation priming via the lateral pathway.
+        _prevConsensus = consensus;
 
         return new ThousandBrainsOutput
         {
@@ -3213,9 +3986,9 @@ public sealed class ThousandBrainsEngine
         var consensus = _voting.ComputeConsensus(votes);
         _objectLibrary[label] = consensus;
 
-        // Store learned displacement sequence for this object
-        if (_displacementModule != null && _currentDisplacements.Count > 0)
-            _objectDisplacements[label] = new List<SDR>(_currentDisplacements);
+        // Store learned object structure (location → displacement → target)
+        if (_displacementModule != null && _currentStructure.Count > 0)
+            _objectStructure[label] = new List<(SDR, SDR, SDR)>(_currentStructure);
     }
 
     /// Reset all columns and grid cells for exploring a new object.
@@ -3228,18 +4001,39 @@ public sealed class ThousandBrainsEngine
     {
         _explorationSteps = 0;
         _prevGridLocations = null;
-        _currentDisplacements.Clear();
+        _prevConsensus = null;  // No top-down expectation for new object
+        _currentStructure.Clear();
         foreach (var column in _columns)
             column.ResetObjectRepresentation();
-        foreach (var module in _gridModules)
-            module.SetPosition(0, 0);
+        for (int i = 0; i < _config.ColumnCount; i++)
+            foreach (var module in _gridModules[i])
+                module.SetPosition(0, 0);
     }
 
     /// Anchor grid cells at the current position based on a landmark
     public void AnchorAtLandmark(SDR landmark)
     {
-        foreach (var module in _gridModules)
-            module.Anchor(landmark);
+        for (int i = 0; i < _config.ColumnCount; i++)
+            foreach (var module in _gridModules[i])
+                module.Anchor(landmark);
+    }
+
+    /// Concatenate all grid module outputs for a given column into a single composite location SDR.
+    private SDR GetCompositeLocation(int columnIndex)
+    {
+        var modules = _gridModules[columnIndex];
+        var allBits = new List<int>();
+        int offset = 0;
+
+        foreach (var module in modules)
+        {
+            var modSDR = module.GetCurrentLocation();
+            foreach (int bit in modSDR.ActiveBits)
+                allBits.Add(bit + offset);
+            offset += module.OutputSize;
+        }
+
+        return new SDR(_totalLocationSize, allBits);
     }
 
     public IReadOnlyDictionary<string, SDR> GetObjectLibrary() => _objectLibrary;
@@ -3311,6 +4105,10 @@ public sealed class SPRegion : IRegion
     private SDR _input = new(0);
     private SDR _output = new(0);
 
+    /// When true, SP learning is frozen — Compute still produces output but
+    /// does not update synaptic permanences or duty cycles.
+    public bool FreezeLearning { get; set; }
+
     public IReadOnlyList<RegionPort> InputPorts { get; } = new[]
     {
         new RegionPort("bottomUpIn", PortType.SDR),
@@ -3340,7 +4138,7 @@ public sealed class SPRegion : IRegion
     };
 
     public void Compute(bool learn = true)
-        => _output = _sp.Compute(_input, learn);
+        => _output = _sp.Compute(_input, learn && !FreezeLearning);
 
     /// SP has no temporal state to reset. Duty cycles and boost factors are
     /// long-term learning statistics that should persist across sequences.
@@ -3417,18 +4215,20 @@ public sealed class SPRegion : IRegion
 }
 
 /// Wraps the Temporal Memory as a NetworkAPI region
+/// Wraps the Temporal Memory as a NetworkAPI region.
+/// Supports optional apical input ("apicalIn" port) for top-down feedback from higher
+/// regions in a hierarchical pipeline. When connected, the higher region's predictive
+/// cells serve as apical context that biases this TM's cell selection.
 public sealed class TMRegion : IRegion
 {
     public string Name { get; }
     private readonly TemporalMemoryConfig _config;
     private readonly TemporalMemory _tm;
     private SDR _input = new(0);
+    private SDR? _apicalInput;   // Top-down feedback from higher region (set via "apicalIn" port)
     private TemporalMemoryOutput? _lastOutput;
 
-    public IReadOnlyList<RegionPort> InputPorts { get; } = new[]
-    {
-        new RegionPort("bottomUpIn", PortType.SDR),
-    };
+    public IReadOnlyList<RegionPort> InputPorts { get; }
 
     public IReadOnlyList<RegionPort> OutputPorts { get; } = new[]
     {
@@ -3442,11 +4242,32 @@ public sealed class TMRegion : IRegion
         Name = name;
         _config = config;
         _tm = new TemporalMemory(config);
+
+        // Only expose the apicalIn port when apical is enabled in the config
+        var ports = new List<RegionPort> { new("bottomUpIn", PortType.SDR) };
+        if (config.ApicalEnabled)
+            ports.Add(new RegionPort("apicalIn", PortType.CellActivity));
+        InputPorts = ports.AsReadOnly();
     }
 
     public void SetInput(string portName, object value)
     {
-        if (portName == "bottomUpIn") _input = (SDR)value;
+        switch (portName)
+        {
+            case "bottomUpIn":
+                _input = (SDR)value;
+                break;
+            case "apicalIn":
+                // Convert CellActivity (HashSet<int>) to SDR in apical input space.
+                // Higher-region cell indices map directly to apical SDR bit positions.
+                if (value is HashSet<int> cellSet && _config.ApicalEnabled)
+                {
+                    // Filter to valid apical input range
+                    var validBits = cellSet.Where(b => b >= 0 && b < _config.ApicalInputSize);
+                    _apicalInput = new SDR(_config.ApicalInputSize, validBits);
+                }
+                break;
+        }
     }
 
     public object GetOutput(string portName) => portName switch
@@ -3458,7 +4279,7 @@ public sealed class TMRegion : IRegion
     };
 
     public void Compute(bool learn = true)
-        => _lastOutput = _tm.Compute(_input, learn);
+        => _lastOutput = _tm.Compute(_input, learn, _apicalInput);
 
     /// Clear TM cell state for sequence boundaries. Preserves learned synapses.
     public void Reset()
@@ -3797,10 +4618,14 @@ public sealed class Network
         _executionOrder ??= TopologicalSort();
         _feedbackTargets ??= BuildFeedbackTargets();
 
-        // Pass 1: feedforward — propagate all links, compute in topological order
+        // Pass 1: full feedforward — propagate all links, compute in topological order
         ExecutePass(learn);
 
         // Pass 2+: settling loop (only if feedback links exist)
+        // During settling, only feedback links propagate new data. Feedforward inputs
+        // are held fixed from Pass 1 so that lower regions recompute with their original
+        // bottom-up input plus updated top-down (apical) feedback. This prevents
+        // feedforward drift during settling iterations.
         if (_feedbackTargets.Count > 0)
         {
             LastSettlingIterations = 0;
@@ -3808,12 +4633,25 @@ public sealed class Network
             {
                 var snapshots = SnapshotFeedbackTargetOutputs();
 
-                // Settling passes don't learn — learning only on the initial pass
-                ExecutePass(learn: false);
+                // Settling passes: propagate only feedback links to update apical inputs,
+                // then recompute feedback-target regions and their downstream dependents.
+                // Distal/feedforward learning is disabled during settling (learn=false).
+                // Apical learning occurs on the FINAL settling iteration (after convergence)
+                // because the converged feedback signal is the correct teaching signal —
+                // learning on intermediate settling states would reinforce unconverged patterns.
+                ExecuteSettlingPass();
                 LastSettlingIterations = i + 1;
 
                 if (HasConverged(snapshots))
+                {
+                    // Converged: optionally do one final learning pass for apical synapses.
+                    // This teaches feedback-target regions to associate the converged
+                    // top-down signal with their current activation — learning "what the
+                    // higher region expected when I was active."
+                    if (learn)
+                        ExecuteSettlingPass(learnApical: true);
                     break;
+                }
             }
         }
         else
@@ -3833,8 +4671,8 @@ public sealed class Network
         foreach (var region in _regions.Values) region.Reset();
     }
 
-    /// Execute one pass through all regions in topological order,
-    /// propagating data through ALL links (including feedback).
+    /// Execute one full pass through all regions in topological order,
+    /// propagating data through ALL links (feedforward and feedback).
     private void ExecutePass(bool learn)
     {
         foreach (string regionName in _executionOrder!)
@@ -3851,6 +4689,68 @@ public sealed class Network
 
             region.Compute(learn);
         }
+    }
+
+    /// Execute a settling pass: propagate ONLY feedback links, then recompute
+    /// feedback-target regions and all their downstream dependents.
+    /// Feedforward inputs are held fixed from the initial pass.
+    /// learnApical: when true, the final settling iteration enables learning
+    /// so apical synapses can learn the converged feedback signal.
+    private void ExecuteSettlingPass(bool learnApical = false)
+    {
+        // Step 1: Propagate feedback links only (update apical inputs)
+        foreach (var link in _links.Where(l => l.IsFeedback))
+        {
+            var sourceRegion = _regions[link.SourceRegion];
+            var value = sourceRegion.GetOutput(link.SourcePort);
+            _regions[link.TargetRegion].SetInput(link.TargetPort, value);
+        }
+
+        // Step 2: Recompute feedback-target regions and downstream dependents
+        // We recompute in topological order, but only regions affected by feedback.
+        var toRecompute = GetSettlingRecomputeSet();
+
+        foreach (string regionName in _executionOrder!)
+        {
+            if (!toRecompute.Contains(regionName)) continue;
+
+            var region = _regions[regionName];
+
+            // For non-feedback-target regions in the recompute set (downstream dependents),
+            // propagate their feedforward inputs from the regions that just recomputed
+            if (!_feedbackTargets!.Contains(regionName))
+            {
+                foreach (var link in _links.Where(l => l.TargetRegion == regionName && !l.IsFeedback))
+                {
+                    var sourceRegion = _regions[link.SourceRegion];
+                    var value = sourceRegion.GetOutput(link.SourcePort);
+                    region.SetInput(link.TargetPort, value);
+                }
+            }
+
+            region.Compute(learn: learnApical);
+        }
+    }
+
+    /// Compute the set of regions that need recomputation during settling:
+    /// feedback targets plus all their downstream dependents in topological order.
+    private HashSet<string> GetSettlingRecomputeSet()
+    {
+        var recompute = new HashSet<string>(_feedbackTargets!);
+
+        // BFS: add all downstream dependents via feedforward links
+        var queue = new Queue<string>(_feedbackTargets!);
+        while (queue.Count > 0)
+        {
+            string current = queue.Dequeue();
+            foreach (var link in _links.Where(l => l.SourceRegion == current && !l.IsFeedback))
+            {
+                if (recompute.Add(link.TargetRegion))
+                    queue.Enqueue(link.TargetRegion);
+            }
+        }
+
+        return recompute;
     }
 
     /// Snapshot the current output of every output port on feedback-target regions.
@@ -3977,14 +4877,30 @@ public sealed class Network
     /// boundaries (anomaly spikes). Level 2 receives this slowly-changing
     /// input and learns sequence-of-sequences patterns on a longer timescale.
     /// This is the core hierarchical processing loop from BAMI.
+    ///
+    /// When enableFeedback=true, L2_TM's predictive cells are fed back to L1_TM
+    /// via a FeedbackLink, providing true top-down hierarchical modulation.
+    /// The Network's settling loop propagates this:
+    ///   Pass 1 (feedforward): L1→L2 computes bottom-up
+    ///   Pass 2+ (settling): L2 predictions → L1 apical → L1 recomputes → L2 refines
+    /// Apical learning occurs on the final settling iteration after convergence.
+    ///
+    /// enableFeedback: when true, L2_TM's predictive cells feed back to L1_TM's apical
+    /// dendrites, enabling top-down modulation. The Network's settling loop propagates
+    /// this feedback iteratively until convergence (L2 predictions stabilize L1's
+    /// representations). Default false for backward compatibility.
     public static Network CreateHierarchicalPipeline(
         int inputSize,
         int l1ColumnCount = 2048, int l1CellsPerColumn = 32,
         int l2ColumnCount = 1024, int l2CellsPerColumn = 16,
-        TemporalPoolerConfig? tpConfig = null)
+        TemporalPoolerConfig? tpConfig = null,
+        bool enableFeedback = false)
     {
         tpConfig ??= new TemporalPoolerConfig();
         var network = new Network();
+
+        // L2 total cell count — needed for L1's apical input size when feedback is enabled
+        int l2TotalCells = l2ColumnCount * l2CellsPerColumn;
 
         // Level 1: SP → TM
         network.AddRegion(new SPRegion("L1_SP", new SpatialPoolerConfig
@@ -3996,6 +4912,8 @@ public sealed class Network
         {
             ColumnCount = l1ColumnCount,
             CellsPerColumn = l1CellsPerColumn,
+            // Enable apical dendrites when feedback is on — sized to receive L2_TM cell indices
+            ApicalInputSize = enableFeedback ? l2TotalCells : 0,
         }));
         network.Link("L1_SP", "bottomUpOut", "L1_TM", "bottomUpIn");
 
@@ -4017,6 +4935,16 @@ public sealed class Network
         }));
         network.Link("L1_TP", "bottomUpOut", "L2_SP", "bottomUpIn");
         network.Link("L2_SP", "bottomUpOut", "L2_TM", "bottomUpIn");
+
+        // Feedback: L2_TM predictive cells → L1_TM apical dendrites.
+        // This sends L2's top-down predictions back to L1, enabling:
+        //   - Faster L1 disambiguation (fewer sequence steps needed)
+        //   - Attention-like modulation (L2 expectations bias L1 cell selection)
+        //   - The settling loop naturally converges: L2 predicts → L1 sharpens → L2 refines
+        if (enableFeedback)
+        {
+            network.FeedbackLink("L2_TM", "predictiveCells", "L1_TM", "apicalIn");
+        }
 
         return network;
     }
@@ -4557,6 +5485,9 @@ public sealed class StreamPipeline
     private readonly AnomalyLikelihood _anomalyLikelihood;
     private long _recordsProcessed;
 
+    /// When true, SP learning is frozen — only TM learns during Process.
+    public bool FreezeSPLearning { get; set; }
+
     public long RecordsProcessed => _recordsProcessed;
 
     public StreamPipeline(StreamConfig config)
@@ -4579,7 +5510,7 @@ public sealed class StreamPipeline
         Interlocked.Increment(ref _recordsProcessed);
 
         SDR encoded = _encoder.Encode(data);
-        SDR activeColumns = _sp.Compute(encoded);
+        SDR activeColumns = _sp.Compute(encoded, learn: !FreezeSPLearning);
         var tmOutput = _tm.Compute(activeColumns);
 
         float anomalyLikelihood = _anomalyLikelihood.Compute(tmOutput.Anomaly);
@@ -4602,6 +5533,19 @@ public sealed class StreamPipeline
             ActiveCellCount = tmOutput.ActiveCells.Count,
             PredictiveCellCount = tmOutput.PredictiveCells.Count,
         };
+    }
+
+    /// Train SP only (no TM) on the given data. Call before the main Process
+    /// loop to stabilize column assignments. Sets FreezeSPLearning = true.
+    public void PreTrainSP(IEnumerable<Dictionary<string, object>> data, int cycles = 50)
+    {
+        for (int c = 0; c < cycles; c++)
+            foreach (var record in data)
+            {
+                SDR encoded = _encoder.Encode(record);
+                _sp.Compute(encoded, learn: true);
+            }
+        FreezeSPLearning = true;
     }
 }
 
@@ -4660,6 +5604,13 @@ public sealed class MultiStreamProcessor : IAsyncDisposable
         var pipeline = new StreamPipeline(config);
         if (!_pipelines.TryAdd(config.StreamId, pipeline))
             throw new InvalidOperationException($"Stream '{config.StreamId}' already exists");
+    }
+
+    /// Register a pre-trained pipeline directly (preserves learned SP/TM state)
+    public void AddStream(StreamPipeline pipeline)
+    {
+        if (!_pipelines.TryAdd(pipeline.StreamId, pipeline))
+            throw new InvalidOperationException($"Stream '{pipeline.StreamId}' already exists");
     }
 
     /// Deterministic worker assignment: same StreamId always routes to same worker,
@@ -5064,50 +6015,45 @@ public static class HtmExamples
             {
                 StreamId = $"sensor_{s}",
                 Encoder = encoder,
-                SPConfig = new SpatialPoolerConfig { ColumnCount = 1024 },
-                TMConfig = new TemporalMemoryConfig { ColumnCount = 1024, CellsPerColumn = 16 },
+                SPConfig = new SpatialPoolerConfig { ColumnCount = 2048 },
+                TMConfig = new TemporalMemoryConfig { ColumnCount = 2048, CellsPerColumn = 32 },
             };
         }
 
-        // Phase 1: SP pre-training on each pipeline directly.
-        // This stabilizes column assignments before the async processor runs.
+        // Phase 1: SP-only pre-training on each pipeline.
+        // Train SP columns without TM to avoid TM learning garbage from unstable SP.
+        // After pre-training, SP is frozen — only TM learns in Phase 2.
         Console.Write("\n  Phase 1: SP pre-training (50 cycles)...");
         var pipelines = new StreamPipeline[streamCount];
         for (int s = 0; s < streamCount; s++)
         {
             pipelines[s] = new StreamPipeline(configs[s]);
             var preRng = new Random(42 + s);
-            for (int c = 0; c < 50; c++)
+            var preTrainData = new List<Dictionary<string, object>>();
+            for (int step = 0; step < cycleLength; step++)
             {
-                for (int step = 0; step < cycleLength; step++)
+                double value = 50 + 20 * Math.Sin(2 * Math.PI * step / cycleLength + s * 0.5)
+                              + preRng.NextDouble() * 3;
+                preTrainData.Add(new Dictionary<string, object>
                 {
-                    double value = 50 + 20 * Math.Sin(2 * Math.PI * step / cycleLength + s * 0.5);
-                    value += preRng.NextDouble() * 3;
-                    var data = new Dictionary<string, object>
-                    {
-                        ["value"] = value,
-                        ["phase"] = (double)step,
-                    };
-                    // Process to train SP (and TM gets some exposure too)
-                    pipelines[s].Process(data, DateTime.MinValue.AddHours(step));
-                }
+                    ["value"] = value,
+                    ["phase"] = (double)step,
+                });
             }
+            pipelines[s].PreTrainSP(preTrainData, cycles: 50);
         }
         Console.WriteLine(" done");
 
         // Phase 2: Run via the async MultiStreamProcessor.
-        // The processor creates its own pipelines internally, so we
-        // need to register streams and submit data through the processor.
-        // The pre-training above stabilized our understanding of the
-        // patterns; now we test the async infrastructure itself.
+        // Pass the pre-trained pipelines directly so learned SP/TM state is preserved.
         Console.WriteLine("  Phase 2: Async multi-stream processing\n");
 
         await using var processor = new MultiStreamProcessor(workerCount: 2);
         for (int s = 0; s < streamCount; s++)
-            processor.AddStream(configs[s]);
+            processor.AddStream(pipelines[s]);
 
         var baseTime = new DateTime(2024, 1, 1);
-        int totalSteps = 1000;  // 50 cycles per stream
+        int totalSteps = 2000;  // 100 cycles per stream
         int expectedResults = totalSteps * streamCount;
 
         // Track per-stream anomaly for reporting
@@ -5336,7 +6282,7 @@ public static class HtmExamples
             OutputSize = 1024,
             OutputActiveBits = 40,
             AnomalyResetThreshold = 0.5f,
-            DecayRate = 0.01f,
+            DecayRate = 0.3f,  // Higher decay so TP tracks current subsequence, not entire history
         };
         var network = Network.CreateHierarchicalPipeline(
             inputSize: 400,
@@ -5345,21 +6291,45 @@ public static class HtmExamples
             tpConfig: tpConfig);
 
         // --- Phase 1: SP pre-training on all unique values ---
+        // Train ONLY L1_SP directly — do not run TM/TP/L2 during pre-training,
+        // as TM would learn garbage sequences from the random value ordering.
+        // After pre-training, freeze L1_SP so column assignments stay stable
+        // while TM learns sequences in Phase 2.
         var allValues = subsequences.SelectMany(s => s).Distinct().ToArray();
+        var l1sp = (SPRegion)network.Regions["L1_SP"];
         Console.Write("SP pre-training (50 cycles)...");
         for (int c = 0; c < 50; c++)
         {
             foreach (double v in allValues)
             {
-                network.SetInput("L1_SP", "bottomUpIn", encoder.Encode(v));
-                network.Compute(learn: true);
+                l1sp.SetInput("bottomUpIn", encoder.Encode(v));
+                l1sp.Compute(learn: true);
             }
-            network.Reset();
         }
+        l1sp.FreezeLearning = true;
         Console.WriteLine(" done");
         network.Reset();
 
-        // --- Phase 2: Sequence learning ---
+        // --- Phase 2: L2_SP warm-up on TP output (500 steps) ---
+        // Run the full network so L1_TM converges and TP stabilizes,
+        // giving L2_SP representative input to learn column assignments.
+        var l2sp = (SPRegion)network.Regions["L2_SP"];
+        Console.Write("L2 SP warm-up (500 steps)...");
+        {
+            int warmupStep = 0;
+            for (int cycle = 0; warmupStep < 500; cycle++)
+                for (int s = 0; s < subsequences.Length && warmupStep < 500; s++)
+                    for (int e = 0; e < elementsPerSeq && warmupStep < 500; e++, warmupStep++)
+                    {
+                        network.SetInput("L1_SP", "bottomUpIn", encoder.Encode(subsequences[s][e]));
+                        network.Compute(learn: true);
+                    }
+        }
+        l2sp.FreezeLearning = true;
+        network.Reset();
+        Console.WriteLine(" done");
+
+        // --- Phase 3: Sequence learning (TM-only, both SPs frozen) ---
         int totalSteps = 2000;
         int step = 0;
 
@@ -5399,7 +6369,7 @@ public static class HtmExamples
         }
 
         Console.WriteLine($"\nCompleted {totalSteps} steps ({totalSteps / (elementsPerSeq * subsequences.Length)} full cycles).");
-        Console.WriteLine("Expected: L1 anomaly near 0% after ~2 cycles; L2 anomaly drops over ~10+ cycles.");
+        Console.WriteLine("Expected: L1 anomaly near 0% by step ~100; L2 anomaly drops over ~10+ cycles.");
     }
 
     /// Example 5: Multi-sensor machine monitoring with fault injection
