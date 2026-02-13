@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading.Tasks;
 using HierarchicalTemporalMemory.Enhanced;
 
@@ -24,7 +25,6 @@ Console.WriteLine();
 
 Console.WriteLine("=== All examples completed ===");
 
-// Smaller version of single-stream to run faster
 static void RunSingleStreamSmall()
 {
     var encoder = new CompositeEncoder()

@@ -1120,6 +1120,12 @@ public sealed class SpatialPooler
     // Maps each column to its inhibition neighborhood
     private readonly int[][] _inhibitionNeighborhoods;
 
+    // Fixed random permutation for deterministic tie-breaking during inhibition.
+    // Without this, columns with identical overlap scores are resolved by _rng.Next()
+    // which produces different winners on each call — even for the same input — preventing
+    // the TM from learning stable sequences.
+    private readonly int[] _tieBreakers;
+
     private readonly Random _rng;
     private int _iteration;
 
@@ -1137,6 +1143,14 @@ public sealed class SpatialPooler
         _minLocalActivity = new float[config.ColumnCount];
 
         Array.Fill(_boostFactors, 1.0f);
+
+        // Build a fixed random permutation so tie-breaking is deterministic across calls.
+        _tieBreakers = Enumerable.Range(0, config.ColumnCount).ToArray();
+        for (int i = _tieBreakers.Length - 1; i > 0; i--)
+        {
+            int j = _rng.Next(i + 1);
+            (_tieBreakers[i], _tieBreakers[j]) = (_tieBreakers[j], _tieBreakers[i]);
+        }
 
         _inhibitionNeighborhoods = BuildInhibitionNeighborhoods();
         InitializeProximalConnections();
@@ -1271,7 +1285,7 @@ public sealed class SpatialPooler
             var winners = Enumerable.Range(0, _config.ColumnCount)
                 .Where(c => overlaps[c] > 0)
                 .OrderByDescending(c => overlaps[c])
-                .ThenBy(_ => _rng.Next()) // Tie-breaking
+                .ThenBy(c => _tieBreakers[c])
                 .Take(numActive);
             active.UnionWith(winners);
         }
