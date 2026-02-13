@@ -442,7 +442,7 @@ public sealed class ScalarEncoder : IEncoder<double>
         for (int i = 0; i < ActiveBits; i++)
             active[i] = (startBit + i) % OutputSize; // Wrap for periodic
 
-        return new SDR(OutputSize, active);
+        return new SDR(OutputSize, (ReadOnlySpan<int>)active);
     }
 }
 
@@ -473,7 +473,7 @@ public sealed class RandomDistributedScalarEncoder : IEncoder<double>
     public SDR Encode(double value)
     {
         int bucket = (int)Math.Floor(value / Resolution);
-        return new SDR(OutputSize, GetOrCreateBucket(bucket));
+        return new SDR(OutputSize, (ReadOnlySpan<int>)GetOrCreateBucket(bucket));
     }
 
     private int[] GetOrCreateBucket(int bucket)
@@ -636,7 +636,7 @@ public sealed class CategoryEncoder : IEncoder<string>
     {
         if (!_categoryBits.ContainsKey(value))
             AddCategory(value);
-        return new SDR(OutputSize, _categoryBits[value]);
+        return new SDR(OutputSize, (ReadOnlySpan<int>)_categoryBits[value]);
     }
 
     /// Encode with explicit similarity: `similar` categories share additional bits.
@@ -664,7 +664,7 @@ public sealed class CategoryEncoder : IEncoder<string>
         }
 
         var result = valueBits.OrderBy(x => x).ToArray();
-        return new SDR(OutputSize, result);
+        return new SDR(OutputSize, (ReadOnlySpan<int>)result);
     }
 }
 
@@ -1082,7 +1082,7 @@ public record struct SegmentMaintenanceResult(int PrunedSynapses, int RemovedSeg
 public enum InhibitionMode { Global, Local }
 public enum BoostingStrategy { Exponential, Linear, None }
 
-public sealed class SpatialPoolerConfig
+public sealed record SpatialPoolerConfig
 {
     public int InputSize { get; init; } = 400;
     public int ColumnCount { get; init; } = 2048;
@@ -1674,9 +1674,6 @@ public sealed class TemporalMemory
         return predictive;
     }
 
-    private HashSet<int> GetPredictedColumns()
-        => _predictiveCells.Select(CellColumn).ToHashSet();
-
     /// Select the best cell in a bursting column for learning.
     /// Priority: cell with best-matching segment → cell with fewest segments (least used)
     private int SelectBestMatchingCell(int column)
@@ -2167,7 +2164,15 @@ public sealed class AnomalyLikelihood
     /// <param name="reestimationInterval">
     /// How often (in iterations) to reinitialize running statistics from the
     /// score history window, preventing Welford drift over very long streams.
-    /// Default: 10 * windowSize. Set to 0 to disable re-estimation.
+    /// Default: 1 * windowSize. Set to 0 to disable re-estimation (not recommended).
+    ///
+    /// DRIFT NOTE: The modified Welford below caps its denominator at windowSize so
+    /// the mean adapts at a windowed rate, but _m2 accumulates every new delta
+    /// without subtracting departing samples. This causes variance to inflate linearly
+    /// between re-estimations. ReestimateFromHistory() resets from the actual window,
+    /// bounding the drift to at most reestimationInterval steps of accumulation.
+    /// A 1x windowSize interval keeps drift tight (one window's worth of extra
+    /// accumulation) at the cost of an O(windowSize) recomputation per window.
     /// </param>
     public AnomalyLikelihood(
         int windowSize = 1000, int learningPeriod = 300,
@@ -2176,7 +2181,7 @@ public sealed class AnomalyLikelihood
         _windowSize = windowSize;
         _learningPeriod = learningPeriod;
         _smoothingAlpha = smoothingAlpha;
-        _reestimationInterval = reestimationInterval > 0 ? reestimationInterval : windowSize * 10;
+        _reestimationInterval = reestimationInterval > 0 ? reestimationInterval : windowSize;
         _scoreHistory = new Queue<float>(windowSize + 1);
     }
 
@@ -2192,10 +2197,17 @@ public sealed class AnomalyLikelihood
         _scoreHistory.Enqueue(rawAnomalyScore);
         if (_scoreHistory.Count > _windowSize)
         {
-            float removed = _scoreHistory.Dequeue();
+            // NOTE: The dequeued value is intentionally not subtracted from _mean/_m2.
+            // Proper sliding-window Welford subtraction is numerically unstable for
+            // floating-point streams. Instead, we let _m2 drift and periodically
+            // recompute exact statistics from the window via ReestimateFromHistory().
+            // See reestimationInterval parameter and DRIFT NOTE in the constructor.
+            _scoreHistory.Dequeue();
         }
 
-        // Update running statistics (Welford)
+        // Update running statistics (modified Welford with capped denominator).
+        // The denominator cap at _windowSize makes the mean adapt at a windowed
+        // rate, but _m2 accumulates without subtraction — see DRIFT NOTE above.
         double delta = rawAnomalyScore - _mean;
         _mean += delta / Math.Min(_iteration, _windowSize);
         double delta2 = rawAnomalyScore - _mean;
@@ -4023,7 +4035,7 @@ public static class HtmSerializer
         for (int i = 0; i < activeCount; i++)
             bits[i] = br.ReadInt32();
 
-        return new SDR(size, bits);
+        return new SDR(size, (ReadOnlySpan<int>)bits);
     }
 
     /// Serialize a segment's synapses
@@ -4557,11 +4569,24 @@ public sealed class StreamPipeline
     }
 }
 
-/// Multi-stream processor: manages concurrent HTM pipelines with backpressure
+/// Multi-stream processor: manages concurrent HTM pipelines with backpressure.
+///
+/// DESIGN: Uses channel-per-worker partitioning, mirroring cortical architecture.
+/// Each cortical column processes its own sensory stream sequentially — the brain's
+/// parallelism is *across* columns, not *within* one. Likewise, each worker owns a
+/// dedicated input channel, and streams are routed to workers by hash affinity.
+/// This guarantees a given StreamId is always processed by the same worker,
+/// preserving the sequential ordering that HTM's temporal state machine requires
+/// (TM prev/current cell state, anomaly likelihood running statistics, etc.)
+/// without any locks.
+///
+/// DO NOT replace this with a shared-channel multi-reader design. HTM components
+/// (SpatialPooler, TemporalMemory, AnomalyLikelihood) are not thread-safe — concurrent
+/// calls to StreamPipeline.Process() for the same StreamId will silently corrupt state.
 public sealed class MultiStreamProcessor : IAsyncDisposable
 {
     private readonly ConcurrentDictionary<string, StreamPipeline> _pipelines = new();
-    private readonly Channel<StreamDataPoint> _inputChannel;
+    private readonly Channel<StreamDataPoint>[] _workerChannels;
     private readonly Channel<StreamResult> _outputChannel;
     private readonly CancellationTokenSource _cts = new();
     private readonly Task[] _workerTasks;
@@ -4570,19 +4595,26 @@ public sealed class MultiStreamProcessor : IAsyncDisposable
     public MultiStreamProcessor(int workerCount = 4, int inputBufferSize = 10_000)
     {
         _workerCount = workerCount;
+        int perWorkerBuffer = Math.Max(1, inputBufferSize / workerCount);
 
-        _inputChannel = Channel.CreateBounded<StreamDataPoint>(
-            new BoundedChannelOptions(inputBufferSize)
-            {
-                FullMode = BoundedChannelFullMode.Wait,
-                SingleReader = false,
-                SingleWriter = false,
-            });
+        // One input channel per worker — stream affinity routing ensures each
+        // StreamPipeline is only ever touched by a single worker thread.
+        _workerChannels = new Channel<StreamDataPoint>[workerCount];
+        for (int i = 0; i < workerCount; i++)
+        {
+            _workerChannels[i] = Channel.CreateBounded<StreamDataPoint>(
+                new BoundedChannelOptions(perWorkerBuffer)
+                {
+                    FullMode = BoundedChannelFullMode.Wait,
+                    SingleReader = true,   // Exactly one worker reads from each channel
+                    SingleWriter = false,
+                });
+        }
 
         _outputChannel = Channel.CreateUnbounded<StreamResult>();
 
         _workerTasks = Enumerable.Range(0, workerCount)
-            .Select(_ => Task.Run(() => WorkerLoop(_cts.Token)))
+            .Select(id => Task.Run(() => WorkerLoop(id, _cts.Token)))
             .ToArray();
     }
 
@@ -4594,14 +4626,26 @@ public sealed class MultiStreamProcessor : IAsyncDisposable
             throw new InvalidOperationException($"Stream '{config.StreamId}' already exists");
     }
 
+    /// Deterministic worker assignment: same StreamId always routes to same worker,
+    /// guaranteeing sequential processing without locks.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private int GetWorkerForStream(string streamId)
+        => (streamId.GetHashCode() & 0x7FFFFFFF) % _workerCount;
+
     /// Submit a data point for processing (async, backpressure-aware)
     public ValueTask SubmitAsync(StreamDataPoint dataPoint,
         CancellationToken ct = default)
-        => _inputChannel.Writer.WriteAsync(dataPoint, ct);
+    {
+        int worker = GetWorkerForStream(dataPoint.StreamId);
+        return _workerChannels[worker].Writer.WriteAsync(dataPoint, ct);
+    }
 
-    /// Submit synchronously (blocks if buffer is full)
-    public void Submit(StreamDataPoint dataPoint)
-        => _inputChannel.Writer.TryWrite(dataPoint);
+    /// Submit synchronously. Returns false if the worker's buffer is full.
+    public bool Submit(StreamDataPoint dataPoint)
+    {
+        int worker = GetWorkerForStream(dataPoint.StreamId);
+        return _workerChannels[worker].Writer.TryWrite(dataPoint);
+    }
 
     /// Read results as an async stream
     public IAsyncEnumerable<StreamResult> ReadResultsAsync(
@@ -4620,10 +4664,10 @@ public sealed class MultiStreamProcessor : IAsyncDisposable
         return false;
     }
 
-    /// Worker loop: reads from input channel, routes to correct pipeline, writes results
-    private async Task WorkerLoop(CancellationToken ct)
+    /// Each worker reads exclusively from its own channel — no contention.
+    private async Task WorkerLoop(int workerId, CancellationToken ct)
     {
-        await foreach (var dataPoint in _inputChannel.Reader.ReadAllAsync(ct))
+        await foreach (var dataPoint in _workerChannels[workerId].Reader.ReadAllAsync(ct))
         {
             if (!_pipelines.TryGetValue(dataPoint.StreamId, out var pipeline))
                 continue; // Unknown stream, skip
@@ -4645,22 +4689,32 @@ public sealed class MultiStreamProcessor : IAsyncDisposable
     public MultiStreamStats GetStats()
     {
         var pipelines = _pipelines.Values.ToList();
+        int pending = 0;
+        foreach (var ch in _workerChannels)
+            pending += ch.Reader.CanCount ? ch.Reader.Count : 0;
+
         return new MultiStreamStats
         {
             StreamCount = pipelines.Count,
             TotalRecordsProcessed = pipelines.Sum(p => p.RecordsProcessed),
             WorkerCount = _workerCount,
-            InputBufferPending = _inputChannel.Reader.CanCount
-                ? _inputChannel.Reader.Count : -1,
+            InputBufferPending = pending,
         };
     }
 
     public async ValueTask DisposeAsync()
     {
-        _inputChannel.Writer.Complete();
-        _cts.Cancel();
+        // Signal all worker channels that no more input is coming, then let
+        // workers drain remaining items before cancelling.
+        foreach (var ch in _workerChannels)
+            ch.Writer.Complete();
 
-        try { await Task.WhenAll(_workerTasks); }
+        // Wait briefly for workers to drain, then cancel if still running.
+        var drainTask = Task.WhenAll(_workerTasks);
+        if (await Task.WhenAny(drainTask, Task.Delay(TimeSpan.FromSeconds(5))) != drainTask)
+            _cts.Cancel();
+
+        try { await drainTask; }
         catch (OperationCanceledException) { }
 
         _outputChannel.Writer.Complete();
@@ -5082,7 +5136,7 @@ public static class HtmExamples
         int elementsPerSeq = subsequences[0].Length;
 
         // --- Build encoder ---
-        var encoder = new ScalarEncoder(size: 400, activeBits: 21, minVal: 0, maxVal: 100);
+        var encoder = new ScalarEncoder(size: 400, activeBits: 21, minValue: 0, maxValue: 100);
 
         // --- Build two-level hierarchy ---
         //   L1_SP → L1_TM → L1_TP → L2_SP → L2_TM

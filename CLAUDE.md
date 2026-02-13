@@ -1,222 +1,197 @@
-# CLAUDE.md — HTM Enhanced Codebase
+# CLAUDE.md — CortexSharp
 
-## Project Overview
+## What This Project Is
 
-This is a **Hierarchical Temporal Memory (HTM)** implementation in C# based on Numenta's BAMI theory and the Thousand Brains Framework. It is a single-file reference architecture (`HtmEnhanced.cs`, ~5000 lines, 18 sections) intended as high-level pseudocode that prioritizes algorithmic clarity while using real C# idioms, types, and patterns.
+CortexSharp is a C# implementation of Hierarchical Temporal Memory (HTM) and the Thousand Brains Theory of intelligence. It models how the neocortex learns, predicts, and recognizes the world.
 
-**Namespace:** `HierarchicalTemporalMemory.Enhanced`
-**Target:** .NET 8+ (C# 12). Uses `System.Numerics`, `System.Runtime.Intrinsics`, `System.Threading.Channels`.
+This is not a neural network. It is a computational model of biological cortical circuits.
 
-This is **not** a library you `dotnet build` out of the box — it is a design document expressed as compilable-shaped code. Treat it as the authoritative architectural blueprint.
+## Installing .NET
 
-## Core HTM Pipeline
+This project targets **.NET 8** (C# 12). You need the .NET 8 SDK installed.
+
+### Ubuntu 24.04
+
+```bash
+# Install the .NET 8 SDK
+sudo apt-get update
+sudo apt-get install -y dotnet-sdk-8.0
+
+# Verify installation
+dotnet --version
+```
+
+If the package isn't available in your distribution's default feed:
+
+```bash
+# Add Microsoft's package repository
+wget https://packages.microsoft.com/config/ubuntu/24.04/packages-microsoft-prod.deb -O packages-microsoft-prod.deb
+sudo dpkg -i packages-microsoft-prod.deb
+rm packages-microsoft-prod.deb
+
+sudo apt-get update
+sudo apt-get install -y dotnet-sdk-8.0
+```
+
+### Building
+
+```bash
+dotnet build
+dotnet run    # if an executable entry point is added
+```
+
+## The Neocortex
+
+The neocortex is the wrinkled outer layer of the mammalian brain. It is responsible for perception, language, planning, and motor control. Despite handling wildly different modalities, it has a remarkably uniform structure everywhere — the same circuit repeated roughly 150,000 times across the cortical sheet.
+
+### Structure
+
+The neocortex is organized into six layers (L1–L6), stacked vertically:
+
+- **L1** — Mostly axons and dendrites, very few cell bodies. Carries top-down feedback from higher regions. Apical dendrites of pyramidal neurons from deeper layers reach up here.
+- **L2/3** — Pyramidal neurons that send output laterally to other cortical columns and to higher cortical regions. This is where object representations form in the Thousand Brains model.
+- **L4** — Primary input layer. Receives feedforward sensory input from the thalamus. The Spatial Pooler models this layer's function.
+- **L5** — Output to subcortical structures (motor commands, basal ganglia). Large pyramidal neurons.
+- **L6** — Feedback to the thalamus. Modulates incoming sensory signals.
+
+These layers are grouped into vertical **columns**:
+
+- **Minicolumns** (~80–120 neurons, ~50 micrometers wide) — the smallest functional unit. Neurons in a minicolumn share feedforward input and tend to fire together.
+- **Macrocolumns** (~300–600 micrometers, containing 50–100 minicolumns) — correspond roughly to a "cortical column" in HTM. Each macrocolumn processes one sensory patch.
+
+### Sparsity
+
+At any moment, roughly **2%** of neurons in a cortical region are active. This extreme sparsity is not a limitation — it is the mechanism. Sparse activity means that two random patterns almost never collide, giving the cortex an enormous representational capacity with very low error rates.
+
+With 2048 minicolumns and 40 active at a time (2% sparsity), there are approximately 10^84 possible activation patterns — more than the number of atoms in the observable universe.
+
+### The Pyramidal Neuron
+
+The primary computational unit is the **pyramidal neuron**, which has three functionally distinct dendritic zones:
+
+- **Proximal dendrites** — Close to the cell body. Receive feedforward input (what is happening right now). A strong enough proximal input causes the neuron to fire. This is what the Spatial Pooler models.
+
+- **Distal (basal) dendrites** — Further from the cell body. Receive lateral input from nearby cells. A distal input does not cause firing on its own — it **depolarizes** the cell, putting it in a predictive state. If a depolarized cell then receives proximal input, it fires slightly before its neighbors. This is prediction. This is what Temporal Memory models.
+
+- **Apical dendrites** — Extend up to L1. Receive top-down feedback from higher regions. Provide contextual modulation — "attention" in biological terms.
+
+### How Synapses Learn
+
+Synapses strengthen when presynaptic and postsynaptic neurons are active together (Hebbian learning: "neurons that fire together wire together"). They weaken when activity is uncorrelated.
+
+HTM models this with a **permanence** value per synapse — a scalar between 0.0 and 1.0. The synapse is functionally connected only when permanence exceeds a threshold (typically 0.5). Learning increments permanence on correlated synapses and decrements it on uncorrelated ones. This is a direct abstraction of long-term potentiation (LTP) and long-term depression (LTD).
+
+### Prediction at the Cellular Level
+
+When a distal dendrite receives enough active synaptic input (exceeding a threshold, typically ~13 synapses out of ~20–40 on a segment), it generates a dendritic NMDA spike. This spike doesn't cause the cell to fire, but it **depolarizes** the cell — raising its membrane potential closer to the firing threshold.
+
+A depolarized cell is a **predicting cell**. When the next feedforward input arrives, predicting cells fire faster than non-predicting cells in the same minicolumn. The minicolumn recognizes a predicted input by activating only the predicting cell(s) rather than all cells (bursting).
+
+This is how the cortex predicts: specific cells within a column represent specific temporal contexts. The same sensory feature activates different cells depending on what came before.
+
+## HTM Theory
+
+### Sparse Distributed Representations (SDRs)
+
+An SDR is a binary vector — mostly zeros with a small number of ones — that represents information the way the cortex does. The critical properties:
+
+**High dimensionality + extreme sparsity = reliable computation.** With n=2048 bits and w=40 active, two random SDRs share zero bits with overwhelming probability. The chance of a false match (random overlap exceeding a threshold of 20 bits) is approximately 10^-43. This is not approximate — it is a mathematical property of high-dimensional sparse spaces.
+
+**Similarity = overlap.** Two SDRs representing similar things share many active bits. Two SDRs representing different things share few or no bits. The overlap count is the primary similarity metric. No learned distance function is needed — similarity is structural.
+
+**Union property.** The OR of multiple SDRs produces a new SDR that can be matched against any of its constituents. This lets a single dendritic segment recognize multiple patterns by storing synapses from all of them — which is exactly what biological dendrites do.
+
+**Noise robustness.** An SDR can tolerate significant bit flips and still be recognized, because the match threshold (theta) can be set well below the total active count (w). With w=40 and theta=20, you can corrupt half the bits and still match correctly.
+
+**Subsampling.** You don't need all w bits to recognize a pattern. A random subset of 15–25 bits is sufficient for astronomically low false positive rates. This is why biological synapses are unreliable and it doesn't matter.
+
+### The Core Pipeline
 
 ```
-Raw Data → Encoder → Spatial Pooler → Temporal Memory → Temporal Pooler → Predictor
-                                           ↓                   ↓
-                                    Anomaly Likelihood    Stable SDR
-                                                      (sequence-level)
+Raw data --> Encoder --> Spatial Pooler --> Temporal Memory --> Prediction / Anomaly
 ```
 
-Every change you make must preserve this pipeline's data flow contract:
-- Encoders produce `SDR` (sparse binary vectors)
-- Spatial Pooler consumes `SDR`, produces `SDR` (fixed sparsity)
-- Temporal Memory consumes `SDR` (columns), produces `TemporalMemoryOutput` (cells + anomaly)
-- Temporal Pooler consumes `TemporalMemoryOutput`, produces `TemporalPoolerOutput` (stable pooled SDR for hierarchy)
-- Predictor consumes `HashSet<int>` (active cells from TM), produces `Dictionary<int, SdrPrediction>`
+**Encoders** convert raw data (numbers, dates, categories, GPS coordinates) into SDRs. The fundamental contract: semantically similar inputs must produce SDRs with high bit overlap.
 
-## File Structure & Section Map
+**Spatial Pooler** (models L4) takes an input SDR and produces a fixed-sparsity output SDR representing which minicolumns are active. It learns stable representations through competitive Hebbian learning:
+1. Each column computes overlap with its proximal synapses against the input
+2. Columns compete via inhibition — only the most active survive (top ~2%)
+3. Winning columns strengthen synapses to active input bits, weaken synapses to inactive bits
+4. Boosting ensures all columns participate over time (no dead columns)
 
-| Section | Lines | Key Types | Purpose |
-|---------|-------|-----------|---------|
-| §1 | 45–376 | `SDR` | SIMD bitvector ops, noise, subsampling, projection |
-| §2 | 377–839 | `ScalarEncoder`, `RDSE`, `DateTimeEncoder`, `CategoryEncoder`, `GeospatialEncoder`, `DeltaEncoder`, `CompositeEncoder` | Raw data → SDR conversion |
-| §3 | 840–1068 | `Synapse`, `DendriteSegment`, `CellSegmentManager` | Synaptic infrastructure + lifecycle |
-| §4 | 1069–1442 | `SpatialPooler`, `SpatialPoolerConfig`, `SpatialPoolerMetrics` | Competitive learning with local/global inhibition |
-| §5 | 1443–2021 | `TemporalMemory`, `TemporalMemoryConfig`, `TemporalMemoryOutput`, `TemporalMemoryMetrics` | Sequence memory + prediction |
-| §5b | 2022–2138 | `TemporalPooler`, `TemporalPoolerConfig`, `TemporalPoolerOutput` | Stable sequence-level pooling for hierarchy |
-| §6 | 2139–2277 | `AnomalyLikelihood` | Statistical anomaly scoring (Welford + Gaussian tail) |
-| §7 | 2278–2380 | `SdrPredictor`, `SdrPrediction` | Multi-step value prediction from cell activity |
-| §8 | 2381–2527 | `GridCellModule`, `GridCellModuleConfig` | Allocentric location via toroidal grid |
-| §9 | 2528–2657 | `DisplacementCellModule` | Relative offset encoding between locations |
-| §10 | 2658–2892 | `CorticalColumn`, `CorticalColumnConfig`, `CorticalColumnOutput` | Feature-at-location processing unit |
-| §11 | 2893–3008 | `LateralVotingMechanism`, `LateralVotingConfig` | Multi-column consensus |
-| §12 | 3009–3213 | `ThousandBrainsEngine`, `ThousandBrainsConfig`, `ThousandBrainsOutput` | Full object learning/recognition |
-| §13 | 3214–3926 | `IRegion`, `SPRegion`, `TMRegion`, `EncoderRegion`, `PredictorRegion`, `TemporalPoolerRegion`, `Network`, `RegionLink` | Declarative computation graph |
-| §14 | 3927–4285 | `HtmSerializer` | Binary serialization with magic number + versioning |
-| §15 | 4286–4408 | `HtmDiagnostics`, `SdrQualityReport`, `SystemHealthReport` | Monitoring + SDR quality analysis |
-| §16 | 4409–4632 | `MultiStreamProcessor`, `StreamPipeline`, `StreamConfig` | Concurrent multi-stream via Channels |
-| §17 | 4633–4786 | `HtmEngine`, `HtmEngineConfig`, `HtmResult` | Single-stream convenience orchestrator |
-| §18 | 4787–5080 | `HtmExamples` | Five runnable demo patterns |
+**Temporal Memory** (models L2/3/4 interactions) learns sequences by forming predictions on distal dendrites:
+1. Active columns are determined by the Spatial Pooler
+2. Within each active column, if any cell was predicted (depolarized), only that cell fires — the column was **predicted**
+3. If no cell was predicted, all cells fire — the column **bursts** (unexpected input)
+4. Active cells grow distal synapses to previously active cells, forming sequence memories
+5. After learning, cells predict which column will be active next by recognizing the current context on their distal segments
 
-## Critical Invariants — Do Not Break
+**Anomaly** is simply the fraction of active columns that were not predicted. A fully predicted input has anomaly 0.0. A completely novel input has anomaly 1.0. No separate anomaly detector is needed — it falls out of the prediction mechanism.
 
-### SDR Invariants
-- `_activeBits` is **always sorted and deduplicated**. Every constructor and factory enforces this. If you add a mutation path, you must maintain sort order or invalidate + rebuild.
-- `_denseCache` (bitvector) is lazily computed and never exposed mutably. If you add SDR mutation, set `_denseCache = null` to invalidate.
-- `Overlap()` auto-selects between sorted-merge (when both SDRs have < 64 active bits) and bitvector POPCNT. Do not remove either path.
-- SDR size (`_size`) is immutable after construction. Binary operations (`Union`, `Intersect`, etc.) assert matching sizes.
+### The Temporal Memory State Machine
 
-### Synapse/Segment Invariants
-- `CellSegmentManager` enforces `_maxSegmentsPerCell` via LRU eviction in `CreateSegment()`. Never bypass this by adding segments directly to the internal list. The `RestoreSegment()` method is **only** for deserialization — it does not enforce LRU.
-- `DendriteSegment.AdaptSynapses()` and `BumpAllPermanences()` use `CollectionsMarshal.AsSpan()` for zero-copy mutation. This is intentional — the synapses list is mutated in-place for performance.
-- Segment cleanup (`CellSegmentManager.Maintain()`) is called periodically by TM, not on every step. The interval is `TemporalMemoryConfig.SegmentCleanupInterval`.
+TM maintains a two-timestep window. The compute cycle:
 
-### Temporal Memory State Machine
-The TM maintains a two-timestep state window. The compute cycle is:
-1. Save current → previous (`_prevActiveCells`, `_prevWinnerCells`, `_prevPredictiveCells`)
-2. Build segment caches against **previous** active cells
-3. Activate cells (predicted path vs. bursting path)
-4. Compute anomaly score
-5. Learn (reinforce, grow, punish) — all learning uses **previous** timestep context
-6. Compute **next** predictions against **newly** active cells
+1. Save current state as previous (`prevActiveCells`, `prevWinnerCells`)
+2. Build segment activation caches against **previous** active cells
+3. Activate cells: predicted cells in active columns, or burst entire column
+4. Compute anomaly from prediction accuracy
+5. Learn: reinforce correct predictions, grow segments on bursting columns, punish wrong predictions
+6. Compute next predictions against **newly** active cells
 
-**The prev/current distinction is the single most common source of bugs.** When modifying TM learning, always ask: "am I using `_prevActiveCells` or `_activeCells`?" Learning always looks backward; prediction always looks forward.
+**Learning always looks backward (previous timestep). Prediction always looks forward (current timestep).** This distinction is the single most common source of implementation bugs.
 
-### Thousand Brains Contracts
-- `CorticalColumn.Compute()` must always call `_featureSP.Compute()` then `_sequenceTM.Compute()` in that order.
-- `CorticalColumn.ReceiveLateralInput()` modifies `_currentObjectRepresentation` in-place. The voting loop calls this iteratively.
-- `ThousandBrainsEngine.Process()` path: grid move → column compute → lateral voting loop → recognition match → displacement prediction.
-- Displacement cells compute displacements between consecutive grid locations during learning (stored per object in `_objectDisplacements`), and predict next location during recognition via `PredictTarget()`.
-- `StartNewObject()` must be called before learning a new object; it resets all columns' object representations **and** displacement state (`_prevGridLocations`, `_currentDisplacements`).
-- `LearnObject()` stores the current displacement sequence alongside the consensus SDR.
+## Thousand Brains Theory
 
-## Coding Conventions
+Classical neuroscience assumed the cortex builds representations hierarchically — simple features in early regions combine into complex features in later regions, converging to a single representation at the top. The Thousand Brains Theory (Hawkins et al., 2019) proposes something fundamentally different.
 
-### Style
-- **Records for immutable data/config**: `SpatialPoolerConfig`, `HtmResult`, `SdrPrediction`, etc.
-- **Sealed classes for stateful components**: `SpatialPooler`, `TemporalMemory`, `GridCellModule`, etc.
-- **`[MethodImpl(AggressiveInlining)]`** on hot-path accessors (`CellIndex`, `CellColumn`, `GetBit`, `ComputeActivity`).
-- **Config objects use `init` properties** with sensible defaults — consumers only override what they need.
-- Metrics classes use exponential moving averages (`alpha = 0.01f`) updated via `Record*()` methods.
+### Every Column Learns Complete Models
 
-### Naming
-- `_camelCase` for private fields, `PascalCase` for everything public.
-- Cell indices are **global** (`column * CellsPerColumn + cellInColumn`), not (column, cell) tuples.
-- `Compute()` is the universal method name for "process one timestep."
-- `*Config` suffix for configuration records, `*Output` for compute results, `*Metrics` for diagnostic state.
+Each cortical column doesn't just detect a feature — it learns a **complete model** of every object it encounters. A column processing a coffee cup's handle also knows about the cup's rim, body, and base. It builds this model by integrating features with locations over time as the sensor moves across the object.
 
-### Patterns in Use
-- **Dual representation** (SDR): sparse index array for iteration + dense bitvector for SIMD ops.
-- **Lazy caching** (SDR `_denseCache`, TM `_activeSegmentCache` / `_matchingSegmentCache`).
-- **LRU eviction** (`CellSegmentManager.CreateSegment`).
-- **Channel-based producer/consumer** (`MultiStreamProcessor`).
-- **Topological sort** for `Network` execution order.
-- **Circular/toroidal arithmetic** in `GridCellModule` and `DisplacementCellModule`.
+This means the cortex maintains thousands of simultaneous models of the same object (one per column), not a single hierarchical representation. Recognition is **consensus**: columns that agree on what object they're sensing converge to a shared representation through lateral connections.
 
-## How to Work With This Code
+### Grid Cells Provide Location
 
-### Adding a New Encoder
-1. Implement `IEncoder<T>` with `OutputSize` property and `Encode(T)` method.
-2. The returned SDR must have semantically similar inputs produce high-overlap SDRs. This is the fundamental encoder contract.
-3. Register via `CompositeEncoder.AddEncoder<T>(name, encoder)`.
-4. Add to the section 2 region of the file, keeping encoders grouped.
+The key missing piece in earlier HTM theory was **location**. How does a column know *where* on an object a feature is?
 
-### Adding a New NetworkAPI Region
-1. Implement `IRegion`: define `InputPorts`, `OutputPorts`, `SetInput`, `GetOutput`, `Compute`.
-2. Wrap your algorithm. The region is just a port adapter.
-3. Register with `network.AddRegion(...)` and wire with `network.Link(...)`.
-4. The network's topological sort will determine execution order automatically.
+Grid cells, discovered in the entorhinal cortex (Nobel Prize 2014, Moser & Moser), fire in regular hexagonal patterns as an animal moves through space. They perform **path integration** — tracking position by integrating velocity over time.
 
-### Modifying the Spatial Pooler
-- Overlap computation and inhibition are the hot paths. Profile before optimizing.
-- `BumpWeakColumns()` calls `DendriteSegment.BumpAllPermanences()` with `0.1 * ConnectedThreshold` per BAMI. The method uses `CollectionsMarshal.AsSpan()` for zero-copy mutation, consistent with `AdaptSynapses`.
-- Local inhibition creates variable total active counts (unlike global which is exactly `TargetSparsity * ColumnCount`). This is intentional and biologically motivated.
+The Thousand Brains Theory proposes that grid cell-like mechanisms exist throughout the neocortex, not just in navigation circuits. Each cortical column has its own grid cell modules that maintain an **object-centric reference frame** — a location within the object being sensed, not in the room.
 
-### Modifying the Temporal Memory
-- **Always run `BuildSegmentCaches()` before activation/learning.** The caches map cell index → matching segments for the current timestep.
-- The three learning phases must execute in order: (1) reinforce active segments, (2) grow on bursting columns, (3) punish incorrect predictions.
-- `SelectBestMatchingCell()` has a two-tier fallback: best matching segment → fewest segments. Do not change this priority without understanding why TM converges.
-- Segment cleanup is intentionally infrequent (default every 1000 steps). Making it per-step will tank throughput.
+When you move your finger from a cup's handle to its rim, grid cells update the location signal through path integration. The column then associates "handle features at location A" and "rim features at location B" as parts of the same object.
 
-### Extending Thousand Brains
-- Each `CorticalColumn` is independent except for lateral voting. Never share state between columns except through `ReceiveLateralInput()`.
-- `GridCellModule` orientation and scale must differ across modules for unique location codes. The default config spreads orientations evenly across π.
-- To add a new object modality, create a new encoder, wire it into the cortical column's input, and update `CombineFeatureAndLocation()`.
+### How Recognition Works
 
-## Key Algorithms — Quick Reference
+1. A column receives a sensory feature and a location from its grid cells
+2. It activates all object representations consistent with that feature-at-location
+3. It sends this set of candidates laterally to other columns
+4. Other columns doing the same thing vote on which object is consistent with *all* columns' observations
+5. Over several sensory samples (saccades, finger movements), the set of candidates narrows
+6. **Convergence**: all columns agree on a single object
 
-### Overlap Computation (SDR)
-Two paths selected automatically:
-- **Sparse** (< 64 active bits each): sorted merge, O(n+m)
-- **Dense**: bitvector AND + POPCNT, O(size/64), AVX2-accelerated when available
+This explains why recognition improves with more sensory contact — each touch/glance eliminates candidates until only one remains.
 
-### Spatial Pooler Inhibition
-- **Global**: sort all columns by boosted overlap, take top-k. O(n log n).
-- **Local**: for each column, count neighbors with higher overlap. Column wins if fewer than k neighbors beat it. O(n * radius).
+### Displacement Cells
 
-### Grid Cell Path Integration
-Position update: rotate movement vector by module orientation → scale by spatial period → add noise → wrap toroidally. SDR output: Gaussian bump on toroidal surface, top-k activation.
+Objects have structure — the handle is always in a consistent spatial relationship to the rim. **Displacement cells** encode these relative offsets between features. During learning, they record the grid cell displacement between consecutive sensory locations. During recognition, they predict where the next feature should be, further constraining the candidate set.
 
-### Lateral Voting
-Bit-count aggregation: each bit's vote count = number of columns with that bit active. Threshold = `VoteThreshold * numColumns`. Convergence = average pairwise `MatchScore` across all column pairs exceeds `ConvergenceThreshold`.
+### How This Differs From Deep Learning
 
-## Performance Considerations
+| Aspect | Deep Learning | Thousand Brains |
+|--------|--------------|-----------------|
+| Representation | Single hierarchy, one model | Thousands of parallel models |
+| Location | Not explicit (learned implicitly) | Explicit grid cell reference frames |
+| Learning | Backpropagation, many epochs | Local Hebbian learning, few exposures |
+| Recognition | Single forward pass | Iterative convergence through voting |
+| Rotation/viewpoint | Requires data augmentation | Handled by reference frame transforms |
+| Sparsity | Dense activations | ~2% activity (biologically plausible) |
 
-- **SDR.Overlap()** is the single hottest function in the system. The SIMD path processes 256 bits per loop iteration. Do not regress this.
-- **TM segment cache** (`BuildSegmentCaches`) runs O(total_segments) per timestep. For very large models (>1M segments), consider spatial partitioning.
-- **`CollectionsMarshal.AsSpan()`** on `List<Synapse>` avoids copying during learning. This couples to internal `List<T>` layout — acceptable for performance-critical pseudocode but document if changed.
-- **MultiStreamProcessor** uses bounded channels with `BoundedChannelFullMode.Wait` for backpressure. Worker count should be ≤ CPU cores for compute-bound HTM workloads.
+## References
 
-## Serialization Format
-
-Magic number: `0x48544D31` ("HTM1"), followed by version byte, type byte, then type-specific payload.
-- Type `0x01`: SDR (size, activeCount, int[] bits)
-- Type `0x02`: SpatialPooler (config + learned state via `SaveSpatialPooler`/`LoadSpatialPooler`)
-- Type `0x03`: TemporalMemory (config + learned state via `SaveTemporalMemory`/`LoadTemporalMemory`)
-- Type `0x10`: Network (region count, per-region name + type + serialized blob, link count, per-link 4 strings, FNV-1a checksum)
-- Type `0x20`: HtmEngine (iteration + SP config/state + TM config/state via `SaveHtmEngine`/`LoadHtmEngineComponents`)
-- Region blobs are self-describing: config properties followed by learned state. `SPRegion`/`TMRegion` provide static `CreateFromData(name, blob)` factories for reconstruction.
-- `LoadNetwork()` uses a `_regionFactory` dictionary (type name → factory). Custom region types must be registered via `HtmSerializer.RegisterRegionFactory()` before loading.
-- `SaveNetwork()` appends an FNV-1a checksum; `LoadNetwork()` verifies it before parsing.
-
-## Testing Guidelines
-
-When adding tests, validate these properties:
-
-### SDR Tests
-- Overlap(A, A) == A.ActiveCount (self-overlap)
-- Overlap(A, B) == Overlap(B, A) (symmetric)
-- AddNoise(0.0) returns identical SDR; AddNoise(1.0) returns zero overlap with original
-- Union(A, B).ActiveCount >= max(A.ActiveCount, B.ActiveCount)
-- Bitvector path and sorted-merge path produce identical overlap counts
-
-### Encoder Tests
-- Similar inputs → high overlap (e.g., ScalarEncoder(50) vs ScalarEncoder(51) should share most bits)
-- Dissimilar inputs → low overlap (e.g., ScalarEncoder(0) vs ScalarEncoder(100))
-- Output sparsity is within expected range
-- CategoryEncoder with overlapBits=0 produces zero overlap between different categories
-
-### SP Tests
-- Output sparsity matches TargetSparsity ± tolerance after learning period
-- No dead columns after sufficient boosting iterations
-- Local inhibition produces spatially distributed activation
-
-### TM Tests
-- Repeated sequence → anomaly drops to near zero after learning
-- Novel input after learned sequence → anomaly spikes
-- Segment count stays bounded by MaxSegmentsPerCell
-- Cleanup reduces synapse/segment counts
-
-### Thousand Brains Tests
-- Learning then re-sensing same object → recognition with high confidence
-- Different objects produce distinguishable consensus SDRs
-- Convergence iteration count decreases with more sensory observations
-
-## Known Limitations & TODOs
-
-- No GPU acceleration path (see Etaler project for OpenCL reference)
-
-## Remaining Work
-
-See `HTM_IMPLEMENTATION_TASKS.md` for the full prioritized task list. **Tiers 1, 2, and 3 are complete.** Remaining:
-
-- **Tier 4** — Quality-of-life and hardening (test suite, compilable project, performance profiling, IDisposable lifecycle, logging hooks, serialization hardening)
-
-## Reference Material
-
-- **BAMI (Biological and Machine Intelligence)**: https://numenta.com/resources/biological-and-machine-intelligence/
-- **HTM School**: https://numenta.org/htm-school/
-- **Thousand Brains Theory paper**: "A Framework for Intelligence and Cortical Function Based on Grid Cells in the Neocortex" (Hawkins et al., 2019)
-- **htm.core (C++ reference)**: https://github.com/htm-community/htm.core
-- **NeoCortexAPI (.NET reference)**: https://github.com/ddobric/neocortexapi
+- Hawkins, J., Lewis, M., Klukas, M., Purdy, S., & Ahmad, S. (2019). "A Framework for Intelligence and Cortical Function Based on Grid Cells in the Neocortex." *Frontiers in Neural Circuits*, 12, 121.
+- Hawkins, J. & Ahmad, S. (2016). "Why Neurons Have Thousands of Synapses, a Theory of Sequence Memory in Neocortex." *Frontiers in Neural Circuits*, 10, 23.
+- Hawkins, J., Ahmad, S., & Cui, Y. (2017). "A Theory of How Columns in the Neocortex Enable Learning the Structure of the World." *Frontiers in Neural Circuits*, 11, 81.
+- Ahmad, S. & Hawkins, J. (2016). "How Do Neurons Operate on Sparse Distributed Representations? A Mathematical Theory of Sparsity, Neurons and Active Dendrites." *arXiv:1601.00720*.
+- Cui, Y., Ahmad, S., & Hawkins, J. (2017). "The HTM Spatial Pooler — A Neocortical Algorithm for Online Sparse Distributed Coding." *Frontiers in Computational Neuroscience*, 11, 111.
+- BAMI: Biological and Machine Intelligence. https://numenta.com/resources/biological-and-machine-intelligence/
