@@ -105,7 +105,12 @@ public interface ILocationLayer
     /// the current position is learned as a new anchor.
     /// </summary>
     /// <param name="sensoryInput">Current sensory SDR for landmark matching.</param>
-    void Anchor(SDR sensoryInput);
+    /// <returns>
+    /// True if an existing anchor was matched and position was corrected.
+    /// False if no anchor matched (position unchanged, new anchor may be learned).
+    /// Callers can use this to know whether path integration drift was corrected.
+    /// </returns>
+    bool Anchor(SDR sensoryInput);
 
     // =========================================================================
     // State

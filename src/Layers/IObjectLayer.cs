@@ -45,6 +45,23 @@
 //   representation stabilizes. Across all columns, lateral voting drives
 //   convergence to a single consistent representation.
 //
+// Two-phase operation within the voting loop:
+//   The object layer has two distinct operations that are called at
+//   different times:
+//
+//   1. Compute() — called ONCE per sensory sample, processes feedforward
+//      input and produces the initial representation. Learning happens here.
+//
+//   2. ApplyLateralNarrowing() — called REPEATEDLY during the voting loop.
+//      Intersects the current representation with lateral consensus from
+//      peer columns, narrowing candidates. NO learning, NO feedforward
+//      reprocessing — just candidate elimination.
+//
+//   This separation is critical: feedforward processing + learning should
+//   happen exactly once per sensory sample (otherwise you corrupt temporal
+//   state and double-learn). But lateral narrowing happens iteratively as
+//   columns exchange information. Conflating these is a common design error.
+//
 // Convergence:
 //   Recognition is not a threshold check against a library. Recognition
 //   IS convergence — when all columns agree on the same representation,
@@ -68,61 +85,61 @@ namespace CortexSharp.Layers;
 public interface IObjectLayer
 {
     // =========================================================================
-    // Core computation
-    // =========================================================================
-    // The ColumnPooler computation per timestep:
-    //
-    //   1. Evaluate feedforward input (from L4) against existing
-    //      representations. Which stored objects are consistent with
-    //      this (feature, location)?
-    //
-    //   2. Apply inertia: cells that were active last timestep are
-    //      preferred (via distal self-reinforcement). The representation
-    //      persists unless contradicted by evidence.
-    //
-    //   3. Integrate lateral input: intersect current candidates with
-    //      the consensus from peer columns. Eliminate candidates that
-    //      other columns don't support.
-    //
-    //   4. Integrate apical input: bias toward representations that
-    //      higher regions expect. Modulatory, not driving.
-    //
-    //   5. Select active cells: choose the sparse set that best
-    //      satisfies all constraints (feedforward match + inertia +
-    //      lateral agreement + apical bias).
-    //
-    //   6. Learn: on active cells, strengthen feedforward synapses to
-    //      the current L4 input. This associates the current
-    //      (feature, location) with this object representation.
-    //
-    // After multiple sensory samples + lateral voting iterations,
-    // the representation converges to a single object.
+    // Core computation — called ONCE per sensory sample
     // =========================================================================
 
     /// <summary>
     /// Compute the L2/3 object representation for this timestep.
+    /// Called once per sensory sample. Learning happens here.
     /// </summary>
     /// <param name="feedforwardInput">
     /// Cell-level output from L4 (active cells encoding "feature at location").
+    /// This is the primary driving input.
     /// </param>
-    /// <param name="lateralInput">
-    /// Consensus SDR from lateral voting with peer columns. Null on first
-    /// iteration or in single-column mode.
+    /// <param name="feedforwardGrowthCandidates">
+    /// Superset of potential feedforward connections — typically L4 winner cells.
+    /// New synapses are sampled from this set during learning. Synapses are
+    /// initialized ABOVE the connected threshold (born connected) for one-shot
+    /// learning. May be same as feedforwardInput or include additional context.
+    /// </param>
+    /// <param name="lateralInputs">
+    /// Object representations from ALL peer columns in the same region.
+    /// One SDR per peer column. Used for initial voting / candidate elimination.
+    /// Null if single-column mode or first voting iteration.
     /// </param>
     /// <param name="apicalInput">
     /// Top-down feedback from a higher cortical region. Null if no
-    /// hierarchical feedback available.
+    /// hierarchical feedback available. Modulatory, not driving.
     /// </param>
     /// <param name="learn">
     /// If true, grow/reinforce feedforward synapses on active cells,
     /// associating the current L4 input with this object representation.
+    /// Feedforward synapses are born connected (above threshold).
     /// </param>
     /// <returns>Output including the active object representation.</returns>
     ObjectLayerOutput Compute(
         SDR feedforwardInput,
-        SDR? lateralInput,
+        SDR? feedforwardGrowthCandidates,
+        SDR[]? lateralInputs,
         SDR? apicalInput,
         bool learn);
+
+    // =========================================================================
+    // Lateral narrowing — called REPEATEDLY during voting loop
+    // =========================================================================
+
+    /// <summary>
+    /// Narrow the current representation using lateral consensus.
+    /// Intersects the current L2/3 representation with the laterally-supported
+    /// cells, eliminating candidates not endorsed by peer columns.
+    ///
+    /// This does NOT reprocess feedforward input or perform learning.
+    /// It is a pure candidate elimination step used during iterative voting.
+    /// </summary>
+    /// <param name="lateralInputs">
+    /// Updated representations from ALL peer columns. One SDR per peer column.
+    /// </param>
+    void ApplyLateralNarrowing(SDR[] lateralInputs);
 
     // =========================================================================
     // State
@@ -167,4 +184,14 @@ public record ObjectLayerOutput
     /// On first activation, a random sparse set is chosen.
     /// </summary>
     public bool IsInitialActivation { get; init; }
+
+    /// <summary>
+    /// Number of cells activated by feedforward match alone.
+    /// </summary>
+    public int FeedforwardActivatedCount { get; init; }
+
+    /// <summary>
+    /// True if representation was seeded randomly (no feedforward match = novel input).
+    /// </summary>
+    public bool IsNovelActivation { get; init; }
 }

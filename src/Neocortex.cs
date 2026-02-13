@@ -24,12 +24,18 @@
 //   converge or max iterations are reached.
 //
 // Settling loop (hierarchical):
-//   1. Level 0 processes sensory input → produces consensus
-//   2. Level 1 processes Level 0 consensus → produces consensus
+//   1. Level 0 processes sensory input → produces consensus (ONCE)
+//   2. Level 1 processes Level 0 consensus → produces consensus (ONCE)
 //   3. Level 1 consensus fed back to Level 0 as apical input
-//   4. Level 0 recomputes with top-down modulation
-//   5. Check convergence at all levels
-//   6. Repeat until settled or max iterations
+//   4. Level 0 SETTLES (re-votes without re-running L4/L6)
+//   5. Level 1 SETTLES with updated Level 0 consensus
+//   6. Check convergence at all levels
+//   7. Repeat 3-6 until settled or max iterations
+//
+//   CRITICAL: The settling loop uses Settle(), NOT Process().
+//   Process() re-runs L4 and L6, which would corrupt temporal state
+//   and path integration. Settle() only re-runs L2/3 lateral voting
+//   with updated top-down context — no feedforward re-processing.
 //
 // Consumer API:
 //   The Neocortex provides high-level methods for:
@@ -67,55 +73,55 @@ public class Neocortex
         _regions = regions;
     }
 
-    // TODO: Add convenience constructor that builds regions from config.
-    // The current constructor takes pre-built regions for testability.
-    // A factory method or builder pattern would be appropriate here.
-
     // =========================================================================
     // Core processing
     // =========================================================================
 
     /// <summary>
     /// Process one sensory sample through the full hierarchy.
-    /// Runs the settling loop: feedforward up, feedback down, repeat.
+    /// Runs feedforward processing ONCE, then the settling loop uses Settle()
+    /// (not Process) to avoid corrupting temporal state.
     /// </summary>
-    /// <param name="sensoryPatches">
-    /// Sensory input for Level 0. One SDR per column, or one SDR
-    /// broadcast to all columns.
+    /// <param name="inputs">
+    /// Sensory input for Level 0. One SensoryInput per column, or one
+    /// SensoryInput broadcast to all columns.
     /// </param>
-    /// <param name="deltaX">Sensor displacement in X.</param>
-    /// <param name="deltaY">Sensor displacement in Y.</param>
     /// <param name="learn">If true, learn at all levels.</param>
     /// <returns>Output from all levels including recognition result.</returns>
-    public NeocortexOutput Process(
-        SDR[] sensoryPatches,
-        float deltaX,
-        float deltaY,
-        bool learn)
+    public NeocortexOutput Process(SensoryInput[] inputs, bool learn)
     {
         var regionOutputs = new RegionOutput[_regions.Length];
 
         // =================================================================
-        // Phase 1: Bottom-up feedforward pass
+        // Phase 1: Bottom-up feedforward pass (ONCE)
         // =================================================================
         // Level 0 processes sensory input directly.
         // Higher levels process the consensus of the level below.
+        // Each level runs its full column computation + voting.
 
-        regionOutputs[0] = _regions[0].Process(sensoryPatches, deltaX, deltaY, learn);
+        regionOutputs[0] = _regions[0].Process(inputs, learn);
 
         for (int level = 1; level < _regions.Length; level++)
         {
             // Higher regions receive the lower region's consensus as input.
-            // The consensus is wrapped as a single-element array (broadcast
-            // to all columns in the higher region).
+            // Wrapped as a single SensoryInput with zero displacement
+            // (the concept of "movement" is a Level 0 concern — higher
+            // levels receive abstract representations, not sensory data
+            // with motor displacement).
             var lowerConsensus = regionOutputs[level - 1].Consensus;
 
             // TODO: Implement projection if lower consensus SDR size doesn't
             // match higher region's expected input size. This may require a
             // learned mapping or proportional bit remapping.
+            var higherInput = new SensoryInput
+            {
+                FeatureSDR = lowerConsensus,
+                DeltaX = 0f,
+                DeltaY = 0f,
+            };
+
             regionOutputs[level] = _regions[level].Process(
-                new[] { lowerConsensus },
-                deltaX, deltaY,
+                new[] { higherInput },
                 learn);
         }
 
@@ -123,8 +129,10 @@ public class Neocortex
         // Phase 2: Settling loop (top-down feedback)
         // =================================================================
         // Higher regions feed their consensus back to lower regions.
-        // Lower regions recompute with this top-down modulation.
-        // Repeat until all levels converge or max iterations reached.
+        // Lower regions SETTLE (re-vote) with this top-down modulation.
+        // CRITICAL: Uses Settle(), NOT Process(). Settle() only re-runs
+        // L2/3 lateral voting — it does NOT re-run L4 or L6. Re-running
+        // Process() would corrupt temporal state and path integration.
 
         bool allConverged = regionOutputs.All(r => r.Converged);
 
@@ -137,16 +145,16 @@ public class Neocortex
                     regionOutputs[level + 1].Consensus);
             }
 
-            // Recompute bottom-up with top-down context
-            regionOutputs[0] = _regions[0].Process(sensoryPatches, deltaX, deltaY, learn);
+            // Settle bottom-up: re-vote with top-down context (no L4/L6 re-processing)
+            regionOutputs[0] = _regions[0].Settle();
 
             for (int level = 1; level < _regions.Length; level++)
             {
-                var lowerConsensus = regionOutputs[level - 1].Consensus;
-                regionOutputs[level] = _regions[level].Process(
-                    new[] { lowerConsensus },
-                    deltaX, deltaY,
-                    learn);
+                // Feed the updated lower consensus to the higher region
+                // as hierarchical feedback, then settle
+                _regions[level].ReceiveHierarchicalFeedback(
+                    regionOutputs[level - 1].Consensus);
+                regionOutputs[level] = _regions[level].Settle();
             }
 
             allConverged = regionOutputs.All(r => r.Converged);
@@ -229,7 +237,7 @@ public record NeocortexConfig
 
     /// <summary>
     /// Maximum settling iterations for the hierarchical feedback loop.
-    /// Each iteration: feedback flows down, then recompute flows up.
+    /// Each iteration: feedback flows down, then Settle flows up.
     /// </summary>
     public int MaxSettlingIterations { get; init; } = 5;
 }

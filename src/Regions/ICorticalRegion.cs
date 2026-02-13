@@ -7,26 +7,31 @@
 // S1 for primary somatosensory).
 //
 // The region's primary responsibility is ORCHESTRATION:
-//   1. Route sensory patches to their respective columns
-//   2. Run intra-column computation (L6 → L4 → L2/3)
+//   1. Route sensory inputs to their respective columns
+//   2. Run intra-column computation (L6 → L4 → L2/3) — ONCE per sample
 //   3. Collect L2/3 representations from all columns
-//   4. Run lateral voting to compute consensus
-//   5. Feed consensus back to columns for candidate narrowing
-//   6. Repeat voting until convergence or max iterations
-//   7. Report recognition result
+//   4. Run lateral voting loop (narrowing only, no L4/L6 re-processing)
+//   5. Report recognition result
+//
+// Two-phase design:
+//   Process() runs column computation + voting for a sensory sample.
+//   Settle() runs ONLY the voting loop without column re-computation.
+//
+//   Process() is called once per sensory input. Settle() can be called
+//   during hierarchical settling where higher-region feedback has changed
+//   the context but no new sensory input has arrived.
 //
 // Lateral voting:
 //   After each column computes independently, their L2/3 representations
 //   are compared. Bits supported by enough columns form the consensus.
-//   This consensus is fed back to each column, which intersects it with
-//   its own representation. Over iterations, all columns converge to
-//   the same representation — this IS object recognition.
+//   This consensus is fed back to each column's L2/3 via
+//   ApplyLateralNarrowing() (NOT by re-running the full pipeline).
+//   Over iterations, all columns converge to the same representation —
+//   this IS object recognition.
 //
 // Multi-patch sensing:
-//   Each column processes ONE sensory patch. In a somatosensory region,
-//   each column corresponds to one fingertip location. In a visual region,
-//   each column corresponds to one foveal fixation. The number of
-//   sensory patches MUST match the number of columns (no wrapping).
+//   Each column processes ONE sensory patch. The number of inputs must
+//   match the number of columns, OR be 1 for broadcast mode.
 //
 // Hierarchical connectivity:
 //   A region can send its consensus to a HIGHER region as feedforward
@@ -48,27 +53,36 @@ namespace CortexSharp.Regions;
 public interface ICorticalRegion
 {
     // =========================================================================
-    // Core computation
+    // Core computation — called ONCE per sensory sample
     // =========================================================================
 
     /// <summary>
     /// Process one sensory sample across all columns.
     /// Runs the full pipeline: column computation → lateral voting → consensus.
+    /// Column computation (L6 → L4 → L2/3) happens ONCE. The voting loop
+    /// only runs L2/3 lateral narrowing, not the full pipeline.
     /// </summary>
-    /// <param name="sensoryPatches">
-    /// One SDR per column, or a single SDR broadcast to all columns.
-    /// Each patch is the encoded sensory input for that column's receptive field.
+    /// <param name="inputs">
+    /// One SensoryInput per column (each bundling feature SDR + displacement),
+    /// or a single SensoryInput broadcast to all columns.
     /// Length must equal <see cref="ColumnCount"/> or 1.
     /// </param>
-    /// <param name="deltaX">Sensor displacement in X (shared across columns).</param>
-    /// <param name="deltaY">Sensor displacement in Y (shared across columns).</param>
     /// <param name="learn">If true, learn at all layers of all columns.</param>
     /// <returns>Region-level output including consensus and convergence status.</returns>
-    RegionOutput Process(
-        SDR[] sensoryPatches,
-        float deltaX,
-        float deltaY,
-        bool learn);
+    RegionOutput Process(SensoryInput[] inputs, bool learn);
+
+    // =========================================================================
+    // Settling — re-run voting WITHOUT new sensory processing
+    // =========================================================================
+
+    /// <summary>
+    /// Re-run lateral voting without processing new sensory input.
+    /// Used during hierarchical settling when top-down feedback has changed
+    /// but no new sensory sample has arrived. This only runs L2/3 lateral
+    /// narrowing — L4 and L6 are untouched.
+    /// </summary>
+    /// <returns>Updated region output after re-voting.</returns>
+    RegionOutput Settle();
 
     // =========================================================================
     // Hierarchical communication

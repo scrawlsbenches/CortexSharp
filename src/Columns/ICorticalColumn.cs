@@ -43,6 +43,16 @@
 //            (with lateral consensus + apical feedback from higher region)
 //   6. Column emits its L2/3 representation for lateral voting
 //
+// Two-phase design (Compute + Settle):
+//   Compute() runs the full L6 → L4 → L2/3 pipeline ONCE per sensory sample.
+//   This is where feedforward processing and learning happen.
+//
+//   ApplyLateralNarrowing() runs L2/3 candidate elimination WITHOUT re-running
+//   L6 or L4. This is called repeatedly during the voting loop. The key insight
+//   is that feedforward + location processing should happen exactly once per
+//   sensory sample (re-running them would corrupt temporal state and path
+//   integration), while lateral narrowing is a pure L2/3 operation.
+//
 // Each column processes ONE sensory patch (one fingertip, one foveal
 // fixation). Multiple columns sensing different patches of the same
 // object vote laterally to converge on the object's identity.
@@ -53,6 +63,7 @@
 
 using CortexSharp.Core;
 using CortexSharp.Layers;
+using CortexSharp.Location;
 
 namespace CortexSharp.Columns;
 
@@ -63,33 +74,35 @@ namespace CortexSharp.Columns;
 public interface ICorticalColumn
 {
     // =========================================================================
-    // Core computation
+    // Core computation — called ONCE per sensory sample
     // =========================================================================
 
     /// <summary>
-    /// Process one sensory sample: a feature at a displacement from the
-    /// previous position. This runs the full L6 → L4 → L2/3 pipeline.
+    /// Process one sensory sample through the full L6 → L4 → L2/3 pipeline.
+    /// This runs feedforward processing and learning. Called exactly once
+    /// per sensory input. Do NOT call repeatedly during voting — use
+    /// <see cref="ApplyLateralNarrowing"/> for iterative consensus.
     /// </summary>
-    /// <param name="sensoryInput">
-    /// Encoded sensory SDR — what the sensor is detecting at this moment
-    /// (e.g., curvature, texture, color at one point on the object).
+    /// <param name="input">
+    /// Sensory input bundling the feature SDR with its displacement context.
     /// </param>
-    /// <param name="deltaX">Sensor displacement in X since last sample.</param>
-    /// <param name="deltaY">Sensor displacement in Y since last sample.</param>
     /// <param name="learn">If true, learn at all layers.</param>
     /// <returns>Output from all layers of the column.</returns>
-    ColumnOutput Compute(SDR sensoryInput, float deltaX, float deltaY, bool learn);
+    ColumnOutput Compute(SensoryInput input, bool learn);
 
     // =========================================================================
-    // Lateral communication (between peer columns in the same region)
+    // Lateral narrowing — called REPEATEDLY during voting loop
     // =========================================================================
 
     /// <summary>
-    /// Receive the consensus SDR from lateral voting. The column intersects
-    /// this with its own L2/3 representation to narrow candidates.
+    /// Apply lateral consensus to narrow the L2/3 representation.
+    /// Does NOT re-run L6 or L4 — only updates L2/3 via candidate elimination.
+    /// Called iteratively by the region's voting loop.
     /// </summary>
-    /// <param name="consensus">Consensus object representation from voting.</param>
-    void ReceiveLateralInput(SDR consensus);
+    /// <param name="peerRepresentations">
+    /// L2/3 representations from ALL peer columns. One SDR per peer column.
+    /// </param>
+    void ApplyLateralNarrowing(SDR[] peerRepresentations);
 
     // =========================================================================
     // Hierarchical communication (between regions)
@@ -99,6 +112,7 @@ public interface ICorticalColumn
     /// Receive top-down feedback from a higher cortical region.
     /// This feeds into L2/3 (apical) and optionally L4 (apical).
     /// Modulatory — biases activation without driving it.
+    /// Stored until the next Compute() call.
     /// </summary>
     /// <param name="feedback">Apical SDR from the higher region.</param>
     void ReceiveApicalInput(SDR feedback);
@@ -123,6 +137,9 @@ public interface ICorticalColumn
     /// <summary>Access the Location Layer (L6) directly.</summary>
     ILocationLayer LocationLayer { get; }
 
+    /// <summary>Access the Displacement Module directly (if enabled, null otherwise).</summary>
+    IDisplacementModule? DisplacementModule { get; }
+
     /// <summary>
     /// Reset the column for a new object. Clears L2/3 representation,
     /// resets L6 location to origin, resets L4 temporal context.
@@ -143,8 +160,17 @@ public record ColumnOutput
     /// <summary>Active cells from L4 Temporal Memory.</summary>
     public required SDR ActiveCells { get; init; }
 
+    /// <summary>Winner cells from L4 TM (one per active column, used for learning).</summary>
+    public required SDR WinnerCells { get; init; }
+
+    /// <summary>Cells predicted for next timestep by L4 TM.</summary>
+    public required SDR PredictedCells { get; init; }
+
     /// <summary>Anomaly score from L4 (fraction of bursting columns).</summary>
     public float Anomaly { get; init; }
+
+    /// <summary>Number of columns that burst (unexpected).</summary>
+    public int BurstingColumnCount { get; init; }
 
     // --- L2/3 outputs ---
 
@@ -158,6 +184,9 @@ public record ColumnOutput
 
     /// <summary>Current location SDR from L6 grid cells.</summary>
     public required SDR LocationSDR { get; init; }
+
+    /// <summary>True if L6 anchored to a known landmark this step.</summary>
+    public bool Anchored { get; init; }
 }
 
 /// <summary>
@@ -200,6 +229,11 @@ public record CorticalColumnConfig
 
     /// <summary>Grid dimension per module (ModuleSize x ModuleSize).</summary>
     public int GridModuleSize { get; init; } = 10;
+
+    // --- Displacement cells ---
+
+    /// <summary>Enable displacement modules for structural prediction.</summary>
+    public bool EnableDisplacementCells { get; init; } = true;
 
     // --- Dendritic thresholds ---
 

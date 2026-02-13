@@ -129,6 +129,22 @@ public interface IInputLayer
     /// Falls naturally from the prediction mechanism — not a separate detector.
     /// </summary>
     float Anomaly { get; }
+
+    /// <summary>
+    /// Winner cells — one per active column, selected for learning.
+    /// In predicted columns: the predicted cell.
+    /// In bursting columns: the cell with the best matching segment,
+    /// or the least recently used cell if no segments match.
+    /// These are passed to L2/3 as feedforwardGrowthCandidates.
+    /// </summary>
+    SDR WinnerCells { get; }
+
+    /// <summary>
+    /// Reset temporal context for a new object. Clears previous active/winner
+    /// cells so the next input is processed without sequence context from the
+    /// previous object. Does NOT reset learned synapses — only ephemeral state.
+    /// </summary>
+    void Reset();
 }
 
 /// <summary>

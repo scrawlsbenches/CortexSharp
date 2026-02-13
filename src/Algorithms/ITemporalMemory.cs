@@ -117,6 +117,13 @@ public interface ITemporalMemory
 
     /// <summary>Total synapses across all segments.</summary>
     int TotalSynapseCount { get; }
+
+    /// <summary>
+    /// Reset temporal context for a new object. Clears previous active/winner
+    /// cells so the next input is processed without sequence context from the
+    /// previous object. Does NOT reset learned segments — only ephemeral state.
+    /// </summary>
+    void Reset();
 }
 
 /// <summary>

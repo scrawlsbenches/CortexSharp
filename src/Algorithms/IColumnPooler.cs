@@ -44,93 +44,35 @@
 //      matching step against a library is needed. The converged
 //      representation IS the recognized object.
 //
+// Relationship to IObjectLayer:
+//   IColumnPooler extends IObjectLayer — it IS the algorithm behind L2/3.
+//   IObjectLayer defines the layer-level contract (what a column needs).
+//   IColumnPooler adds algorithm-specific accessors (cell count, target
+//   active cells, diagnostics). Any IColumnPooler can be used as an
+//   IObjectLayer, which is how it's injected into CorticalColumn.
+//
 // Reference: Numenta ColumnPooler implementation (column_pooler.py)
 //            Hawkins et al. (2017), "A Theory of How Columns in the
 //            Neocortex Enable Learning the Structure of the World"
 // ============================================================================
 
 using CortexSharp.Core;
+using CortexSharp.Layers;
 
 namespace CortexSharp.Algorithms;
 
 /// <summary>
 /// Column Pooler — stable object representation learning for L2/3.
+/// Extends <see cref="IObjectLayer"/> with algorithm-specific diagnostics.
 /// </summary>
-public interface IColumnPooler
+public interface IColumnPooler : IObjectLayer
 {
     // =========================================================================
-    // Core computation
+    // Algorithm-specific accessors
     // =========================================================================
-    // The compute cycle per timestep:
-    //
-    //   1. Evaluate feedforward input against existing representations:
-    //      - For each cell, compute feedforward overlap (proximal/feedforward
-    //        synapse activity against L4 active cells)
-    //      - Cells with strong feedforward match are candidates
-    //
-    //   2. Apply inertia: cells active last timestep get priority via
-    //      distal self-reinforcement (they predicted themselves)
-    //
-    //   3. Integrate lateral input: if consensus available, intersect
-    //      candidates with laterally-supported cells
-    //
-    //   4. Integrate apical input: bias toward cells depolarized by
-    //      top-down feedback (modulatory, not driving)
-    //
-    //   5. Select winners: choose the sparse set that best satisfies
-    //      all constraints. If no constraints are met (novel object),
-    //      activate a random sparse set.
-    //
-    //   6. Learn on winners:
-    //      - Grow/reinforce feedforward synapses to current L4 input
-    //        (permanence initialized ABOVE threshold — born connected)
-    //      - Grow/reinforce lateral synapses to peer column representations
-    //      - Grow/reinforce distal self-connections for inertia
-    //
-    // The output is a stable SDR that represents the current object.
+    // These go beyond what the layer contract requires. They expose internals
+    // useful for testing, tuning, and monitoring the learning process.
     // =========================================================================
-
-    /// <summary>
-    /// Compute the L2/3 object representation.
-    /// </summary>
-    /// <param name="feedforwardInput">
-    /// Active cells from L4 TM, encoding "feature at location."
-    /// This is the primary driving input — what's being sensed right now.
-    /// </param>
-    /// <param name="feedforwardGrowthCandidates">
-    /// Superset of potential feedforward connections (e.g., all L4 winner cells).
-    /// New synapses are sampled from this set. May be same as feedforwardInput
-    /// or include additional context.
-    /// </param>
-    /// <param name="lateralInputs">
-    /// Object representations from peer columns in the same region.
-    /// Used for voting / candidate elimination. Null if single-column mode
-    /// or first voting iteration.
-    /// </param>
-    /// <param name="apicalInput">
-    /// Top-down feedback from higher region. Modulatory.
-    /// </param>
-    /// <param name="learn">
-    /// If true, grow/reinforce synapses on active cells.
-    /// Feedforward synapses are born connected (above threshold).
-    /// </param>
-    /// <returns>Output including the stable object representation.</returns>
-    ColumnPoolerOutput Compute(
-        SDR feedforwardInput,
-        SDR? feedforwardGrowthCandidates,
-        SDR[]? lateralInputs,
-        SDR? apicalInput,
-        bool learn);
-
-    // =========================================================================
-    // State
-    // =========================================================================
-
-    /// <summary>
-    /// Current object representation — the sparse active cell SDR.
-    /// Stable across multiple sensory samples of the same object.
-    /// </summary>
-    SDR Representation { get; }
 
     /// <summary>
     /// Number of L2/3 cells in this pooler.
@@ -141,17 +83,11 @@ public interface IColumnPooler
     /// Target number of active cells in the representation (~40).
     /// </summary>
     int TargetActiveCells { get; }
-
-    /// <summary>
-    /// Reset for a new object. Clears the current representation and
-    /// all inertia. The next feedforward input will seed a fresh
-    /// representation (random sparse activation if novel).
-    /// </summary>
-    void Reset();
 }
 
 /// <summary>
 /// Output from a single ColumnPooler compute step.
+/// Extends ObjectLayerOutput with algorithm-specific diagnostics.
 /// </summary>
 public record ColumnPoolerOutput
 {

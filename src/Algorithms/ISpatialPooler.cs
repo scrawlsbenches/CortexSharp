@@ -65,4 +65,11 @@ public interface ISpatialPooler
 
     /// <summary>Number of compute iterations performed.</summary>
     int Iteration { get; }
+
+    /// <summary>
+    /// Reset ephemeral state (iteration counter, duty cycle history).
+    /// Does NOT reset learned proximal synapses. Use this when starting
+    /// a fresh evaluation context where boosting history is irrelevant.
+    /// </summary>
+    void Reset();
 }
