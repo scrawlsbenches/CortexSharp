@@ -442,7 +442,7 @@ public sealed class ScalarEncoder : IEncoder<double>
         for (int i = 0; i < ActiveBits; i++)
             active[i] = (startBit + i) % OutputSize; // Wrap for periodic
 
-        return new SDR(OutputSize, active);
+        return new SDR(OutputSize, (IEnumerable<int>)active);
     }
 }
 
@@ -473,7 +473,7 @@ public sealed class RandomDistributedScalarEncoder : IEncoder<double>
     public SDR Encode(double value)
     {
         int bucket = (int)Math.Floor(value / Resolution);
-        return new SDR(OutputSize, GetOrCreateBucket(bucket));
+        return new SDR(OutputSize, (IEnumerable<int>)GetOrCreateBucket(bucket));
     }
 
     private int[] GetOrCreateBucket(int bucket)
@@ -636,7 +636,7 @@ public sealed class CategoryEncoder : IEncoder<string>
     {
         if (!_categoryBits.ContainsKey(value))
             AddCategory(value);
-        return new SDR(OutputSize, _categoryBits[value]);
+        return new SDR(OutputSize, (IEnumerable<int>)_categoryBits[value]);
     }
 
     /// Encode with explicit similarity: `similar` categories share additional bits.
@@ -664,7 +664,7 @@ public sealed class CategoryEncoder : IEncoder<string>
         }
 
         var result = valueBits.OrderBy(x => x).ToArray();
-        return new SDR(OutputSize, result);
+        return new SDR(OutputSize, (IEnumerable<int>)result);
     }
 }
 
@@ -1082,7 +1082,7 @@ public record struct SegmentMaintenanceResult(int PrunedSynapses, int RemovedSeg
 public enum InhibitionMode { Global, Local }
 public enum BoostingStrategy { Exponential, Linear, None }
 
-public sealed class SpatialPoolerConfig
+public sealed record SpatialPoolerConfig
 {
     public int InputSize { get; init; } = 400;
     public int ColumnCount { get; init; } = 2048;
@@ -1673,9 +1673,6 @@ public sealed class TemporalMemory
 
         return predictive;
     }
-
-    private HashSet<int> GetPredictedColumns()
-        => _predictiveCells.Select(CellColumn).ToHashSet();
 
     /// Select the best cell in a bursting column for learning.
     /// Priority: cell with best-matching segment → cell with fewest segments (least used)
@@ -4023,7 +4020,7 @@ public static class HtmSerializer
         for (int i = 0; i < activeCount; i++)
             bits[i] = br.ReadInt32();
 
-        return new SDR(size, bits);
+        return new SDR(size, (IEnumerable<int>)bits);
     }
 
     /// Serialize a segment's synapses
@@ -5082,7 +5079,7 @@ public static class HtmExamples
         int elementsPerSeq = subsequences[0].Length;
 
         // --- Build encoder ---
-        var encoder = new ScalarEncoder(size: 400, activeBits: 21, minVal: 0, maxVal: 100);
+        var encoder = new ScalarEncoder(size: 400, activeBits: 21, minValue: 0, maxValue: 100);
 
         // --- Build two-level hierarchy ---
         //   L1_SP → L1_TM → L1_TP → L2_SP → L2_TM
