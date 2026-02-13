@@ -1096,7 +1096,7 @@ public sealed record SpatialPoolerConfig
     public InhibitionMode Inhibition { get; init; } = InhibitionMode.Global;
     public int InhibitionRadius { get; init; } = 50;       // For local inhibition
     public BoostingStrategy Boosting { get; init; } = BoostingStrategy.Exponential;
-    public float BoostStrength { get; init; } = 1.0f;
+    public float BoostStrength { get; init; } = 0.0f;   // 0 = disabled (NuPIC default)
     public float MinPctOverlapDutyCycles { get; init; } = 0.001f;
     public int DutyCyclePeriod { get; init; } = 1000;
     public int Seed { get; init; } = 42;
@@ -1120,6 +1120,12 @@ public sealed class SpatialPooler
     // Maps each column to its inhibition neighborhood
     private readonly int[][] _inhibitionNeighborhoods;
 
+    // Fixed random permutation for deterministic tie-breaking during inhibition.
+    // Without this, columns with identical overlap scores are resolved by _rng.Next()
+    // which produces different winners on each call — even for the same input — preventing
+    // the TM from learning stable sequences.
+    private readonly int[] _tieBreakers;
+
     private readonly Random _rng;
     private int _iteration;
 
@@ -1137,6 +1143,14 @@ public sealed class SpatialPooler
         _minLocalActivity = new float[config.ColumnCount];
 
         Array.Fill(_boostFactors, 1.0f);
+
+        // Build a fixed random permutation so tie-breaking is deterministic across calls.
+        _tieBreakers = Enumerable.Range(0, config.ColumnCount).ToArray();
+        for (int i = _tieBreakers.Length - 1; i > 0; i--)
+        {
+            int j = _rng.Next(i + 1);
+            (_tieBreakers[i], _tieBreakers[j]) = (_tieBreakers[j], _tieBreakers[i]);
+        }
 
         _inhibitionNeighborhoods = BuildInhibitionNeighborhoods();
         InitializeProximalConnections();
@@ -1271,7 +1285,7 @@ public sealed class SpatialPooler
             var winners = Enumerable.Range(0, _config.ColumnCount)
                 .Where(c => overlaps[c] > 0)
                 .OrderByDescending(c => overlaps[c])
-                .ThenBy(_ => _rng.Next()) // Tie-breaking
+                .ThenBy(c => _tieBreakers[c])
                 .Take(numActive);
             active.UnionWith(winners);
         }
@@ -2806,11 +2820,14 @@ public sealed class CorticalColumn
         }
     }
 
-    /// Reset object evidence (e.g., when starting to explore a new object)
+    /// Reset object evidence and temporal state (e.g., when starting to explore a new object).
+    /// Clears TM predictions so that sequence context from the previous object
+    /// does not produce spurious predictions on the first touch of the new one.
     public void ResetObjectRepresentation()
     {
         _currentObjectRepresentation = new SDR(_config.ObjectRepresentationSize);
         _confidence = 0;
+        _sequenceTM.Reset();
     }
 
     public SDR GetObjectRepresentation() => _currentObjectRepresentation;
@@ -2840,10 +2857,12 @@ public sealed class CorticalColumn
             objectBits.Add(((hash & 0x7FFFFFFF) % _config.ObjectRepresentationSize));
         }
 
-        // Subsample to maintain target sparsity
+        // Subsample to maintain target sparsity — use deterministic selection
+        // (lowest bit indices) so the same TM cells always produce the same
+        // object SDR regardless of RNG state.
         if (objectBits.Count > _config.ObjectActiveBits)
         {
-            var sampled = objectBits.OrderBy(_ => _rng.Next()).Take(_config.ObjectActiveBits);
+            var sampled = objectBits.OrderBy(b => b).Take(_config.ObjectActiveBits);
             return new SDR(_config.ObjectRepresentationSize, sampled);
         }
 
@@ -2874,7 +2893,9 @@ public sealed class CorticalColumn
         return new SDR(_config.ObjectRepresentationSize, result);
     }
 
-    /// Blend two SDRs: randomly select bits from each based on blendFactor
+    /// Blend two SDRs: select bits from each based on blendFactor.
+    /// Uses deterministic selection (lowest bit indices) so the same
+    /// inputs always produce the same output regardless of RNG state.
     private SDR BlendSDRs(SDR a, SDR b, float bWeight)
     {
         var result = new HashSet<int>();
@@ -2884,8 +2905,8 @@ public sealed class CorticalColumn
         int fromB = (int)(targetBits * bWeight);
         int fromA = targetBits - fromB;
 
-        result.UnionWith(a.ActiveBits.ToArray().OrderBy(_ => _rng.Next()).Take(fromA));
-        result.UnionWith(b.ActiveBits.ToArray().OrderBy(_ => _rng.Next()).Take(fromB));
+        result.UnionWith(a.ActiveBits.ToArray().OrderBy(x => x).Take(fromA));
+        result.UnionWith(b.ActiveBits.ToArray().OrderBy(x => x).Take(fromB));
 
         return new SDR(a.Size, result);
     }
@@ -3189,7 +3210,12 @@ public sealed class ThousandBrainsEngine
             _objectDisplacements[label] = new List<SDR>(_currentDisplacements);
     }
 
-    /// Reset all columns for exploring a new object
+    /// Reset all columns and grid cells for exploring a new object.
+    /// Grid cells are reset to a fixed origin so that the same movement
+    /// sequence during recognition produces the same location SDRs as
+    /// during learning. Without this, grid cells would retain their
+    /// position from the previous object, making (feature + location)
+    /// inputs non-reproducible.
     public void StartNewObject()
     {
         _explorationSteps = 0;
@@ -3197,6 +3223,8 @@ public sealed class ThousandBrainsEngine
         _currentDisplacements.Clear();
         foreach (var column in _columns)
             column.ResetObjectRepresentation();
+        foreach (var module in _gridModules)
+            module.SetPosition(0, 0);
     }
 
     /// Anchor grid cells at the current position based on a landmark
@@ -4757,6 +4785,7 @@ public sealed class HtmEngineConfig
     public int InhibitionRadius { get; init; } = 50;
     public int MaxSegmentsPerCell { get; init; } = 128;
     public int MaxSynapsesPerSegment { get; init; } = 64;
+    public float BoostStrength { get; init; } = 0.0f;
 
     // Temporal Pooler — produces stable sequence-level representations
     public float TpAnomalyResetThreshold { get; init; } = 0.5f;
@@ -4805,6 +4834,7 @@ public sealed class HtmEngine
             TargetSparsity = config.Sparsity,
             Inhibition = config.Inhibition,
             InhibitionRadius = config.InhibitionRadius,
+            BoostStrength = config.BoostStrength,
         };
 
         _tmConfig = new TemporalMemoryConfig
@@ -4829,6 +4859,10 @@ public sealed class HtmEngine
         _anomalyLikelihood = new AnomalyLikelihood();
     }
 
+    /// When true, SP learning is frozen — only TM learns during Compute.
+    /// Set this after PreTrainSP to stabilize column assignments.
+    public bool FreezeSPLearning { get; set; }
+
     /// Process one timestep through the full pipeline:
     /// Encode → SP → TM → TP → Predictor → Anomaly
     public HtmResult Compute(Dictionary<string, object> inputData, bool learn = true)
@@ -4837,7 +4871,7 @@ public sealed class HtmEngine
 
         // Encode → SP → TM
         SDR encoded = _encoder.Encode(inputData);
-        SDR activeColumns = _sp.Compute(encoded, learn);
+        SDR activeColumns = _sp.Compute(encoded, learn && !FreezeSPLearning);
         var tmOutput = _tm.Compute(activeColumns, learn);
 
         // Temporal Pooling — stable sequence-level representation
@@ -4868,6 +4902,21 @@ public sealed class HtmEngine
         };
     }
 
+    /// Run SP-only learning (no TM) on the given data stream.
+    /// Call this before the main Compute loop to stabilize column assignments.
+    /// After pre-training, FreezeSPLearning is set to true so that subsequent
+    /// Compute calls only train the TM on stable column assignments.
+    public void PreTrainSP(IEnumerable<Dictionary<string, object>> data, int cycles = 50)
+    {
+        for (int c = 0; c < cycles; c++)
+            foreach (var record in data)
+            {
+                SDR encoded = _encoder.Encode(record);
+                _sp.Compute(encoded, learn: true);
+            }
+        FreezeSPLearning = true;
+    }
+
     /// Get comprehensive system health report
     public SystemHealthReport GetHealth()
         => HtmDiagnostics.GetSystemHealth(_sp, _tm);
@@ -4896,6 +4945,7 @@ public sealed class HtmEngine
 public static class HtmExamples
 {
     /// Example 1: Single-stream anomaly detection (Hot Gym pattern)
+    /// Uses two-phase training: SP pre-training → TM sequence learning
     public static void RunSingleStreamDemo()
     {
         // --- Configure Encoders ---
@@ -4918,11 +4968,29 @@ public static class HtmExamples
             MaxSynapsesPerSegment = 64,
         });
 
-        // --- Process Stream ---
+        // --- Phase 1: SP pre-training on representative data ---
+        var baseTime = new DateTime(2024, 1, 1);
+        var trainingData = new List<Dictionary<string, object>>();
+        for (int h = 0; h < 168; h++) // One full week (24 * 7)
+        {
+            var ts = baseTime.AddHours(h);
+            trainingData.Add(new Dictionary<string, object>
+            {
+                ["timestamp"] = ts,
+                ["value"] = 50.0 + 20.0 * Math.Sin(2 * Math.PI * h / 24)
+                           + 10.0 * Math.Sin(2 * Math.PI * h / 168),
+            });
+        }
+
+        Console.Write("SP pre-training (30 cycles x 168 hours)...");
+        engine.PreTrainSP(trainingData, cycles: 30);
+        Console.WriteLine(" done");
+
+        // --- Phase 2: TM sequence learning ---
         var rng = new Random(42);
         for (int i = 0; i < 5000; i++)
         {
-            var timestamp = DateTime.Now.AddHours(i);
+            var timestamp = baseTime.AddHours(i);
             double consumption = 50 + 20 * Math.Sin(2 * Math.PI * i / 24)  // Daily cycle
                                + 10 * Math.Sin(2 * Math.PI * i / 168)       // Weekly cycle
                                + rng.NextDouble() * 5;                       // Noise
@@ -4952,67 +5020,164 @@ public static class HtmExamples
     }
 
     /// Example 2: Multi-stream concurrent processing
+    ///
+    /// Four independent sensor streams run in parallel through the
+    /// MultiStreamProcessor. Each has a different sinusoidal period
+    /// and phase, processed by its own SP+TM pipeline on separate
+    /// worker threads.
+    ///
+    /// The processor uses channel-per-worker partitioning: each stream
+    /// is routed to a deterministic worker by hash, so the same StreamId
+    /// always hits the same thread — no locks needed, HTM state is safe.
+    ///
+    /// Phase 1: SP pre-training (submit data with learn=true on each pipeline)
+    /// Phase 2: TM sequence learning via the async processor
     public static async Task RunMultiStreamDemo()
     {
-        await using var processor = new MultiStreamProcessor(workerCount: 4);
+        Console.WriteLine("Multi-Stream Concurrent Processing");
+        Console.WriteLine(new string('=', 72));
 
-        // Register multiple sensor streams
-        for (int s = 0; s < 10; s++)
+        int streamCount = 4;
+        int cycleLength = 20;  // Steps per cycle per stream
+
+        // Build stream configs — each stream gets its own encoder + SP + TM.
+        // RDSE for value + periodic ScalarEncoder for cycle position.
+        var configs = new StreamConfig[streamCount];
+        for (int s = 0; s < streamCount; s++)
         {
             var encoder = new CompositeEncoder()
                 .AddEncoder("value", new RandomDistributedScalarEncoder(
                     size: 400, activeBits: 21, resolution: 1.0))
-                .AddEncoder("timestamp", new DateTimeEncoder(hourBits: 48, dowBits: 48));
+                .AddEncoder("phase", new ScalarEncoder(
+                    size: 64, activeBits: 5, minValue: 0, maxValue: cycleLength,
+                    periodic: true));
 
-            processor.AddStream(new StreamConfig
+            configs[s] = new StreamConfig
             {
                 StreamId = $"sensor_{s}",
                 Encoder = encoder,
                 SPConfig = new SpatialPoolerConfig { ColumnCount = 1024 },
                 TMConfig = new TemporalMemoryConfig { ColumnCount = 1024, CellsPerColumn = 16 },
-            });
+            };
         }
 
-        // Start result consumer
+        // Phase 1: SP pre-training on each pipeline directly.
+        // This stabilizes column assignments before the async processor runs.
+        Console.Write("\n  Phase 1: SP pre-training (50 cycles)...");
+        var pipelines = new StreamPipeline[streamCount];
+        for (int s = 0; s < streamCount; s++)
+        {
+            pipelines[s] = new StreamPipeline(configs[s]);
+            var preRng = new Random(42 + s);
+            for (int c = 0; c < 50; c++)
+            {
+                for (int step = 0; step < cycleLength; step++)
+                {
+                    double value = 50 + 20 * Math.Sin(2 * Math.PI * step / cycleLength + s * 0.5);
+                    value += preRng.NextDouble() * 3;
+                    var data = new Dictionary<string, object>
+                    {
+                        ["value"] = value,
+                        ["phase"] = (double)step,
+                    };
+                    // Process to train SP (and TM gets some exposure too)
+                    pipelines[s].Process(data, DateTime.MinValue.AddHours(step));
+                }
+            }
+        }
+        Console.WriteLine(" done");
+
+        // Phase 2: Run via the async MultiStreamProcessor.
+        // The processor creates its own pipelines internally, so we
+        // need to register streams and submit data through the processor.
+        // The pre-training above stabilized our understanding of the
+        // patterns; now we test the async infrastructure itself.
+        Console.WriteLine("  Phase 2: Async multi-stream processing\n");
+
+        await using var processor = new MultiStreamProcessor(workerCount: 2);
+        for (int s = 0; s < streamCount; s++)
+            processor.AddStream(configs[s]);
+
+        var baseTime = new DateTime(2024, 1, 1);
+        int totalSteps = 1000;  // 50 cycles per stream
+        int expectedResults = totalSteps * streamCount;
+
+        // Track per-stream anomaly for reporting
+        var streamAnomalies = new ConcurrentDictionary<string, List<float>>();
+        for (int s = 0; s < streamCount; s++)
+            streamAnomalies[$"sensor_{s}"] = new List<float>();
+
+        // Consumer: reads all results and collects anomaly data
         var consumer = Task.Run(async () =>
         {
             int count = 0;
             await foreach (var result in processor.ReadResultsAsync())
             {
-                if (result.AnomalyLikelihood > 0.95f)
-                    Console.WriteLine($"  ⚠ {result.StreamId} anomaly at {result.Timestamp:HH:mm}");
-                if (++count >= 50_000) break;
+                if (streamAnomalies.TryGetValue(result.StreamId, out var list))
+                {
+                    lock (list)
+                        list.Add(result.RawAnomaly);
+                }
+                count++;
+                if (count >= expectedResults) break;
             }
+            return count;
         });
 
-        // Produce data
+        // Producer: submit all data points
         var rng = new Random(42);
-        for (int i = 0; i < 5000; i++)
+        for (int i = 0; i < totalSteps; i++)
         {
-            for (int s = 0; s < 10; s++)
+            for (int s = 0; s < streamCount; s++)
             {
+                int step = i % cycleLength;
+                double value = 50 + 20 * Math.Sin(2 * Math.PI * step / cycleLength + s * 0.5)
+                              + rng.NextDouble() * 3;
+
                 await processor.SubmitAsync(new StreamDataPoint
                 {
                     StreamId = $"sensor_{s}",
-                    Timestamp = DateTime.Now.AddMinutes(i),
+                    Timestamp = baseTime.AddMinutes(i),
                     Data = new Dictionary<string, object>
                     {
-                        ["timestamp"] = DateTime.Now.AddMinutes(i),
-                        ["value"] = (double)(50 + 20 * Math.Sin(2 * Math.PI * i / 100 + s)
-                                    + rng.NextDouble() * 3),
+                        ["value"] = value,
+                        ["phase"] = (double)step,
                     },
                 });
             }
         }
 
-        Console.WriteLine(processor.GetStats());
-        await consumer;
+        // Wait for consumer to finish reading all results
+        int totalRead = await consumer;
+
+        var stats = processor.GetStats();
+        Console.WriteLine($"  {stats}");
+        Console.WriteLine($"  Results read: {totalRead}/{expectedResults}");
+
+        // Per-stream convergence report
+        Console.WriteLine($"\n  {"Stream",-12} | {"Total",5} | {"Last-cycle avg",14} | Converged?");
+        foreach (var (streamId, anomalies) in streamAnomalies.OrderBy(kv => kv.Key))
+        {
+            float lastCycleAvg = 1.0f;
+            if (anomalies.Count >= cycleLength)
+            {
+                lastCycleAvg = anomalies
+                    .Skip(anomalies.Count - cycleLength)
+                    .Average();
+            }
+            string converged = lastCycleAvg < 0.25f ? "yes" : "no";
+            Console.WriteLine($"  {streamId,-12} | {anomalies.Count,5} | " +
+                              $"{lastCycleAvg * 100,12:F1} % | {converged}");
+        }
+
+        Console.WriteLine("\n  Expected: each stream converges independently via its own worker.");
+        Console.WriteLine("  The processor guarantees sequential ordering per stream without locks.");
     }
 
     /// Example 3: NetworkAPI — declarative pipeline construction
+    /// Uses two-phase training via Network.Compute(learn:) control
     public static void RunNetworkApiDemo()
     {
-        // Build a two-level hierarchy: SP1 → TM1 → SP2 → TM2
         var network = new Network();
 
         network.AddRegion(new SPRegion("L1_SP", new SpatialPoolerConfig
@@ -5026,15 +5191,33 @@ public static class HtmExamples
 
         network.Link("L1_SP", "bottomUpOut", "L1_TM", "bottomUpIn");
 
-        // Run
         var encoder = new ScalarEncoder(400, 21, 0, 100);
+
+        // Phase 1: SP pre-training (TM also receives input but learns patterns
+        // that will be overwritten — the key is stabilizing SP columns)
+        Console.Write("SP pre-training (50 cycles x 50 steps)...");
+        for (int c = 0; c < 50; c++)
+        {
+            for (int i = 0; i < 50; i++)
+            {
+                double value = 50 + 30 * Math.Sin(2 * Math.PI * i / 50);
+                network.SetInput("L1_SP", "bottomUpIn", encoder.Encode(value));
+                network.Compute(learn: true);
+            }
+            // Reset TM between pre-training cycles to avoid cross-cycle sequence learning
+            network.Reset();
+        }
+        Console.WriteLine(" done");
+
+        // Phase 2: TM sequence learning on stable SP columns
+        network.Reset();
         for (int i = 0; i < 1000; i++)
         {
             double value = 50 + 30 * Math.Sin(2 * Math.PI * i / 50);
             SDR encoded = encoder.Encode(value);
 
             network.SetInput("L1_SP", "bottomUpIn", encoded);
-            network.Compute();
+            network.Compute(learn: true);
 
             var anomaly = (float)network.GetOutput("L1_TM", "anomaly");
             if (i % 100 == 0)
@@ -5153,7 +5336,22 @@ public static class HtmExamples
             l2ColumnCount: 512, l2CellsPerColumn: 16,
             tpConfig: tpConfig);
 
-        // --- Run ---
+        // --- Phase 1: SP pre-training on all unique values ---
+        var allValues = subsequences.SelectMany(s => s).Distinct().ToArray();
+        Console.Write("SP pre-training (50 cycles)...");
+        for (int c = 0; c < 50; c++)
+        {
+            foreach (double v in allValues)
+            {
+                network.SetInput("L1_SP", "bottomUpIn", encoder.Encode(v));
+                network.Compute(learn: true);
+            }
+            network.Reset();
+        }
+        Console.WriteLine(" done");
+        network.Reset();
+
+        // --- Phase 2: Sequence learning ---
         int totalSteps = 2000;
         int step = 0;
 
@@ -5173,7 +5371,7 @@ public static class HtmExamples
                     SDR encoded = encoder.Encode(value);
 
                     network.SetInput("L1_SP", "bottomUpIn", encoded);
-                    network.Compute();
+                    network.Compute(learn: true);
 
                     float l1Anomaly = (float)network.GetOutput("L1_TM", "anomaly");
                     float l2Anomaly = (float)network.GetOutput("L2_TM", "anomaly");
@@ -5194,5 +5392,809 @@ public static class HtmExamples
 
         Console.WriteLine($"\nCompleted {totalSteps} steps ({totalSteps / (elementsPerSeq * subsequences.Length)} full cycles).");
         Console.WriteLine("Expected: L1 anomaly near 0% after ~2 cycles; L2 anomaly drops over ~10+ cycles.");
+    }
+
+    /// Example 5: Multi-sensor machine monitoring with fault injection
+    ///
+    /// Models an industrial pump with a repeating 10-step duty cycle:
+    ///   Idle → Startup → Peak → Steady → Cooldown → (repeat)
+    ///
+    /// Three sensor streams (temperature, vibration, RPM) are encoded into a
+    /// single SDR and fed through SP → TM.  The SP is pre-trained first to
+    /// stabilize column assignments before TM sequence learning begins (this
+    /// two-phase approach mirrors standard HTM deployment practice).
+    ///
+    /// After the TM converges, three faults are injected:
+    ///   1. Bearing wear  — vibration drifts upward during the steady phase
+    ///   2. Overheating   — temperature spikes during peak
+    ///   3. Stall         — RPM drops to zero mid-cycle
+    /// Each fault should produce a clear anomaly spike on a background of ~0%.
+    public static void RunMachineMonitoringDemo()
+    {
+        Console.WriteLine("Machine Monitoring Demo: 3-sensor pump with fault injection");
+        Console.WriteLine("Sensors: temperature (°C), vibration (mm/s), RPM");
+        Console.WriteLine("Duty cycle: Idle→Startup→Peak→Steady→Cooldown (10 steps)\n");
+
+        // ---- Encoder ----
+        // Three RDSE fields, one per sensor.  Resolutions chosen so that the
+        // normal operating range spans ~20-30 encoder buckets per sensor.
+        var encoder = new CompositeEncoder()
+            .AddEncoder("temperature", new RandomDistributedScalarEncoder(
+                size: 200, activeBits: 11, resolution: 2.0))
+            .AddEncoder("vibration", new RandomDistributedScalarEncoder(
+                size: 200, activeBits: 11, resolution: 0.3))
+            .AddEncoder("rpm", new RandomDistributedScalarEncoder(
+                size: 200, activeBits: 11, resolution: 100.0));
+
+        // ---- SP & TM (used directly for explicit two-phase training) ----
+        var sp = new SpatialPooler(new SpatialPoolerConfig
+        {
+            InputSize = encoder.TotalSize,
+            ColumnCount = 2048,
+            TargetSparsity = 0.02f,
+        });
+        var tm = new TemporalMemory(new TemporalMemoryConfig
+        {
+            ColumnCount = 2048,
+            CellsPerColumn = 32,
+        });
+
+        // ---- Duty cycle definition ----
+        // Each step is (temperature, vibration, rpm).
+        // 10 steps form one complete pump cycle.
+        var dutyCycle = new (double temp, double vib, double rpm)[]
+        {
+            // Idle (2 steps)
+            (25, 0.5, 0),
+            (25, 0.5, 0),
+            // Startup (2 steps)
+            (35, 2.0, 1000),
+            (50, 4.0, 2000),
+            // Peak (2 steps)
+            (72, 3.5, 2800),
+            (75, 3.2, 2800),
+            // Steady (2 steps)
+            (68, 2.8, 2600),
+            (65, 2.5, 2600),
+            // Cooldown (2 steps)
+            (45, 1.5, 1000),
+            (30, 0.8, 200),
+        };
+        int cycleLen = dutyCycle.Length;
+
+        // ---- Phase 1: Pre-train the SP ----
+        // Run the duty cycle through the SP many times so that column
+        // assignments stabilize before TM begins forming segments.
+        int spTrainingCycles = 50;
+        Console.Write($"Phase 1: SP pre-training ({spTrainingCycles} cycles)...");
+        for (int c = 0; c < spTrainingCycles; c++)
+        {
+            for (int p = 0; p < cycleLen; p++)
+            {
+                var (t, v, r) = dutyCycle[p];
+                var data = new Dictionary<string, object>
+                {
+                    ["temperature"] = t, ["vibration"] = v, ["rpm"] = r,
+                };
+                sp.Compute(encoder.Encode(data), learn: true);
+            }
+        }
+        Console.WriteLine(" done");
+
+        // Verify stability: same input → same columns
+        var probe0a = sp.Compute(encoder.Encode(new Dictionary<string, object>
+            { ["temperature"] = 25.0, ["vibration"] = 0.5, ["rpm"] = 0.0 }), learn: false);
+        var probe0b = sp.Compute(encoder.Encode(new Dictionary<string, object>
+            { ["temperature"] = 25.0, ["vibration"] = 0.5, ["rpm"] = 0.0 }), learn: false);
+        int probeOverlap = probe0a.ActiveBits.ToArray()
+            .Intersect(probe0b.ActiveBits.ToArray()).Count();
+        Console.WriteLine($"SP stability check: {probeOverlap}/{probe0a.ActiveCount} " +
+                          $"column overlap on repeated input\n");
+
+        // ---- Phase 2: TM sequence learning + fault injection ----
+        int tmTrainingCycles = 10;
+        int faultCycles = 3;
+        int gapCycles = 5;
+
+        int faultStart1 = tmTrainingCycles * cycleLen;
+        int faultEnd1 = faultStart1 + faultCycles * cycleLen;
+        int faultStart2 = faultEnd1 + gapCycles * cycleLen;
+        int faultEnd2 = faultStart2 + faultCycles * cycleLen;
+        int faultStart3 = faultEnd2 + gapCycles * cycleLen;
+        int faultEnd3 = faultStart3 + faultCycles * cycleLen;
+        int totalSteps = faultEnd3;
+
+        Console.WriteLine($"Phase 2: TM learning ({tmTrainingCycles} cycles) → " +
+                          $"bearing wear → gap → overheat → gap → stall");
+        Console.WriteLine($"Total: {totalSteps} steps ({totalSteps / cycleLen} cycles)\n");
+
+        Console.WriteLine($"{"Step",5} {"Cyc",4} {"Phase",9} {"Temp",5} {"Vib",5} {"RPM",5}  " +
+                          $"{"Anomaly",8} {"Burst",5} {"Pred",5}  Fault");
+        Console.WriteLine(new string('-', 75));
+
+        int lastPrintedCycle = -1;
+
+        for (int step = 0; step < totalSteps; step++)
+        {
+            int phase = step % cycleLen;
+            int cycle = step / cycleLen;
+            var (temp, vib, rpm) = dutyCycle[phase];
+
+            // ---- Fault injection ----
+            string fault = "";
+            if (step >= faultStart1 && step < faultEnd1)
+            {
+                // Bearing wear: vibration increases 2-3x during steady/peak phases
+                if (phase >= 4 && phase <= 7)
+                {
+                    vib += 5.0 + 2.0 * ((step - faultStart1) / (double)(faultEnd1 - faultStart1));
+                    fault = "BEARING";
+                }
+            }
+            else if (step >= faultStart2 && step < faultEnd2)
+            {
+                // Overheat: temperature spikes +30°C during peak
+                if (phase >= 4 && phase <= 5)
+                {
+                    temp += 30;
+                    fault = "OVERHEAT";
+                }
+            }
+            else if (step >= faultStart3 && step < faultEnd3)
+            {
+                // Stall: RPM drops to 0, vibration spikes during what should be peak/steady
+                if (phase >= 3 && phase <= 7)
+                {
+                    rpm = 0;
+                    vib = 8.0;
+                    fault = "STALL";
+                }
+            }
+
+            var data = new Dictionary<string, object>
+            {
+                ["temperature"] = temp,
+                ["vibration"] = vib,
+                ["rpm"] = rpm,
+            };
+
+            // SP: no further learning (already pre-trained)
+            SDR activeColumns = sp.Compute(encoder.Encode(data), learn: false);
+            // TM: learn only during normal operation (not during faults)
+            bool tmLearn = step < faultStart1;
+            var tmOut = tm.Compute(activeColumns, learn: tmLearn);
+            float anomaly = tmOut.Anomaly;
+
+            // Print: first 2 cycles, every 5th cycle start, fault transitions, last step
+            bool isCycleStart = phase == 0 && cycle != lastPrintedCycle;
+            bool isFaultBoundary = step == faultStart1 || step == faultEnd1
+                                || step == faultStart2 || step == faultEnd2
+                                || step == faultStart3 || step == faultEnd3;
+            bool shouldPrint = (cycle < 2 && phase == 0)
+                            || (isCycleStart && cycle % 5 == 0)
+                            || isFaultBoundary
+                            || fault.Length > 0
+                            || step == totalSteps - 1;
+
+            string phaseName = phase switch
+            {
+                0 or 1 => "Idle",
+                2 or 3 => "Startup",
+                4 or 5 => "Peak",
+                6 or 7 => "Steady",
+                _      => "Cooldown",
+            };
+
+            if (shouldPrint)
+            {
+                lastPrintedCycle = cycle;
+                Console.WriteLine(
+                    $"{step,5} {cycle,4} {phaseName,9} {temp,5:F0} {vib,5:F1} {rpm,5:F0}  " +
+                    $"{anomaly * 100,5:F0} %  {tmOut.BurstingColumnCount,5} {tmOut.PredictedActiveColumnCount,5}  {fault}");
+            }
+        }
+
+        // ---- Summary ----
+        Console.WriteLine($"\nSegments: {tm.TotalSegmentCount:N0}, " +
+                          $"Synapses: {tm.TotalSynapseCount:N0}");
+        Console.WriteLine("\nExpected: anomaly ≈ 0% during normal operation after ~4 cycles, " +
+                          "clear spikes during each fault window.");
+    }
+
+    /// Example 7: Grid Cells, Displacement Cells, and Thousand Brains object recognition
+    ///
+    /// Directly exercises the core Thousand Brains Theory components:
+    ///   1. GridCellModule — path integration, position tracking, anchoring
+    ///   2. DisplacementCellModule — relative offset encoding, target prediction
+    ///   3. Full Thousand Brains pipeline — multi-column learning with grid cells,
+    ///      displacement predictions, and lateral voting for consensus
+    ///
+    /// These are the biological mechanisms proposed by Hawkins et al. (2019) for
+    /// how the neocortex builds object-centric reference frames using grid cell-like
+    /// computations in every cortical column.
+    public static void RunGridCellDemo()
+    {
+        Console.WriteLine("Grid Cells & Displacement Cells — Thousand Brains Theory");
+        Console.WriteLine(new string('=', 72));
+
+        // ================================================================
+        // Section 1: Grid Cell Path Integration
+        // ================================================================
+        Console.WriteLine("\n1. GRID CELL PATH INTEGRATION");
+        Console.WriteLine("   A single grid cell module tracks position on a toroidal surface.");
+        Console.WriteLine("   Movement displaces the active bump; same position → same SDR.\n");
+
+        var gridConfig = new GridCellModuleConfig
+        {
+            ModuleSize = 40,        // 40×40 = 1600 cells
+            ActiveCellCount = 10,   // 10 active cells per bump
+            Scale = 1.0f,
+            Orientation = 0.0f,
+            BumpSigma = 1.5f,
+            PathIntegrationNoise = 0.0f,  // No noise for deterministic testing
+        };
+        var grid = new GridCellModule(gridConfig, seed: 42);
+
+        // Set to a known starting position
+        grid.SetPosition(10.0f, 15.0f);
+        var sdrAtStart = grid.GetCurrentLocation();
+        Console.WriteLine($"   Position (10, 15): {sdrAtStart.ActiveCount} active cells, " +
+                          $"SDR size = {sdrAtStart.Size}");
+
+        // Move right by 5 units
+        grid.Move(5.0f, 0.0f);
+        var pos = grid.GetPosition();
+        var sdrAfterMove = grid.GetCurrentLocation();
+        Console.WriteLine($"   Move (+5, 0) → position ({pos.X:F1}, {pos.Y:F1}): " +
+                          $"overlap with start = {sdrAtStart.Overlap(sdrAfterMove)}");
+
+        // Move back to start
+        grid.Move(-5.0f, 0.0f);
+        pos = grid.GetPosition();
+        var sdrBackAtStart = grid.GetCurrentLocation();
+        int returnOverlap = sdrAtStart.Overlap(sdrBackAtStart);
+        Console.WriteLine($"   Move (-5, 0) → position ({pos.X:F1}, {pos.Y:F1}): " +
+                          $"overlap with start = {returnOverlap}");
+        Console.WriteLine($"   → Return to origin recovers the original SDR: " +
+                          $"{(returnOverlap == sdrAtStart.ActiveCount ? "YES (exact match)" : $"partial ({returnOverlap}/{sdrAtStart.ActiveCount})")}");
+
+        // Demonstrate toroidal wrapping
+        grid.SetPosition(38.0f, 38.0f);
+        grid.Move(5.0f, 5.0f);
+        pos = grid.GetPosition();
+        Console.WriteLine($"\n   Toroidal wrapping: (38, 38) + (5, 5) → ({pos.X:F1}, {pos.Y:F1})");
+        Console.WriteLine($"   → Position wraps around the module boundary (mod 40).");
+
+        // ================================================================
+        // Section 2: Multi-Scale Grid Cells (unique location codes)
+        // ================================================================
+        Console.WriteLine("\n2. MULTI-SCALE GRID CELLS");
+        Console.WriteLine("   Multiple modules at different scales/orientations produce");
+        Console.WriteLine("   unique composite location codes — like Fourier components.\n");
+
+        var modules = new GridCellModule[4];
+        for (int i = 0; i < 4; i++)
+        {
+            modules[i] = new GridCellModule(new GridCellModuleConfig
+            {
+                ModuleSize = 20,
+                ActiveCellCount = 8,
+                Scale = 1.0f + i * 0.7f,
+                Orientation = i * MathF.PI / 6,
+                PathIntegrationNoise = 0.0f,
+            }, seed: 42 + i);
+        }
+
+        // Compute composite location SDRs at several positions
+        var positions = new (float X, float Y)[]
+        {
+            (5, 5), (10, 5), (5, 10), (5, 5),  // Last repeats first
+        };
+
+        Console.WriteLine($"   {"Position",12} | {"Mod0",5} {"Mod1",5} {"Mod2",5} {"Mod3",5} | Composite bits");
+        var compositeSDRs = new SDR[positions.Length];
+        for (int p = 0; p < positions.Length; p++)
+        {
+            // Set all modules to the same physical position
+            foreach (var m in modules)
+                m.SetPosition(positions[p].X, positions[p].Y);
+
+            // Get each module's SDR and concatenate into a composite
+            var allBits = new List<int>();
+            int offset = 0;
+            var perModuleActive = new int[4];
+            for (int m = 0; m < 4; m++)
+            {
+                var modSDR = modules[m].GetCurrentLocation();
+                perModuleActive[m] = modSDR.ActiveCount;
+                foreach (int bit in modSDR.ActiveBits)
+                    allBits.Add(bit + offset);
+                offset += modules[m].OutputSize;
+            }
+            compositeSDRs[p] = new SDR(offset, allBits);
+
+            Console.WriteLine($"   ({positions[p].X,4:F0},{positions[p].Y,4:F0})     | " +
+                              $"{perModuleActive[0],5} {perModuleActive[1],5} {perModuleActive[2],5} {perModuleActive[3],5} | " +
+                              $"{compositeSDRs[p].ActiveCount} active bits");
+        }
+
+        // Check uniqueness: different positions should have low overlap
+        Console.WriteLine($"\n   Overlap (5,5) vs (10,5): {compositeSDRs[0].Overlap(compositeSDRs[1])} " +
+                          $"(different positions → low overlap)");
+        Console.WriteLine($"   Overlap (5,5) vs (5,10): {compositeSDRs[0].Overlap(compositeSDRs[2])} " +
+                          $"(different positions → low overlap)");
+        Console.WriteLine($"   Overlap (5,5) vs (5,5):  {compositeSDRs[0].Overlap(compositeSDRs[3])} " +
+                          $"(same position → exact match)");
+
+        // ================================================================
+        // Section 3: Displacement Cells
+        // ================================================================
+        Console.WriteLine("\n3. DISPLACEMENT CELLS");
+        Console.WriteLine("   Encode the relative offset between two locations.");
+        Console.WriteLine("   Given a displacement + source → predict target location.\n");
+
+        var displacementModule = new DisplacementCellModule(size: 40, activeCells: 10, sigma: 1.5f);
+
+        // Create two grid cell locations at known positions
+        var gridA = new GridCellModule(new GridCellModuleConfig
+        {
+            ModuleSize = 40, ActiveCellCount = 10, Scale = 1.0f,
+            PathIntegrationNoise = 0.0f,
+        }, seed: 42);
+        var gridB = new GridCellModule(new GridCellModuleConfig
+        {
+            ModuleSize = 40, ActiveCellCount = 10, Scale = 1.0f,
+            PathIntegrationNoise = 0.0f,
+        }, seed: 42);
+
+        // Location A at (10, 10), Location B at (20, 15)
+        gridA.SetPosition(10.0f, 10.0f);
+        gridB.SetPosition(20.0f, 15.0f);
+        var locA = gridA.GetCurrentLocation();
+        var locB = gridB.GetCurrentLocation();
+
+        // Compute displacement A → B
+        var dispAB = displacementModule.ComputeDisplacement(locA, locB);
+        Console.WriteLine($"   Location A = (10, 10), Location B = (20, 15)");
+        Console.WriteLine($"   Displacement A→B: {dispAB.ActiveCount} active cells");
+
+        // Predict target B from source A + displacement
+        var predictedB = displacementModule.PredictTarget(locA, dispAB);
+        int predictionOverlap = locB.Overlap(predictedB);
+        Console.WriteLine($"   Predicted B from (A + disp): overlap with actual B = " +
+                          $"{predictionOverlap}/{locB.ActiveCount}");
+        Console.WriteLine($"   → Displacement prediction accuracy: " +
+                          $"{(predictionOverlap >= locB.ActiveCount / 2 ? "GOOD" : "POOR")} " +
+                          $"({100.0 * predictionOverlap / locB.ActiveCount:F0}%)");
+
+        // Predict source A from target B + displacement (reverse direction)
+        var predictedA = displacementModule.PredictSource(locB, dispAB);
+        int reverseOverlap = locA.Overlap(predictedA);
+        Console.WriteLine($"   Predicted A from (B - disp): overlap with actual A = " +
+                          $"{reverseOverlap}/{locA.ActiveCount}");
+
+        // Verify different displacements produce different SDRs
+        gridB.SetPosition(15.0f, 25.0f);
+        var locC = gridB.GetCurrentLocation();
+        var dispAC = displacementModule.ComputeDisplacement(locA, locC);
+        int dispOverlap = dispAB.Overlap(dispAC);
+        Console.WriteLine($"\n   Displacement A→B vs A→C: overlap = {dispOverlap} " +
+                          $"(different offsets → different SDRs)");
+
+        // ================================================================
+        // Section 4: Anchoring — Sensory Landmark Correction
+        // ================================================================
+        Console.WriteLine("\n4. GRID CELL ANCHORING");
+        Console.WriteLine("   Grid cells accumulate path integration error over time.");
+        Console.WriteLine("   Anchoring corrects drift by snapping to a known landmark.\n");
+
+        var driftyGrid = new GridCellModule(new GridCellModuleConfig
+        {
+            ModuleSize = 40, ActiveCellCount = 10,
+            PathIntegrationNoise = 0.05f,  // Moderate noise
+        }, seed: 99);
+
+        driftyGrid.SetPosition(10.0f, 10.0f);
+        var landmark = new SDR(256, Enumerable.Range(0, 256).Where(i => i % 20 < 3));
+
+        // Anchor at this position with a landmark
+        driftyGrid.Anchor(landmark);
+        var anchoredPos = driftyGrid.GetPosition();
+        Console.WriteLine($"   Anchored at ({anchoredPos.X:F1}, {anchoredPos.Y:F1}) with landmark");
+
+        // Move around — noise accumulates
+        for (int i = 0; i < 20; i++)
+            driftyGrid.Move(2.0f, 1.0f);
+        for (int i = 0; i < 20; i++)
+            driftyGrid.Move(-2.0f, -1.0f);
+
+        var driftedPos = driftyGrid.GetPosition();
+        float drift = MathF.Sqrt(
+            MathF.Pow(driftedPos.X - anchoredPos.X, 2) +
+            MathF.Pow(driftedPos.Y - anchoredPos.Y, 2));
+        Console.WriteLine($"   After 40 noisy moves (round trip): ({driftedPos.X:F1}, {driftedPos.Y:F1})");
+        Console.WriteLine($"   Drift from anchored position: {drift:F2} units");
+
+        // Re-anchor using the same landmark
+        driftyGrid.Anchor(landmark);
+        var correctedPos = driftyGrid.GetPosition();
+        float correction = MathF.Sqrt(
+            MathF.Pow(correctedPos.X - anchoredPos.X, 2) +
+            MathF.Pow(correctedPos.Y - anchoredPos.Y, 2));
+        Console.WriteLine($"   After re-anchoring: ({correctedPos.X:F1}, {correctedPos.Y:F1})");
+        Console.WriteLine($"   → Drift corrected: {drift:F2} → {correction:F2} units");
+
+        // ================================================================
+        // Section 5: Full Thousand Brains Object Learning & Recognition
+        // ================================================================
+        Console.WriteLine("\n5. THOUSAND BRAINS: OBJECT LEARNING & RECOGNITION");
+        Console.WriteLine("   Multiple cortical columns each maintain independent models.");
+        Console.WriteLine("   Grid cells provide location; voting produces consensus.\n");
+
+        var tbEngine = new ThousandBrainsEngine(new ThousandBrainsConfig
+        {
+            ColumnCount = 4,
+            ColumnConfig = new CorticalColumnConfig
+            {
+                InputSize = 256,
+                LocationSize = 1600,      // GridCellModule default: 40×40
+                ColumnCount = 512,
+                CellsPerColumn = 8,
+                ObjectRepresentationSize = 2048,
+                ObjectActiveBits = 40,
+            },
+            VotingConfig = new LateralVotingConfig
+            {
+                ConvergenceThreshold = 0.5f,
+                MaxIterations = 5,
+                VoteThreshold = 0.3f,
+            },
+            UseDisplacementCells = true,
+            DisplacementModuleSize = 40,
+        });
+
+        var featureEncoder = new CategoryEncoder(256, 15);
+
+        // --- Define objects ---
+        var cubeFaces = new[] { "flat", "edge", "corner", "flat", "edge", "corner" };
+        var cubeDeltas = new (float X, float Y)[]
+        {
+            (0, 0), (1, 0), (1, 1), (0, 1), (-1, 0), (-1, -1),
+        };
+        var sphereFaces = new[] { "smooth", "smooth", "smooth", "smooth", "seam" };
+        var sphereDeltas = new (float X, float Y)[]
+        {
+            (0, 0), (2, 0), (0, 2), (-2, 0), (0, -2),
+        };
+
+        // Interleave learning: both objects train the SP simultaneously,
+        // so column assignments reflect all inputs. Library SDRs are stored
+        // after all learning is complete, ensuring SP stability.
+        int learningCycles = 30;
+        Console.Write($"   Training both objects ({learningCycles} interleaved cycles)...");
+        for (int c = 0; c < learningCycles; c++)
+        {
+            // Cube
+            tbEngine.StartNewObject();
+            for (int t = 0; t < cubeFaces.Length; t++)
+            {
+                var feature = featureEncoder.Encode(cubeFaces[t]);
+                var patches = Enumerable.Repeat(feature, 4).ToArray();
+                tbEngine.Process(patches, cubeDeltas[t].X, cubeDeltas[t].Y, learn: true);
+            }
+            // Sphere
+            tbEngine.StartNewObject();
+            for (int t = 0; t < sphereFaces.Length; t++)
+            {
+                var feature = featureEncoder.Encode(sphereFaces[t]);
+                var patches = Enumerable.Repeat(feature, 4).ToArray();
+                tbEngine.Process(patches, sphereDeltas[t].X, sphereDeltas[t].Y, learn: true);
+            }
+        }
+        Console.WriteLine(" done");
+
+        // Store library SDRs from one final pass of each object
+        tbEngine.StartNewObject();
+        for (int t = 0; t < cubeFaces.Length; t++)
+        {
+            var feature = featureEncoder.Encode(cubeFaces[t]);
+            var patches = Enumerable.Repeat(feature, 4).ToArray();
+            tbEngine.Process(patches, cubeDeltas[t].X, cubeDeltas[t].Y, learn: false);
+        }
+        tbEngine.LearnObject("cube");
+
+        tbEngine.StartNewObject();
+        for (int t = 0; t < sphereFaces.Length; t++)
+        {
+            var feature = featureEncoder.Encode(sphereFaces[t]);
+            var patches = Enumerable.Repeat(feature, 4).ToArray();
+            tbEngine.Process(patches, sphereDeltas[t].X, sphereDeltas[t].Y, learn: false);
+        }
+        tbEngine.LearnObject("sphere");
+
+        // --- Recognition test: cube ---
+        Console.WriteLine("\n   Recognition test — touching a cube:");
+        tbEngine.StartNewObject();
+        var testTouches = new[] { ("flat", 0f, 0f), ("edge", 1f, 0f), ("corner", 1f, 1f) };
+        for (int t = 0; t < testTouches.Length; t++)
+        {
+            var (feat, dx, dy) = testTouches[t];
+            var feature = featureEncoder.Encode(feat);
+            var patches = Enumerable.Repeat(feature, 4).ToArray();
+            var result = tbEngine.Process(patches, dx, dy, learn: false);
+
+            string recognized = result.RecognizedObject ?? "unknown";
+            Console.WriteLine($"     Touch {t}: '{feat}' → recognized='{recognized}' " +
+                              $"(conf={result.RecognitionConfidence:P0}, " +
+                              $"converged={result.Converged}, " +
+                              $"iters={result.VotingIterations}, " +
+                              $"disp_pred={result.PredictedNextLocation != null})");
+        }
+
+        // --- Recognition test: sphere ---
+        Console.WriteLine("\n   Recognition test — touching a sphere:");
+        tbEngine.StartNewObject();
+        var sphereTest = new[] { ("smooth", 0f, 0f), ("smooth", 2f, 0f), ("seam", 0f, 2f) };
+        for (int t = 0; t < sphereTest.Length; t++)
+        {
+            var (feat, dx, dy) = sphereTest[t];
+            var feature = featureEncoder.Encode(feat);
+            var patches = Enumerable.Repeat(feature, 4).ToArray();
+            var result = tbEngine.Process(patches, dx, dy, learn: false);
+
+            string recognized = result.RecognizedObject ?? "unknown";
+            Console.WriteLine($"     Touch {t}: '{feat}' → recognized='{recognized}' " +
+                              $"(conf={result.RecognitionConfidence:P0}, " +
+                              $"converged={result.Converged}, " +
+                              $"iters={result.VotingIterations})");
+        }
+
+        // --- Summary: object library ---
+        var library = tbEngine.GetObjectLibrary();
+        Console.WriteLine($"\n   Object library: {library.Count} objects learned");
+        foreach (var (name, sdr) in library)
+            Console.WriteLine($"     '{name}': {sdr.ActiveCount} active bits in consensus SDR");
+
+        Console.WriteLine("\n   The Thousand Brains Theory: each cortical column maintains its own");
+        Console.WriteLine("   complete model of every object, using grid cell reference frames for");
+        Console.WriteLine("   location. Recognition emerges from consensus across columns.");
+    }
+
+    /// Example 8: GeospatialEncoder and DeltaEncoder
+    ///
+    /// Exercises the two remaining untested encoder types:
+    ///   - GeospatialEncoder: multi-scale spatial encoding for GPS coordinates
+    ///   - DeltaEncoder: stateful encoder that encodes changes between values
+    ///
+    /// Both are combined into an anomaly detection pipeline tracking a vehicle
+    /// on a known route, with GPS and speed delta encoding.
+    public static void RunEncoderDemo()
+    {
+        Console.WriteLine("GeospatialEncoder & DeltaEncoder — Specialized Encoder Demo");
+        Console.WriteLine(new string('=', 72));
+
+        // ================================================================
+        // Section 1: GeospatialEncoder — Multi-scale GPS encoding
+        // ================================================================
+        Console.WriteLine("\n1. GEOSPATIAL ENCODER");
+        Console.WriteLine("   Encodes (lat, lon) at multiple spatial scales.");
+        Console.WriteLine("   Nearby locations share bits; distant ones don't.\n");
+
+        // 5 scales from ~11km down to ~43m resolution.
+        // Each scale is 4x finer: 0.1, 0.025, 0.00625, 0.00156, 0.00039 degrees.
+        // This provides a smooth overlap gradient across urban distances.
+        var geoEncoder = new GeospatialEncoder(
+            scales: 5,
+            bitsPerScale: 128,
+            activeBitsPerScale: 7,
+            maxRadiusDegrees: 0.1);
+
+        Console.WriteLine($"   Output size: {geoEncoder.OutputSize} bits, " +
+                          $"~{5 * 7} active bits per encoding");
+        Console.WriteLine("   Scales: ~11km → ~2.8km → ~700m → ~170m → ~43m");
+
+        // Encode several locations: NYC landmarks
+        var locations = new (string Name, double Lat, double Lon)[]
+        {
+            ("Times Square",    40.7580, -73.9855),
+            ("Central Park",    40.7829, -73.9654),  // ~2.8 km north
+            ("Brooklyn Bridge", 40.7061, -73.9969),  // ~6 km south
+            ("JFK Airport",     40.6413, -73.7781),  // ~20 km southeast
+            ("Times Square 2",  40.7580, -73.9855),  // Exact repeat
+        };
+
+        var geoSDRs = new SDR[locations.Length];
+        for (int i = 0; i < locations.Length; i++)
+        {
+            geoSDRs[i] = geoEncoder.Encode((locations[i].Lat, locations[i].Lon));
+            Console.WriteLine($"   {locations[i].Name,-18}: {geoSDRs[i].ActiveCount} active bits");
+        }
+
+        Console.WriteLine($"\n   {"A",-18} vs {"B",-18} | Overlap | Relationship");
+        Console.WriteLine($"   {"",18}    {"",18} |         |");
+
+        void ShowGeoOverlap(int a, int b, string relationship)
+        {
+            int overlap = geoSDRs[a].Overlap(geoSDRs[b]);
+            Console.WriteLine($"   {locations[a].Name,-18} vs {locations[b].Name,-18} | {overlap,7} | {relationship}");
+        }
+
+        ShowGeoOverlap(0, 4, "Same location → full match");
+        ShowGeoOverlap(0, 1, "~3 km → coarse scales share bits");
+        ShowGeoOverlap(0, 2, "~6 km → fewer shared scales");
+        ShowGeoOverlap(0, 3, "~20 km → different at all scales");
+
+        // Smeared encoding: smooth transitions at grid boundaries
+        Console.Write("\n   Smeared encoding: ");
+        var smeared = geoEncoder.EncodeSmeared((40.7580, -73.9855));
+        Console.WriteLine($"{smeared.ActiveCount} active bits (vs {geoSDRs[0].ActiveCount} plain) — " +
+                          $"activates neighboring grid cells for smoother transitions");
+
+        // ================================================================
+        // Section 2: DeltaEncoder — Change-based encoding
+        // ================================================================
+        Console.WriteLine("\n2. DELTA ENCODER");
+        Console.WriteLine("   Encodes the change between consecutive values.");
+        Console.WriteLine("   Patterns in derivatives repeat regardless of baseline.\n");
+
+        var deltaEncoder = new DeltaEncoder(
+            size: 200, activeBits: 11, minDelta: -10, maxDelta: 10);
+
+        // Feed a signal with repeating delta pattern at different baselines
+        Console.WriteLine("   Signal: baseline shifts but delta pattern repeats");
+        Console.WriteLine($"   {"Step",5} | {"Value",6} | {"Delta",6} | Active bits");
+
+        double[] signal = {
+            // Rising pattern at baseline 0
+            0, 3, 5, 8, 5, 3, 0,
+            // Same pattern at baseline 50
+            50, 53, 55, 58, 55, 53, 50,
+        };
+
+        var deltaSdrs = new SDR[signal.Length];
+        deltaEncoder.Reset();
+        for (int i = 0; i < signal.Length; i++)
+        {
+            deltaSdrs[i] = deltaEncoder.Encode(signal[i]);
+            double delta = i > 0 ? signal[i] - signal[i - 1] : 0;
+            Console.WriteLine($"   {i,5} | {signal[i],6:F0} | {delta,+6:F0} | {deltaSdrs[i].ActiveCount}");
+        }
+
+        // Compare matching delta positions across baselines
+        Console.WriteLine($"\n   Same delta patterns at different baselines:");
+        Console.WriteLine($"   Step 1 (0→3)  vs Step 8 (50→53):  overlap = {deltaSdrs[1].Overlap(deltaSdrs[8])} " +
+                          $"(both Δ=+3)");
+        Console.WriteLine($"   Step 2 (3→5)  vs Step 9 (53→55):  overlap = {deltaSdrs[2].Overlap(deltaSdrs[9])} " +
+                          $"(both Δ=+2)");
+        Console.WriteLine($"   Step 4 (8→5)  vs Step 11 (58→55): overlap = {deltaSdrs[4].Overlap(deltaSdrs[11])} " +
+                          $"(both Δ=-3)");
+        Console.WriteLine($"   Step 1 (Δ=+3) vs Step 4 (Δ=-3):  overlap = {deltaSdrs[1].Overlap(deltaSdrs[4])} " +
+                          $"(opposite deltas → different)");
+        Console.WriteLine("   → Same deltas produce identical encodings regardless of absolute value.");
+
+        // ================================================================
+        // Section 3: Combined pipeline — GPS route anomaly detection
+        // ================================================================
+        Console.WriteLine("\n3. COMBINED PIPELINE: GPS ROUTE ANOMALY DETECTION");
+        Console.WriteLine("   A vehicle follows a known route. We encode GPS + speed delta");
+        Console.WriteLine("   and detect deviations using SP + TM.\n");
+
+        // Build a composite encoder with geospatial + delta
+        var speedDelta = new DeltaEncoder(size: 200, activeBits: 11, minDelta: -30, maxDelta: 30);
+        var routeEncoder = new CompositeEncoder()
+            .AddEncoder("location", geoEncoder)
+            .AddEncoder("speed_delta", speedDelta);
+
+        var sp = new SpatialPooler(new SpatialPoolerConfig
+        {
+            InputSize = routeEncoder.TotalSize,
+            ColumnCount = 1024,
+            TargetSparsity = 0.02f,
+        });
+        var tm = new TemporalMemory(new TemporalMemoryConfig
+        {
+            ColumnCount = 1024,
+            CellsPerColumn = 16,
+        });
+
+        // Define a simple route: 10 waypoints along a path
+        var route = new (double Lat, double Lon, double Speed)[]
+        {
+            (40.758, -73.985, 20),  // Times Sq, slow
+            (40.762, -73.980, 35),  // Accelerating north
+            (40.768, -73.975, 45),  // Cruising
+            (40.775, -73.968, 45),  // Cruising
+            (40.780, -73.964, 40),  // Approaching park
+            (40.783, -73.965, 25),  // Slowing for park
+            (40.783, -73.970, 20),  // Turning west
+            (40.780, -73.975, 30),  // Heading south
+            (40.770, -73.980, 40),  // Cruising south
+            (40.760, -73.984, 25),  // Slowing, back to start area
+        };
+
+        // Phase 1: SP pre-training
+        Console.Write("   SP pre-training (50 cycles)...");
+        speedDelta.Reset();
+        for (int c = 0; c < 50; c++)
+        {
+            speedDelta.Reset();
+            foreach (var (lat, lon, speed) in route)
+            {
+                var encoded = routeEncoder.Encode(new Dictionary<string, object>
+                {
+                    ["location"] = (lat, lon),
+                    ["speed_delta"] = speed,
+                });
+                sp.Compute(encoded, learn: true);
+            }
+        }
+        Console.WriteLine(" done");
+
+        // Phase 2: TM sequence learning
+        Console.Write("   TM learning (20 cycles)...");
+        for (int c = 0; c < 20; c++)
+        {
+            speedDelta.Reset();
+            tm.Reset();
+            foreach (var (lat, lon, speed) in route)
+            {
+                var encoded = routeEncoder.Encode(new Dictionary<string, object>
+                {
+                    ["location"] = (lat, lon),
+                    ["speed_delta"] = speed,
+                });
+                var cols = sp.Compute(encoded, learn: false);
+                tm.Compute(cols, learn: true);
+            }
+        }
+        Console.WriteLine(" done");
+
+        // Phase 3: Test with normal route + deviations
+        Console.WriteLine($"\n   {"Step",5} | {"Type",9} | {"Anomaly",7} | Location");
+
+        // Normal run
+        speedDelta.Reset();
+        tm.Reset();
+        float normalAvg = 0;
+        for (int i = 0; i < route.Length; i++)
+        {
+            var (lat, lon, speed) = route[i];
+            var encoded = routeEncoder.Encode(new Dictionary<string, object>
+            {
+                ["location"] = (lat, lon),
+                ["speed_delta"] = speed,
+            });
+            var cols = sp.Compute(encoded, learn: false);
+            var tmOut = tm.Compute(cols, learn: false);
+            normalAvg += tmOut.Anomaly;
+            if (i == 0 || i == route.Length - 1)
+                Console.WriteLine($"   {i,5} | {"Normal",9} | {tmOut.Anomaly * 100,5:F0} % | ({lat:F3}, {lon:F3})");
+        }
+        normalAvg /= route.Length;
+        Console.WriteLine($"   {"",5}   {"",9}   avg = {normalAvg * 100:F0} %");
+
+        // Deviated run: take a wrong turn at step 5
+        var devRoute = route.ToArray();
+        devRoute[5] = (40.790, -73.960, 50);  // Wrong direction, speeding
+        devRoute[6] = (40.795, -73.955, 55);  // Further off route
+
+        speedDelta.Reset();
+        tm.Reset();
+        for (int i = 0; i < devRoute.Length; i++)
+        {
+            var (lat, lon, speed) = devRoute[i];
+            var encoded = routeEncoder.Encode(new Dictionary<string, object>
+            {
+                ["location"] = (lat, lon),
+                ["speed_delta"] = speed,
+            });
+            var cols = sp.Compute(encoded, learn: false);
+            var tmOut = tm.Compute(cols, learn: false);
+            string kind = (i == 5 || i == 6) ? "DEVIATED" : "Normal";
+            if (i >= 4 && i <= 7)
+                Console.WriteLine($"   {i,5} | {kind,9} | {tmOut.Anomaly * 100,5:F0} % | ({lat:F3}, {lon:F3})");
+        }
+
+        Console.WriteLine("\n   Expected: low anomaly on the learned route, high anomaly at deviations.");
     }
 }
