@@ -3098,7 +3098,7 @@ public sealed class ThousandBrainsEngine
                 Orientation = i * MathF.PI / config.ColumnCount, // Spread orientations
             }).ToArray();
 
-        var gridConfigs = config.GridModuleConfigs ?? defaultGridConfigs;
+        var gridConfigs = config.GridModuleConfigs.Length > 0 ? config.GridModuleConfigs : defaultGridConfigs;
 
         _gridModules = new GridCellModule[config.ColumnCount];
         _columns = new CorticalColumn[config.ColumnCount];
