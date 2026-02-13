@@ -7,20 +7,24 @@ using HierarchicalTemporalMemory.Enhanced;
 Console.WriteLine("=== CortexSharp — Running Examples ===");
 Console.WriteLine();
 
-Console.WriteLine("[1/4] Single-Stream Anomaly Detection (Hot Gym) — 1000 steps");
+Console.WriteLine("[1/5] Single-Stream Anomaly Detection (Hot Gym) — 1000 steps");
 RunSingleStreamSmall();
 Console.WriteLine();
 
-Console.WriteLine("[2/4] Network API Pipeline");
+Console.WriteLine("[2/5] Network API Pipeline");
 HtmExamples.RunNetworkApiDemo();
 Console.WriteLine();
 
-Console.WriteLine("[3/4] Thousand Brains Object Recognition");
+Console.WriteLine("[3/5] Thousand Brains Object Recognition");
 HtmExamples.RunThousandBrainsDemo();
 Console.WriteLine();
 
-Console.WriteLine("[4/4] Hierarchical Temporal Memory");
+Console.WriteLine("[4/5] Hierarchical Temporal Memory");
 HtmExamples.RunHierarchicalDemo();
+Console.WriteLine();
+
+Console.WriteLine("[5/5] Machine Monitoring with Fault Detection");
+HtmExamples.RunMachineMonitoringDemo();
 Console.WriteLine();
 
 Console.WriteLine("=== All examples completed ===");

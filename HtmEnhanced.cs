@@ -5209,4 +5209,211 @@ public static class HtmExamples
         Console.WriteLine($"\nCompleted {totalSteps} steps ({totalSteps / (elementsPerSeq * subsequences.Length)} full cycles).");
         Console.WriteLine("Expected: L1 anomaly near 0% after ~2 cycles; L2 anomaly drops over ~10+ cycles.");
     }
+
+    /// Example 5: Multi-sensor machine monitoring with fault injection
+    ///
+    /// Models an industrial pump with a repeating 10-step duty cycle:
+    ///   Idle → Startup → Peak → Steady → Cooldown → (repeat)
+    ///
+    /// Three sensor streams (temperature, vibration, RPM) are encoded into a
+    /// single SDR and fed through SP → TM.  The SP is pre-trained first to
+    /// stabilize column assignments before TM sequence learning begins (this
+    /// two-phase approach mirrors standard HTM deployment practice).
+    ///
+    /// After the TM converges, three faults are injected:
+    ///   1. Bearing wear  — vibration drifts upward during the steady phase
+    ///   2. Overheating   — temperature spikes during peak
+    ///   3. Stall         — RPM drops to zero mid-cycle
+    /// Each fault should produce a clear anomaly spike on a background of ~0%.
+    public static void RunMachineMonitoringDemo()
+    {
+        Console.WriteLine("Machine Monitoring Demo: 3-sensor pump with fault injection");
+        Console.WriteLine("Sensors: temperature (°C), vibration (mm/s), RPM");
+        Console.WriteLine("Duty cycle: Idle→Startup→Peak→Steady→Cooldown (10 steps)\n");
+
+        // ---- Encoder ----
+        // Three RDSE fields, one per sensor.  Resolutions chosen so that the
+        // normal operating range spans ~20-30 encoder buckets per sensor.
+        var encoder = new CompositeEncoder()
+            .AddEncoder("temperature", new RandomDistributedScalarEncoder(
+                size: 200, activeBits: 11, resolution: 2.0))
+            .AddEncoder("vibration", new RandomDistributedScalarEncoder(
+                size: 200, activeBits: 11, resolution: 0.3))
+            .AddEncoder("rpm", new RandomDistributedScalarEncoder(
+                size: 200, activeBits: 11, resolution: 100.0));
+
+        // ---- SP & TM (used directly for explicit two-phase training) ----
+        var sp = new SpatialPooler(new SpatialPoolerConfig
+        {
+            InputSize = encoder.TotalSize,
+            ColumnCount = 2048,
+            TargetSparsity = 0.02f,
+        });
+        var tm = new TemporalMemory(new TemporalMemoryConfig
+        {
+            ColumnCount = 2048,
+            CellsPerColumn = 32,
+        });
+
+        // ---- Duty cycle definition ----
+        // Each step is (temperature, vibration, rpm).
+        // 10 steps form one complete pump cycle.
+        var dutyCycle = new (double temp, double vib, double rpm)[]
+        {
+            // Idle (2 steps)
+            (25, 0.5, 0),
+            (25, 0.5, 0),
+            // Startup (2 steps)
+            (35, 2.0, 1000),
+            (50, 4.0, 2000),
+            // Peak (2 steps)
+            (72, 3.5, 2800),
+            (75, 3.2, 2800),
+            // Steady (2 steps)
+            (68, 2.8, 2600),
+            (65, 2.5, 2600),
+            // Cooldown (2 steps)
+            (45, 1.5, 1000),
+            (30, 0.8, 200),
+        };
+        int cycleLen = dutyCycle.Length;
+
+        // ---- Phase 1: Pre-train the SP ----
+        // Run the duty cycle through the SP many times so that column
+        // assignments stabilize before TM begins forming segments.
+        int spTrainingCycles = 50;
+        Console.Write($"Phase 1: SP pre-training ({spTrainingCycles} cycles)...");
+        for (int c = 0; c < spTrainingCycles; c++)
+        {
+            for (int p = 0; p < cycleLen; p++)
+            {
+                var (t, v, r) = dutyCycle[p];
+                var data = new Dictionary<string, object>
+                {
+                    ["temperature"] = t, ["vibration"] = v, ["rpm"] = r,
+                };
+                sp.Compute(encoder.Encode(data), learn: true);
+            }
+        }
+        Console.WriteLine(" done");
+
+        // Verify stability: same input → same columns
+        var probe0a = sp.Compute(encoder.Encode(new Dictionary<string, object>
+            { ["temperature"] = 25.0, ["vibration"] = 0.5, ["rpm"] = 0.0 }), learn: false);
+        var probe0b = sp.Compute(encoder.Encode(new Dictionary<string, object>
+            { ["temperature"] = 25.0, ["vibration"] = 0.5, ["rpm"] = 0.0 }), learn: false);
+        int probeOverlap = probe0a.ActiveBits.ToArray()
+            .Intersect(probe0b.ActiveBits.ToArray()).Count();
+        Console.WriteLine($"SP stability check: {probeOverlap}/{probe0a.ActiveCount} " +
+                          $"column overlap on repeated input\n");
+
+        // ---- Phase 2: TM sequence learning + fault injection ----
+        int tmTrainingCycles = 10;
+        int faultCycles = 3;
+        int gapCycles = 5;
+
+        int faultStart1 = tmTrainingCycles * cycleLen;
+        int faultEnd1 = faultStart1 + faultCycles * cycleLen;
+        int faultStart2 = faultEnd1 + gapCycles * cycleLen;
+        int faultEnd2 = faultStart2 + faultCycles * cycleLen;
+        int faultStart3 = faultEnd2 + gapCycles * cycleLen;
+        int faultEnd3 = faultStart3 + faultCycles * cycleLen;
+        int totalSteps = faultEnd3;
+
+        Console.WriteLine($"Phase 2: TM learning ({tmTrainingCycles} cycles) → " +
+                          $"bearing wear → gap → overheat → gap → stall");
+        Console.WriteLine($"Total: {totalSteps} steps ({totalSteps / cycleLen} cycles)\n");
+
+        Console.WriteLine($"{"Step",5} {"Cyc",4} {"Phase",9} {"Temp",5} {"Vib",5} {"RPM",5}  " +
+                          $"{"Anomaly",8} {"Burst",5} {"Pred",5}  Fault");
+        Console.WriteLine(new string('-', 75));
+
+        int lastPrintedCycle = -1;
+
+        for (int step = 0; step < totalSteps; step++)
+        {
+            int phase = step % cycleLen;
+            int cycle = step / cycleLen;
+            var (temp, vib, rpm) = dutyCycle[phase];
+
+            // ---- Fault injection ----
+            string fault = "";
+            if (step >= faultStart1 && step < faultEnd1)
+            {
+                // Bearing wear: vibration increases 2-3x during steady/peak phases
+                if (phase >= 4 && phase <= 7)
+                {
+                    vib += 5.0 + 2.0 * ((step - faultStart1) / (double)(faultEnd1 - faultStart1));
+                    fault = "BEARING";
+                }
+            }
+            else if (step >= faultStart2 && step < faultEnd2)
+            {
+                // Overheat: temperature spikes +30°C during peak
+                if (phase >= 4 && phase <= 5)
+                {
+                    temp += 30;
+                    fault = "OVERHEAT";
+                }
+            }
+            else if (step >= faultStart3 && step < faultEnd3)
+            {
+                // Stall: RPM drops to 0, vibration spikes during what should be peak/steady
+                if (phase >= 3 && phase <= 7)
+                {
+                    rpm = 0;
+                    vib = 8.0;
+                    fault = "STALL";
+                }
+            }
+
+            var data = new Dictionary<string, object>
+            {
+                ["temperature"] = temp,
+                ["vibration"] = vib,
+                ["rpm"] = rpm,
+            };
+
+            // SP: no further learning (already pre-trained)
+            SDR activeColumns = sp.Compute(encoder.Encode(data), learn: false);
+            // TM: learn only during normal operation (not during faults)
+            bool tmLearn = step < faultStart1;
+            var tmOut = tm.Compute(activeColumns, learn: tmLearn);
+            float anomaly = tmOut.Anomaly;
+
+            // Print: first 2 cycles, every 5th cycle start, fault transitions, last step
+            bool isCycleStart = phase == 0 && cycle != lastPrintedCycle;
+            bool isFaultBoundary = step == faultStart1 || step == faultEnd1
+                                || step == faultStart2 || step == faultEnd2
+                                || step == faultStart3 || step == faultEnd3;
+            bool shouldPrint = (cycle < 2 && phase == 0)
+                            || (isCycleStart && cycle % 5 == 0)
+                            || isFaultBoundary
+                            || fault.Length > 0
+                            || step == totalSteps - 1;
+
+            string phaseName = phase switch
+            {
+                0 or 1 => "Idle",
+                2 or 3 => "Startup",
+                4 or 5 => "Peak",
+                6 or 7 => "Steady",
+                _      => "Cooldown",
+            };
+
+            if (shouldPrint)
+            {
+                lastPrintedCycle = cycle;
+                Console.WriteLine(
+                    $"{step,5} {cycle,4} {phaseName,9} {temp,5:F0} {vib,5:F1} {rpm,5:F0}  " +
+                    $"{anomaly * 100,5:F0} %  {tmOut.BurstingColumnCount,5} {tmOut.PredictedActiveColumnCount,5}  {fault}");
+            }
+        }
+
+        // ---- Summary ----
+        Console.WriteLine($"\nSegments: {tm.TotalSegmentCount:N0}, " +
+                          $"Synapses: {tm.TotalSynapseCount:N0}");
+        Console.WriteLine("\nExpected: anomaly ≈ 0% during normal operation after ~4 cycles, " +
+                          "clear spikes during each fault window.");
+    }
 }
