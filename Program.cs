@@ -20,6 +20,33 @@ using HierarchicalTemporalMemory.Enhanced;
 //   dotnet run multistream  — concurrent multi-stream processing
 //   dotnet run gridcells    — grid cells, displacement cells, Thousand Brains
 //   dotnet run encoders     — GeospatialEncoder, DeltaEncoder, GPS route
+//   dotnet run textpredict  — character-level text prediction
+// ============================================================================
+//
+// ============================================================================
+// Future application examples (TODO):
+//
+//   - Network intrusion detection: encode packet metadata (port, protocol,
+//     payload size, inter-arrival time) with CompositeEncoder, detect anomalous
+//     traffic patterns via SP+TM online anomaly detection.
+//
+//   - Server log anomaly detection: encode log event types (CategoryEncoder) +
+//     timestamps (DateTimeEncoder) + response times (RDSE), learn normal event
+//     sequences, flag error cascades and unusual request orderings.
+//
+//   - Clickstream / user behavior prediction: encode page categories + time-on-page
+//     + navigation actions, learn typical browsing patterns, flag bot traffic or
+//     compromised accounts via sequence anomaly.
+//
+//   - Spatial object recognition with touch: extend the 1000brains example into
+//     a more tangible demo — simulate a robotic finger exploring 2D/3D shapes,
+//     using grid cells for location and feature encoders for curvature/texture.
+//
+//   - ECG/heartbeat anomaly detection: encode heart rate + R-R interval with
+//     ScalarEncoder/DeltaEncoder, detect arrhythmias as temporal anomalies.
+//
+//   - Music sequence learning: encode MIDI-like note/duration/velocity,
+//     learn melodic patterns, predict next notes in a sequence.
 // ============================================================================
 
 var examples = new (string Name, string Description, Action Run)[]
@@ -35,6 +62,7 @@ var examples = new (string Name, string Description, Action Run)[]
         () => HtmExamples.RunMultiStreamDemo().GetAwaiter().GetResult()),
     ("gridcells",    "Grid Cells — path integration, displacement, 1000 Brains", HtmExamples.RunGridCellDemo),
     ("encoders",     "Encoders — GeospatialEncoder + DeltaEncoder + GPS route",  HtmExamples.RunEncoderDemo),
+    ("textpredict",  "Text Prediction — character-level sequence learning",     HtmExamples.RunTextPredictionDemo),
 };
 
 string selected = args.Length > 0 ? args[0].ToLowerInvariant() : "";

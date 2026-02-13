@@ -6197,4 +6197,295 @@ public static class HtmExamples
 
         Console.WriteLine("\n   Expected: low anomaly on the learned route, high anomaly at deviations.");
     }
+
+    /// Example: Character-Level Text Prediction
+    ///
+    /// Demonstrates HTM sequence learning on character sequences. A CategoryEncoder
+    /// maps each character to a unique SDR, the Spatial Pooler creates stable column
+    /// representations, and Temporal Memory learns which characters follow which.
+    ///
+    /// After training on two phrases with shared structure:
+    ///   "the cat sat on the mat"
+    ///   "the bat sat on the hat"
+    ///
+    /// The system demonstrates:
+    ///   1. Anomaly dropping as character sequences become familiar
+    ///   2. Branching predictions at ambiguous points ("the " -> 'c' or 'b')
+    ///   3. Context-dependent disambiguation ("the c" -> only 'a')
+    ///   4. High anomaly on novel character sequences
+    ///   5. Free-running text generation from a seed prefix
+    public static void RunTextPredictionDemo()
+    {
+        Console.WriteLine("Character-Level Text Prediction");
+        Console.WriteLine(new string('=', 72));
+        Console.WriteLine("HTM learns to predict the next character in text, using the same");
+        Console.WriteLine("mechanisms the neocortex uses for sequence learning.\n");
+
+        // ---- Training corpus ----
+        // Two phrases that share structure but branch at key points.
+        // "the [c/b]at sat on the [m/h]at"
+        // This tests disambiguation: after "the ", TM should predict both 'c' and 'b'.
+        // After "the c", it narrows to 'a' (then "t sat on the mat").
+        string[] phrases =
+        {
+            "the cat sat on the mat",
+            "the bat sat on the hat",
+        };
+
+        Console.WriteLine("Training corpus:");
+        foreach (string p in phrases)
+            Console.WriteLine($"  \"{p}\"");
+
+        var allChars = phrases.SelectMany(p => p).Distinct().OrderBy(c => c).ToList();
+        Console.WriteLine($"\nVocabulary: {allChars.Count} characters " +
+                          $"[{string.Join("", allChars.Select(c => c == ' ' ? '_' : c))}]");
+
+        // ---- Encoder: each character -> distinct SDR ----
+        var charEncoder = new CategoryEncoder(size: 400, activeBits: 21);
+        foreach (char c in allChars)
+            charEncoder.AddCategory(c.ToString());
+
+        // ---- SP + TM ----
+        // 2048 columns at 2% sparsity = 41 active columns per character.
+        // 32 cells per column = enough context capacity to disambiguate
+        // the same character appearing in different positions across both phrases.
+        int columnCount = 2048;
+        int cellsPerColumn = 32;
+
+        var sp = new SpatialPooler(new SpatialPoolerConfig
+        {
+            InputSize = 400,
+            ColumnCount = columnCount,
+            TargetSparsity = 0.02f,
+        });
+        var tm = new TemporalMemory(new TemporalMemoryConfig
+        {
+            ColumnCount = columnCount,
+            CellsPerColumn = cellsPerColumn,
+        });
+
+        // ---- Phase 1: SP pre-training ----
+        Console.Write("\nPhase 1: SP pre-training (50 cycles)...");
+        for (int c = 0; c < 50; c++)
+            foreach (char ch in allChars)
+                sp.Compute(charEncoder.Encode(ch.ToString()), learn: true);
+        Console.WriteLine(" done");
+
+        // Build character -> active columns mapping (for decoding predictions)
+        var charToColumns = new Dictionary<char, HashSet<int>>();
+        foreach (char ch in allChars)
+        {
+            var cols = sp.Compute(charEncoder.Encode(ch.ToString()), learn: false);
+            charToColumns[ch] = new HashSet<int>(cols.ActiveBits.ToArray());
+        }
+
+        // ---- Phase 2: TM sequence learning ----
+        int trainingCycles = 50;
+        Console.Write($"Phase 2: TM sequence learning ({trainingCycles} cycles)...");
+
+        var cycleAnomalies = new float[trainingCycles];
+        for (int cycle = 0; cycle < trainingCycles; cycle++)
+        {
+            float totalAnomaly = 0;
+            int charCount = 0;
+            foreach (string phrase in phrases)
+            {
+                tm.Reset();
+                foreach (char ch in phrase)
+                {
+                    var cols = sp.Compute(charEncoder.Encode(ch.ToString()), learn: false);
+                    var tmOut = tm.Compute(cols, learn: true);
+                    totalAnomaly += tmOut.Anomaly;
+                    charCount++;
+                }
+            }
+            cycleAnomalies[cycle] = totalAnomaly / charCount;
+        }
+        Console.WriteLine(" done\n");
+
+        // Show learning curve
+        Console.WriteLine("Learning curve (avg anomaly per training cycle):");
+        int[] milestones = { 1, 5, 10, 25, trainingCycles };
+        foreach (int m in milestones)
+            Console.WriteLine($"  Cycle {m,2}: {cycleAnomalies[m - 1] * 100,5:F1}%");
+
+        // Helper: map predictive cells to predicted characters with scores
+        List<(char Ch, int Score)> PredictChars(HashSet<int> predictiveCells)
+        {
+            var predictedCols = new HashSet<int>();
+            foreach (int cell in predictiveCells)
+                predictedCols.Add(cell / cellsPerColumn);
+
+            var scores = new List<(char Ch, int Score)>();
+            foreach (char candidate in allChars)
+            {
+                int score = charToColumns[candidate].Count(c => predictedCols.Contains(c));
+                if (score > 0)
+                    scores.Add((candidate, score));
+            }
+            // Sort by score descending, then alphabetically for determinism
+            scores.Sort((a, b) =>
+            {
+                int cmp = b.Score.CompareTo(a.Score);
+                return cmp != 0 ? cmp : a.Ch.CompareTo(b.Ch);
+            });
+            return scores;
+        }
+
+        char DisplayChar(char c) => c == ' ' ? '_' : c;
+
+        // ================================================================
+        // Section 1: Character-by-character prediction on learned text
+        // ================================================================
+        Console.WriteLine($"\n{new string('-', 72)}");
+        Console.WriteLine("1. SEQUENCE REPLAY -- predictions on learned text\n");
+        Console.WriteLine($"   Feeding: \"{phrases[0]}\"\n");
+        Console.WriteLine($"   {"Pos",3} {"Char",5} {"Anom",5} | Predicted next (* = top match, ~ = in set)");
+
+        string testPhrase = phrases[0];
+        tm.Reset();
+        for (int i = 0; i < testPhrase.Length; i++)
+        {
+            char ch = testPhrase[i];
+            var cols = sp.Compute(charEncoder.Encode(ch.ToString()), learn: false);
+            var tmOut = tm.Compute(cols, learn: false);
+
+            var scores = PredictChars(tmOut.PredictiveCells);
+
+            string predictions = scores.Count > 0
+                ? string.Join(" ", scores.Take(4).Select(s =>
+                    $"'{DisplayChar(s.Ch)}'({s.Score})"))
+                : "(none)";
+
+            // Mark if actual next char is in predictions
+            string marker = "";
+            if (i + 1 < testPhrase.Length)
+            {
+                char nextCh = testPhrase[i + 1];
+                if (scores.Count > 0 && scores[0].Ch == nextCh)
+                    marker = " *";
+                else if (scores.Any(s => s.Ch == nextCh))
+                    marker = " ~";
+            }
+
+            Console.WriteLine($"   {i,3}  '{DisplayChar(ch)}'  {tmOut.Anomaly * 100,4:F0}% | {predictions}{marker}");
+        }
+
+        // ================================================================
+        // Section 2: Branching predictions
+        // ================================================================
+        Console.WriteLine($"\n{new string('-', 72)}");
+        Console.WriteLine("2. BRANCHING PREDICTIONS -- disambiguation at shared prefixes\n");
+        Console.WriteLine("   The same prefix \"the \" appears in both phrases but leads");
+        Console.WriteLine("   to different continuations. TM predicts all valid next chars.\n");
+
+        var prefixes = new[]
+        {
+            ("the ", "Ambiguous start -> expects both 'c' and 'b'"),
+            ("the c", "After 'c' -> narrowed to phrase A -> expects 'a'"),
+            ("the b", "After 'b' -> narrowed to phrase B -> expects 'a'"),
+            ("the cat sat on the ", "Deep in phrase A -> expects 'm'"),
+            ("the bat sat on the ", "Deep in phrase B -> expects 'h'"),
+        };
+
+        foreach (var (prefix, explanation) in prefixes)
+        {
+            tm.Reset();
+            TemporalMemoryOutput lastOutput = null;
+            foreach (char ch in prefix)
+            {
+                var cols = sp.Compute(charEncoder.Encode(ch.ToString()), learn: false);
+                lastOutput = tm.Compute(cols, learn: false);
+            }
+
+            var scores = PredictChars(lastOutput!.PredictiveCells);
+
+            string displayPrefix = prefix.Replace(" ", "_");
+            string predicted = scores.Count > 0
+                ? string.Join(", ", scores.Take(5).Select(s =>
+                    $"'{DisplayChar(s.Ch)}'"))
+                : "(none)";
+            Console.WriteLine($"   \"{displayPrefix}\" -> [{predicted}]");
+            Console.WriteLine($"      {explanation}");
+        }
+
+        // ================================================================
+        // Section 3: Novel sequence detection
+        // ================================================================
+        Console.WriteLine($"\n{new string('-', 72)}");
+        Console.WriteLine("3. NOVEL SEQUENCE DETECTION -- anomaly on unfamiliar text\n");
+
+        var testCases = new[]
+        {
+            (phrases[0],                      "Learned phrase A"),
+            (phrases[1],                      "Learned phrase B"),
+            ("the mat sat on the cat",        "Novel (swapped targets)"),
+            ("the hat sat on the bat",        "Novel (swapped targets)"),
+            ("cat the on sat mat the",        "Novel (scrambled words)"),
+        };
+
+        Console.WriteLine($"   {"Text",-30} | {"Avg Anom",8} | Note");
+        foreach (var (text, label) in testCases)
+        {
+            tm.Reset();
+            float totalAnomaly = 0;
+            foreach (char ch in text)
+            {
+                var cols = sp.Compute(charEncoder.Encode(ch.ToString()), learn: false);
+                var tmOut = tm.Compute(cols, learn: false);
+                totalAnomaly += tmOut.Anomaly;
+            }
+            float avgAnomaly = totalAnomaly / text.Length;
+            Console.WriteLine($"   \"{text,-28}\" | {avgAnomaly * 100,6:F1}% | {label}");
+        }
+        Console.WriteLine("   -> Learned sequences: low anomaly. Novel orderings: higher anomaly.");
+
+        // ================================================================
+        // Section 4: Text generation
+        // ================================================================
+        Console.WriteLine($"\n{new string('-', 72)}");
+        Console.WriteLine("4. TEXT GENERATION -- free-running prediction from seed\n");
+
+        var seeds = new[] { "the c", "the b" };
+        int generateLength = 20;
+
+        foreach (string seed in seeds)
+        {
+            tm.Reset();
+            TemporalMemoryOutput lastOutput = null;
+            foreach (char ch in seed)
+            {
+                var cols = sp.Compute(charEncoder.Encode(ch.ToString()), learn: false);
+                lastOutput = tm.Compute(cols, learn: false);
+            }
+
+            string generated = seed;
+            for (int g = 0; g < generateLength; g++)
+            {
+                var scores = PredictChars(lastOutput!.PredictiveCells);
+                if (scores.Count == 0) break;
+
+                char nextChar = scores[0].Ch;
+                generated += nextChar;
+
+                var nextCols = sp.Compute(charEncoder.Encode(nextChar.ToString()), learn: false);
+                lastOutput = tm.Compute(nextCols, learn: false);
+            }
+
+            Console.WriteLine($"   Seed \"{seed}\" -> \"{generated}\"");
+        }
+
+        Console.WriteLine("\n   TM generates text by following the strongest predicted character at each");
+        Console.WriteLine("   step. Different seeds activate different context cells, producing");
+        Console.WriteLine("   different continuations from shared subsequences.");
+
+        // ---- Summary ----
+        Console.WriteLine($"\n{new string('=', 72)}");
+        Console.WriteLine("Summary:");
+        Console.WriteLine($"  Segments: {tm.TotalSegmentCount:N0}, Synapses: {tm.TotalSynapseCount:N0}");
+        Console.WriteLine("  Key insight: each character is represented by MULTIPLE cells in a column.");
+        Console.WriteLine("  Different cells activate for the same character in different contexts.");
+        Console.WriteLine("  'a' after 'c' uses different cells than 'a' after 'b' -- this is how");
+        Console.WriteLine("  the neocortex disambiguates identical stimuli in different temporal contexts.");
+    }
 }
