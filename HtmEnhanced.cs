@@ -2769,7 +2769,7 @@ public sealed class CorticalColumnConfig
     public int CellsPerColumn { get; init; } = 16;
     public int ObjectRepresentationSize { get; init; } = 2048;
     public int ObjectActiveBits { get; init; } = 40;
-    public float LateralInfluence { get; init; } = 0.3f; // How much lateral input affects state
+    public float LateralInfluence { get; init; } = 0.3f; // Reserved for future use (intersection-based voting doesn't need a blend weight)
 }
 
 public sealed class CorticalColumn
@@ -2862,28 +2862,30 @@ public sealed class CorticalColumn
         };
     }
 
-    /// Incorporate lateral input from other columns (voting)
+    /// Incorporate lateral input from other columns (voting).
+    /// Per the Thousand Brains Theory, columns narrow their candidate sets
+    /// by intersecting with the consensus — keeping only mutually supported bits.
     public void ReceiveLateralInput(SDR consensusRepresentation)
     {
-        // Narrow the current object representation toward consensus
-        // by intersecting or blending with the incoming signal
         if (consensusRepresentation.ActiveCount == 0) return;
+        if (_currentObjectRepresentation.ActiveCount == 0) return;
 
-        int overlap = _currentObjectRepresentation.Overlap(consensusRepresentation);
-        float similarity = _currentObjectRepresentation.MatchScore(consensusRepresentation);
+        var intersection = _currentObjectRepresentation.Intersect(consensusRepresentation);
 
-        if (similarity > 0.3f)
+        if (intersection.ActiveCount > 0)
         {
-            // Strong agreement: move toward consensus
-            _currentObjectRepresentation = BlendSDRs(
-                _currentObjectRepresentation, consensusRepresentation,
-                _config.LateralInfluence);
+            // Bits supported by both this column and the consensus survive.
+            // This narrows the candidate set — the core voting mechanism.
+            _currentObjectRepresentation = intersection.EnforceSparsity(_config.ObjectActiveBits);
         }
-        else if (similarity < 0.1f && _confidence < 0.5f)
+        else if (_confidence < 0.5f)
         {
-            // Low confidence + low agreement: reset to consensus
+            // No overlap and low confidence: this column has no useful information.
+            // Defer to the collective wisdom of other columns.
             _currentObjectRepresentation = consensusRepresentation;
         }
+        // else: no overlap but high confidence — this column disagrees with consensus.
+        // Keep its representation; further observations will resolve the conflict.
     }
 
     /// Reset object evidence and temporal state (e.g., when starting to explore a new object).
@@ -2935,47 +2937,28 @@ public sealed class CorticalColumn
         return new SDR(_config.ObjectRepresentationSize, objectBits);
     }
 
-    /// Accumulate object evidence: blend previous representation with new observation
+    /// Accumulate object evidence: narrow the candidate set with each observation.
+    /// Each new observation eliminates inconsistent candidates via intersection.
+    /// If the intersection is too sparse (new object or conflicting observation),
+    /// reset to the current observation — start a new candidate set.
     private SDR AccumulateObjectEvidence(SDR previous, SDR current)
     {
         if (previous.ActiveCount == 0) return current;
 
-        // Keep bits that are supported by EITHER previous or current evidence,
-        // with preference for bits supported by both (intersection-boosted union)
+        // Intersection: only bits supported by BOTH previous and current survive.
+        // This implements the theory's "progressive narrowing" of candidates.
         var intersection = previous.Intersect(current);
-        var union = previous.Union(current);
 
-        if (union.ActiveCount <= _config.ObjectActiveBits)
-            return union;
+        // If enough bits survive, the observation is consistent — narrow the set
+        int minViableBits = Math.Max(1, _config.ObjectActiveBits / 4);
+        if (intersection.ActiveCount >= minViableBits)
+            return intersection.EnforceSparsity(_config.ObjectActiveBits);
 
-        // Prioritize intersection bits, fill remainder from union
-        var result = new HashSet<int>(intersection.ActiveBits.ToArray());
-        foreach (int bit in union.ActiveBits)
-        {
-            if (result.Count >= _config.ObjectActiveBits) break;
-            result.Add(bit);
-        }
-
-        return new SDR(_config.ObjectRepresentationSize, result);
+        // Too few bits survived: this observation is inconsistent with accumulated
+        // evidence. Reset to current observation (new candidate set).
+        return current;
     }
 
-    /// Blend two SDRs: select bits from each based on blendFactor.
-    /// Uses deterministic selection (lowest bit indices) so the same
-    /// inputs always produce the same output regardless of RNG state.
-    private SDR BlendSDRs(SDR a, SDR b, float bWeight)
-    {
-        var result = new HashSet<int>();
-        int targetBits = Math.Max(a.ActiveCount, b.ActiveCount);
-
-        // Take (1-bWeight) fraction from a, bWeight fraction from b
-        int fromB = (int)(targetBits * bWeight);
-        int fromA = targetBits - fromB;
-
-        result.UnionWith(a.ActiveBits.ToArray().OrderBy(x => x).Take(fromA));
-        result.UnionWith(b.ActiveBits.ToArray().OrderBy(x => x).Take(fromB));
-
-        return new SDR(a.Size, result);
-    }
 }
 
 public record CorticalColumnOutput
@@ -3211,17 +3194,28 @@ public sealed class ThousandBrainsEngine
             _columns,
             col => col.GetObjectRepresentation());
 
-        // 4. Attempt recognition against known objects
+        // 4. Attempt recognition: only recognize when columns have converged.
+        // Convergence IS recognition — it means columns agree on the object.
         string? recognizedObject = null;
         float bestMatch = 0;
 
-        foreach (var (label, objSDR) in _objectLibrary)
+        if (converged && consensus.ActiveCount > 0)
         {
-            float match = consensus.MatchScore(objSDR);
-            if (match > bestMatch && match > 0.5f)
+            foreach (var (label, objSDR) in _objectLibrary)
             {
-                bestMatch = match;
-                recognizedObject = label;
+                float match = consensus.MatchScore(objSDR);
+                if (match > bestMatch)
+                {
+                    bestMatch = match;
+                    recognizedObject = label;
+                }
+            }
+
+            // Require strong match — convergence + high similarity = confident recognition
+            if (bestMatch < 0.3f)
+            {
+                recognizedObject = null;
+                bestMatch = 0;
             }
         }
 
