@@ -10,7 +10,7 @@ This is not a neural network. It is a computational model of biological cortical
 
 This project targets **.NET 8** (C# 12). You need the .NET 8 SDK installed.
 
-### Ubuntu / Debian
+### Ubuntu 24.04
 
 ```bash
 # Install the .NET 8 SDK
@@ -32,16 +32,6 @@ rm packages-microsoft-prod.deb
 sudo apt-get update
 sudo apt-get install -y dotnet-sdk-8.0
 ```
-
-### macOS
-
-```bash
-brew install dotnet@8
-```
-
-### Windows
-
-Download the SDK installer from https://dotnet.microsoft.com/download/dotnet/8.0
 
 ### Building
 
