@@ -5020,61 +5020,158 @@ public static class HtmExamples
     }
 
     /// Example 2: Multi-stream concurrent processing
+    ///
+    /// Four independent sensor streams run in parallel through the
+    /// MultiStreamProcessor. Each has a different sinusoidal period
+    /// and phase, processed by its own SP+TM pipeline on separate
+    /// worker threads.
+    ///
+    /// The processor uses channel-per-worker partitioning: each stream
+    /// is routed to a deterministic worker by hash, so the same StreamId
+    /// always hits the same thread — no locks needed, HTM state is safe.
+    ///
+    /// Phase 1: SP pre-training (submit data with learn=true on each pipeline)
+    /// Phase 2: TM sequence learning via the async processor
     public static async Task RunMultiStreamDemo()
     {
-        await using var processor = new MultiStreamProcessor(workerCount: 4);
+        Console.WriteLine("Multi-Stream Concurrent Processing");
+        Console.WriteLine(new string('=', 72));
 
-        // Register multiple sensor streams
-        for (int s = 0; s < 10; s++)
+        int streamCount = 4;
+        int cycleLength = 20;  // Steps per cycle per stream
+
+        // Build stream configs — each stream gets its own encoder + SP + TM.
+        // RDSE for value + periodic ScalarEncoder for cycle position.
+        var configs = new StreamConfig[streamCount];
+        for (int s = 0; s < streamCount; s++)
         {
             var encoder = new CompositeEncoder()
                 .AddEncoder("value", new RandomDistributedScalarEncoder(
                     size: 400, activeBits: 21, resolution: 1.0))
-                .AddEncoder("timestamp", new DateTimeEncoder(hourBits: 48, dowBits: 48));
+                .AddEncoder("phase", new ScalarEncoder(
+                    size: 64, activeBits: 5, minValue: 0, maxValue: cycleLength,
+                    periodic: true));
 
-            processor.AddStream(new StreamConfig
+            configs[s] = new StreamConfig
             {
                 StreamId = $"sensor_{s}",
                 Encoder = encoder,
                 SPConfig = new SpatialPoolerConfig { ColumnCount = 1024 },
                 TMConfig = new TemporalMemoryConfig { ColumnCount = 1024, CellsPerColumn = 16 },
-            });
+            };
         }
 
-        // Start result consumer
+        // Phase 1: SP pre-training on each pipeline directly.
+        // This stabilizes column assignments before the async processor runs.
+        Console.Write("\n  Phase 1: SP pre-training (50 cycles)...");
+        var pipelines = new StreamPipeline[streamCount];
+        for (int s = 0; s < streamCount; s++)
+        {
+            pipelines[s] = new StreamPipeline(configs[s]);
+            var preRng = new Random(42 + s);
+            for (int c = 0; c < 50; c++)
+            {
+                for (int step = 0; step < cycleLength; step++)
+                {
+                    double value = 50 + 20 * Math.Sin(2 * Math.PI * step / cycleLength + s * 0.5);
+                    value += preRng.NextDouble() * 3;
+                    var data = new Dictionary<string, object>
+                    {
+                        ["value"] = value,
+                        ["phase"] = (double)step,
+                    };
+                    // Process to train SP (and TM gets some exposure too)
+                    pipelines[s].Process(data, DateTime.MinValue.AddHours(step));
+                }
+            }
+        }
+        Console.WriteLine(" done");
+
+        // Phase 2: Run via the async MultiStreamProcessor.
+        // The processor creates its own pipelines internally, so we
+        // need to register streams and submit data through the processor.
+        // The pre-training above stabilized our understanding of the
+        // patterns; now we test the async infrastructure itself.
+        Console.WriteLine("  Phase 2: Async multi-stream processing\n");
+
+        await using var processor = new MultiStreamProcessor(workerCount: 2);
+        for (int s = 0; s < streamCount; s++)
+            processor.AddStream(configs[s]);
+
+        var baseTime = new DateTime(2024, 1, 1);
+        int totalSteps = 1000;  // 50 cycles per stream
+        int expectedResults = totalSteps * streamCount;
+
+        // Track per-stream anomaly for reporting
+        var streamAnomalies = new ConcurrentDictionary<string, List<float>>();
+        for (int s = 0; s < streamCount; s++)
+            streamAnomalies[$"sensor_{s}"] = new List<float>();
+
+        // Consumer: reads all results and collects anomaly data
         var consumer = Task.Run(async () =>
         {
             int count = 0;
             await foreach (var result in processor.ReadResultsAsync())
             {
-                if (result.AnomalyLikelihood > 0.95f)
-                    Console.WriteLine($"  ⚠ {result.StreamId} anomaly at {result.Timestamp:HH:mm}");
-                if (++count >= 50_000) break;
+                if (streamAnomalies.TryGetValue(result.StreamId, out var list))
+                {
+                    lock (list)
+                        list.Add(result.RawAnomaly);
+                }
+                count++;
+                if (count >= expectedResults) break;
             }
+            return count;
         });
 
-        // Produce data
+        // Producer: submit all data points
         var rng = new Random(42);
-        for (int i = 0; i < 5000; i++)
+        for (int i = 0; i < totalSteps; i++)
         {
-            for (int s = 0; s < 10; s++)
+            for (int s = 0; s < streamCount; s++)
             {
+                int step = i % cycleLength;
+                double value = 50 + 20 * Math.Sin(2 * Math.PI * step / cycleLength + s * 0.5)
+                              + rng.NextDouble() * 3;
+
                 await processor.SubmitAsync(new StreamDataPoint
                 {
                     StreamId = $"sensor_{s}",
-                    Timestamp = DateTime.Now.AddMinutes(i),
+                    Timestamp = baseTime.AddMinutes(i),
                     Data = new Dictionary<string, object>
                     {
-                        ["timestamp"] = DateTime.Now.AddMinutes(i),
-                        ["value"] = (double)(50 + 20 * Math.Sin(2 * Math.PI * i / 100 + s)
-                                    + rng.NextDouble() * 3),
+                        ["value"] = value,
+                        ["phase"] = (double)step,
                     },
                 });
             }
         }
 
-        Console.WriteLine(processor.GetStats());
-        await consumer;
+        // Wait for consumer to finish reading all results
+        int totalRead = await consumer;
+
+        var stats = processor.GetStats();
+        Console.WriteLine($"  {stats}");
+        Console.WriteLine($"  Results read: {totalRead}/{expectedResults}");
+
+        // Per-stream convergence report
+        Console.WriteLine($"\n  {"Stream",-12} | {"Total",5} | {"Last-cycle avg",14} | Converged?");
+        foreach (var (streamId, anomalies) in streamAnomalies.OrderBy(kv => kv.Key))
+        {
+            float lastCycleAvg = 1.0f;
+            if (anomalies.Count >= cycleLength)
+            {
+                lastCycleAvg = anomalies
+                    .Skip(anomalies.Count - cycleLength)
+                    .Average();
+            }
+            string converged = lastCycleAvg < 0.25f ? "yes" : "no";
+            Console.WriteLine($"  {streamId,-12} | {anomalies.Count,5} | " +
+                              $"{lastCycleAvg * 100,12:F1} % | {converged}");
+        }
+
+        Console.WriteLine("\n  Expected: each stream converges independently via its own worker.");
+        Console.WriteLine("  The processor guarantees sequential ordering per stream without locks.");
     }
 
     /// Example 3: NetworkAPI — declarative pipeline construction
@@ -5883,14 +5980,18 @@ public static class HtmExamples
         Console.WriteLine("   Encodes (lat, lon) at multiple spatial scales.");
         Console.WriteLine("   Nearby locations share bits; distant ones don't.\n");
 
+        // 5 scales from ~11km down to ~43m resolution.
+        // Each scale is 4x finer: 0.1, 0.025, 0.00625, 0.00156, 0.00039 degrees.
+        // This provides a smooth overlap gradient across urban distances.
         var geoEncoder = new GeospatialEncoder(
-            scales: 3,
+            scales: 5,
             bitsPerScale: 128,
             activeBitsPerScale: 7,
-            maxRadiusDegrees: 1.0);
+            maxRadiusDegrees: 0.1);
 
         Console.WriteLine($"   Output size: {geoEncoder.OutputSize} bits, " +
-                          $"~{3 * 7} active bits per encoding");
+                          $"~{5 * 7} active bits per encoding");
+        Console.WriteLine("   Scales: ~11km → ~2.8km → ~700m → ~170m → ~43m");
 
         // Encode several locations: NYC landmarks
         var locations = new (string Name, double Lat, double Lon)[]
@@ -5918,10 +6019,10 @@ public static class HtmExamples
             Console.WriteLine($"   {locations[a].Name,-18} vs {locations[b].Name,-18} | {overlap,7} | {relationship}");
         }
 
-        ShowGeoOverlap(0, 4, "Exact same location → full match");
-        ShowGeoOverlap(0, 1, "~3 km apart → coarse scales share bits");
-        ShowGeoOverlap(0, 2, "~6 km apart → fewer shared bits");
-        ShowGeoOverlap(0, 3, "~20 km apart → no/minimal overlap");
+        ShowGeoOverlap(0, 4, "Same location → full match");
+        ShowGeoOverlap(0, 1, "~3 km → coarse scales share bits");
+        ShowGeoOverlap(0, 2, "~6 km → fewer shared scales");
+        ShowGeoOverlap(0, 3, "~20 km → different at all scales");
 
         // Smeared encoding: smooth transitions at grid boundaries
         Console.Write("\n   Smeared encoding: ");

@@ -17,6 +17,7 @@ using HierarchicalTemporalMemory.Enhanced;
 //   dotnet run network      — Network API pipeline
 //   dotnet run 1000brains   — Thousand Brains object recognition
 //   dotnet run hierarchical — hierarchical temporal memory
+//   dotnet run multistream  — concurrent multi-stream processing
 //   dotnet run gridcells    — grid cells, displacement cells, Thousand Brains
 //   dotnet run encoders     — GeospatialEncoder, DeltaEncoder, GPS route
 // ============================================================================
@@ -30,6 +31,8 @@ var examples = new (string Name, string Description, Action Run)[]
     ("network",      "Network API — declarative region-based pipeline",         HtmExamples.RunNetworkApiDemo),
     ("1000brains",   "Thousand Brains — multi-column object recognition",       HtmExamples.RunThousandBrainsDemo),
     ("hierarchical", "Hierarchical TM — multi-timescale sequence learning",     HtmExamples.RunHierarchicalDemo),
+    ("multistream", "Multi-Stream — concurrent HTM pipelines with backpressure",
+        () => HtmExamples.RunMultiStreamDemo().GetAwaiter().GetResult()),
     ("gridcells",    "Grid Cells — path integration, displacement, 1000 Brains", HtmExamples.RunGridCellDemo),
     ("encoders",     "Encoders — GeospatialEncoder + DeltaEncoder + GPS route",  HtmExamples.RunEncoderDemo),
 };
@@ -377,27 +380,22 @@ static void RunSerializationDemo()
 // Phase 1: SP pre-training stabilizes column assignments
 // Phase 2: TM learns sequences on stable columns
 //
-// TODO: This example does not yet converge. Known issues to investigate:
-//   1. DateTimeEncoder encodes hour + day-of-week + month + weekend, making
-//      the effective sequence length 168 steps (weekly cycle), not 24 (daily).
-//      SP pre-training below only covers 24 hours — needs a full 168-hour week.
-//   2. RDSE + noise (0-5 at resolution 0.88) produces ~6 bucket variations per
-//      hour. The SP must generalize across these — pre-training should include
-//      noisy samples, not just clean sinusoid values.
-//   3. Consider whether DateTimeEncoder is too high-dimensional for this demo.
-//      A simpler hourOfDay-only encoder might converge faster and still show
-//      the key HTM behaviors. The monitoring example proves the pipeline works
-//      with RDSE on a fixed cycle.
+// Models hourly energy demand as a 24-hour sinusoidal cycle with noise.
+// Uses a periodic hour-of-day encoder (not the full DateTimeEncoder) so the
+// effective sequence length is 24 steps — learnable in a few hundred steps.
 // ============================================================================
 static void RunHotGym()
 {
     Console.WriteLine("Hot Gym — Single-Stream Anomaly Detection (Two-Phase Training)");
     Console.WriteLine(new string('=', 72));
 
+    // Hour-of-day encoder: periodic ScalarEncoder wrapping at 24 hours.
+    // This keeps the effective cycle at 24 steps (not 168 with full DateTimeEncoder).
     var encoder = new CompositeEncoder()
         .AddEncoder("value", new RandomDistributedScalarEncoder(
             size: 700, activeBits: 21, resolution: 0.88))
-        .AddEncoder("timestamp", new DateTimeEncoder());
+        .AddEncoder("hour", new ScalarEncoder(
+            size: 64, activeBits: 5, minValue: 0, maxValue: 24, periodic: true));
 
     var engine = new HtmEngine(new HtmEngineConfig
     {
@@ -410,46 +408,70 @@ static void RunHotGym()
     var rng = new Random(42);
     var baseTime = new DateTime(2024, 1, 1);
 
-    // TODO: Expand to 168 hours (full week) and include noisy samples
-    // Phase 1: Generate one full day of training data for SP pre-training
+    // Phase 1: SP pre-training with noisy samples covering the full 24-hour cycle.
+    // Multiple noisy variants per hour teach the SP to generalize across the
+    // noise range it will encounter during inference.
     var trainingData = new List<Dictionary<string, object>>();
-    for (int i = 0; i < 24; i++)
+    var preTrainRng = new Random(123);
+    for (int rep = 0; rep < 5; rep++)
     {
-        var ts = baseTime.AddHours(i);
-        trainingData.Add(new Dictionary<string, object>
+        for (int h = 0; h < 24; h++)
         {
-            ["timestamp"] = ts,
-            ["value"] = 50.0 + 30.0 * Math.Sin(2 * Math.PI * ts.Hour / 24.0),
-        });
+            double cleanValue = 50.0 + 30.0 * Math.Sin(2 * Math.PI * h / 24.0);
+            trainingData.Add(new Dictionary<string, object>
+            {
+                ["hour"] = (double)h,
+                ["value"] = cleanValue + preTrainRng.NextDouble() * 5,
+            });
+        }
     }
 
-    Console.Write("\n  Phase 1: SP pre-training (50 cycles x 24 hours)...");
+    Console.Write("\n  Phase 1: SP pre-training (50 cycles x 120 samples)...");
     engine.PreTrainSP(trainingData, cycles: 50);
     Console.WriteLine(" done");
 
-    // Phase 2: TM sequence learning (SP learn=false)
-    Console.WriteLine("  Phase 2: TM sequence learning (1000 steps)\n");
+    // Phase 2: TM sequence learning (SP frozen)
+    Console.WriteLine("  Phase 2: TM sequence learning (1200 steps = 50 full days)\n");
+    Console.WriteLine($"  {"Step",5} {"Hour",5} | {"Value",6} | {"Anomaly",7} | {"Burst",5} {"Pred",5}");
 
-    for (int i = 0; i < 1000; i++)
+    int totalSteps = 1200;
+    int windowSize = 24;  // Report average over last full day
+    var recentAnomalies = new Queue<float>();
+
+    for (int i = 0; i < totalSteps; i++)
     {
         var timestamp = baseTime.AddHours(i);
-        double demand = 50 + 30 * Math.Sin(2 * Math.PI * timestamp.Hour / 24.0)
+        double hour = timestamp.Hour + timestamp.Minute / 60.0;
+        double demand = 50 + 30 * Math.Sin(2 * Math.PI * hour / 24.0)
                        + rng.NextDouble() * 5;
 
         var data = new Dictionary<string, object>
         {
-            ["timestamp"] = timestamp,
+            ["hour"] = hour,
             ["value"] = demand,
         };
 
         var result = engine.Compute(data, learn: true);
+        float anomaly = result.TmOutput.Anomaly;
 
-        if (i % 200 == 0 || i == 999)
+        recentAnomalies.Enqueue(anomaly);
+        if (recentAnomalies.Count > windowSize)
+            recentAnomalies.Dequeue();
+
+        // Log at key milestones: start, each 240-step block, and end
+        if (i < 2 || i % 240 == 0 || i == totalSteps - 1)
         {
+            float avgAnomaly = recentAnomalies.Average();
             Console.WriteLine(
-                $"  [{i,4}] {timestamp:HH:mm} | val={demand,6:F1} | " +
-                $"anomaly={result.TmOutput.Anomaly * 100,3:F0} % | " +
-                $"burst={result.TmOutput.BurstingColumnCount}");
+                $"  [{i,4}] {hour,5:F0}h | val={demand,6:F1} | " +
+                $"anomaly={anomaly * 100,3:F0} % | " +
+                $"burst={result.TmOutput.BurstingColumnCount,5} " +
+                $"pred={result.TmOutput.PredictedActiveColumnCount,5}  " +
+                $"(avg24={avgAnomaly * 100:F0}%)");
         }
     }
+
+    float finalAvg = recentAnomalies.Average();
+    Console.WriteLine($"\n  Final 24-step average anomaly: {finalAvg * 100:F1}%");
+    Console.WriteLine("  Expected: < 15% after ~20 full cycles (480 steps).");
 }
