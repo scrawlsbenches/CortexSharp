@@ -2486,7 +2486,7 @@ public record SdrPrediction
 
 public sealed class GridCellModuleConfig
 {
-    public int ModuleSize { get; init; } = 40;          // Width of the square module
+    public int ModuleSize { get; init; } = 40;          // Side length N of the hexagonal module (N×N cells in axial coords)
     public int CellsPerAxis => ModuleSize;
     public int TotalCells => ModuleSize * ModuleSize;
     public int ActiveCellCount { get; init; } = 10;     // Cells in the active "bump"
@@ -2496,22 +2496,43 @@ public sealed class GridCellModuleConfig
     public float PathIntegrationNoise { get; init; } = 0.01f;
 }
 
+/// Grid cell module using hexagonal tiling.
+///
+/// Biological grid cells fire in regular hexagonal lattice patterns (Moser & Moser, 2014).
+/// This module uses axial coordinates (q, r) to arrange cells on a hex grid within a
+/// parallelogram-shaped torus. The hexagonal distance metric provides more uniform spatial
+/// coverage than a square grid.
+///
+/// Coordinate system:
+///   - Cells are at integer (q, r) positions, q ∈ [0, N), r ∈ [0, N)
+///   - Cell index = q * N + r  (compatible with existing downstream code)
+///   - TotalCells = N × N  (same count as the previous square implementation)
+///   - Hex distance² = 3 * (dq² + dq*dr + dr²)  (Euclidean distance in hex space)
+///   - Toroidal wrapping: both q and r wrap at N
+///
+/// Path integration converts Cartesian movement deltas to axial coordinate deltas,
+/// then wraps toroidally.
 public sealed class GridCellModule
 {
     private readonly GridCellModuleConfig _config;
     private readonly Random _rng;
 
-    // Current position in module-local coordinates (continuous)
-    private float _posX;
-    private float _posY;
+    // Current position in continuous axial coordinates (q, r), wrapping at ModuleSize
+    private float _posQ;
+    private float _posR;
 
     // Precomputed rotation matrix for this module's orientation
     private readonly float _cosTheta, _sinTheta;
 
+    // Constant for Cartesian ↔ axial conversion
+    private static readonly float Sqrt3 = MathF.Sqrt(3.0f);
+
     public int OutputSize => _config.TotalCells;
 
-    // Learned associations: sensory feature hash → grid position
-    private readonly Dictionary<int, (float X, float Y)> _anchorMemory = new();
+    // Learned associations: sensory pattern → grid position (SDR-overlap-based)
+    private readonly List<(SDR Pattern, float Q, float R)> _anchorMemory = new();
+    private const int MaxAnchors = 256;
+    private const int AnchorOverlapThreshold = 5; // Minimum overlap to trigger recall
 
     public GridCellModule(GridCellModuleConfig config, int seed = 42)
     {
@@ -2521,13 +2542,14 @@ public sealed class GridCellModule
         _sinTheta = MathF.Sin(config.Orientation);
 
         // Start at random position
-        _posX = (float)(_rng.NextDouble() * config.ModuleSize);
-        _posY = (float)(_rng.NextDouble() * config.ModuleSize);
+        _posQ = (float)(_rng.NextDouble() * config.ModuleSize);
+        _posR = (float)(_rng.NextDouble() * config.ModuleSize);
     }
 
     /// Path integration: update position based on movement vector.
-    /// The movement is first rotated by the module's orientation, then
-    /// scaled by the module's spatial period, and wrapped toroidally.
+    /// The Cartesian movement is first rotated by the module's orientation,
+    /// then scaled by the module's spatial period, converted to axial hex
+    /// coordinates, and wrapped toroidally.
     public void Move(float deltaX, float deltaY)
     {
         // Rotate movement into module's reference frame
@@ -2542,30 +2564,41 @@ public sealed class GridCellModule
         rotX += (float)(_rng.NextDouble() * 2 - 1) * _config.PathIntegrationNoise;
         rotY += (float)(_rng.NextDouble() * 2 - 1) * _config.PathIntegrationNoise;
 
+        // Convert Cartesian delta to axial hex coordinate delta
+        // From pointy-top hex: q = x/sqrt(3) - y/3, r = 2y/3
+        float dq = rotX / Sqrt3 - rotY / 3.0f;
+        float dr = 2.0f * rotY / 3.0f;
+
         // Update position with toroidal wrapping
-        _posX = Mod(_posX + rotX, _config.ModuleSize);
-        _posY = Mod(_posY + rotY, _config.ModuleSize);
+        _posQ = Mod(_posQ + dq, _config.ModuleSize);
+        _posR = Mod(_posR + dr, _config.ModuleSize);
     }
 
     /// Compute the current grid cell SDR: a Gaussian bump centered
-    /// at the current position on the toroidal grid surface.
+    /// at the current position on the toroidal hexagonal grid surface.
     public SDR GetCurrentLocation()
     {
         var activations = new List<(int Index, float Weight)>();
         float sigma2 = _config.BumpSigma * _config.BumpSigma;
+        int n = _config.ModuleSize;
 
-        for (int gx = 0; gx < _config.ModuleSize; gx++)
+        for (int q = 0; q < n; q++)
         {
-            for (int gy = 0; gy < _config.ModuleSize; gy++)
+            for (int r = 0; r < n; r++)
             {
-                // Toroidal distance from current position to grid cell
-                float dx = ToroidalDist(gx - _posX, _config.ModuleSize);
-                float dy = ToroidalDist(gy - _posY, _config.ModuleSize);
-                float dist2 = dx * dx + dy * dy;
+                // Toroidal distance in axial coordinates
+                float dq = ToroidalDist(q - _posQ, n);
+                float dr = ToroidalDist(r - _posR, n);
+
+                // Hexagonal Euclidean distance²:
+                // For pointy-top hexagons, the squared Euclidean distance between
+                // two points separated by (dq, dr) in axial coordinates is:
+                //   dist² = 3 * (dq² + dq*dr + dr²)
+                float dist2 = 3.0f * (dq * dq + dq * dr + dr * dr);
 
                 float activation = MathF.Exp(-dist2 / (2 * sigma2));
                 if (activation > 0.01f) // Threshold for sparsity
-                    activations.Add((gx * _config.ModuleSize + gy, activation));
+                    activations.Add((q * n + r, activation));
             }
         }
 
@@ -2579,32 +2612,49 @@ public sealed class GridCellModule
     }
 
     /// Anchor the grid to a known position based on a sensory input.
+    /// Uses SDR overlap matching (noise-tolerant) instead of hash lookup.
     /// This corrects accumulated path integration drift.
     public void Anchor(SDR sensoryInput)
     {
-        int hash = sensoryInput.GetHashCode();
+        // Find best-matching stored anchor via SDR overlap
+        int bestOverlap = 0;
+        int bestIdx = -1;
 
-        if (_anchorMemory.TryGetValue(hash, out var remembered))
+        for (int i = 0; i < _anchorMemory.Count; i++)
+        {
+            int overlap = sensoryInput.Overlap(_anchorMemory[i].Pattern);
+            if (overlap > bestOverlap)
+            {
+                bestOverlap = overlap;
+                bestIdx = i;
+            }
+        }
+
+        if (bestOverlap >= AnchorOverlapThreshold && bestIdx >= 0)
         {
             // Snap to remembered position (error correction)
-            _posX = remembered.X;
-            _posY = remembered.Y;
+            _posQ = _anchorMemory[bestIdx].Q;
+            _posR = _anchorMemory[bestIdx].R;
         }
         else
         {
             // Learn this sensory input → position association
-            _anchorMemory[hash] = (_posX, _posY);
+            if (_anchorMemory.Count >= MaxAnchors)
+                _anchorMemory.RemoveAt(0); // Evict oldest
+            _anchorMemory.Add((sensoryInput, _posQ, _posR));
         }
     }
 
-    /// Reset to a specific position (for testing / initialization)
+    /// Reset to a specific position (in axial hex coordinates).
+    /// For compatibility: (0, 0) is the origin; values wrap at ModuleSize.
     public void SetPosition(float x, float y)
     {
-        _posX = Mod(x, _config.ModuleSize);
-        _posY = Mod(y, _config.ModuleSize);
+        _posQ = Mod(x, _config.ModuleSize);
+        _posR = Mod(y, _config.ModuleSize);
     }
 
-    public (float X, float Y) GetPosition() => (_posX, _posY);
+    /// Get current position in axial hex coordinates.
+    public (float X, float Y) GetPosition() => (_posQ, _posR);
 
     private static float Mod(float a, float m) => ((a % m) + m) % m;
 
@@ -3091,8 +3141,9 @@ public sealed class LateralVotingMechanism
 // SECTION 12: Thousand Brains Engine
 // ============================================================================
 // The complete Thousand Brains architecture. Orchestrates multiple cortical
-// columns, each with its own grid cell module and sensory input, plus
-// lateral voting for consensus-based object recognition.
+// columns, each with its own set of grid cell modules (multiple modules
+// per column at different scales/orientations for richer location encoding),
+// plus lateral voting for consensus-based object recognition.
 //
 // Object learning: explore an object, accumulate evidence, converge, label.
 // Object recognition: observe features at locations, vote, converge to ID.
@@ -3101,6 +3152,7 @@ public sealed class LateralVotingMechanism
 public sealed class ThousandBrainsConfig
 {
     public int ColumnCount { get; init; } = 8;
+    public int ModulesPerColumn { get; init; } = 3;     // Multiple modules per column provide richer location codes
     public CorticalColumnConfig ColumnConfig { get; init; } = new();
     public GridCellModuleConfig[] GridModuleConfigs { get; init; } = Array.Empty<GridCellModuleConfig>();
     public LateralVotingConfig VotingConfig { get; init; } = new();
@@ -3112,7 +3164,11 @@ public sealed class ThousandBrainsEngine
 {
     private readonly ThousandBrainsConfig _config;
     private readonly CorticalColumn[] _columns;
-    private readonly GridCellModule[] _gridModules;
+    // Multiple grid cell modules per column: _gridModules[columnIdx][moduleIdx]
+    // The theory proposes that each column has several modules at different
+    // scales/orientations, whose combined output provides a unique location code.
+    private readonly GridCellModule[][] _gridModules;
+    private readonly int _totalLocationSize; // Sum of all module OutputSizes for one column
     private readonly DisplacementCellModule? _displacementModule;
     private readonly LateralVotingMechanism _voting;
 
@@ -3131,24 +3187,57 @@ public sealed class ThousandBrainsEngine
         _config = config;
         _voting = new LateralVotingMechanism(config.VotingConfig);
 
-        // Create grid cell modules (one per column, varying scale/orientation)
-        var defaultGridConfigs = Enumerable.Range(0, config.ColumnCount)
-            .Select(i => new GridCellModuleConfig
-            {
-                Scale = 1.0f + i * 0.5f,     // Increasing scales
-                Orientation = i * MathF.PI / config.ColumnCount, // Spread orientations
-            }).ToArray();
+        int modulesPerCol = config.ModulesPerColumn;
 
-        var gridConfigs = config.GridModuleConfigs.Length > 0 ? config.GridModuleConfigs : defaultGridConfigs;
+        // Build grid module configs: each column gets `modulesPerCol` modules
+        // at different scales and orientations for richer location encoding
+        GridCellModuleConfig[] baseConfigs;
+        if (config.GridModuleConfigs.Length > 0)
+        {
+            baseConfigs = config.GridModuleConfigs;
+        }
+        else
+        {
+            baseConfigs = Enumerable.Range(0, modulesPerCol)
+                .Select(m => new GridCellModuleConfig
+                {
+                    Scale = 1.0f + m * 0.7f,     // Increasing scales across modules
+                    Orientation = m * MathF.PI / modulesPerCol, // Spread orientations
+                }).ToArray();
+        }
 
-        _gridModules = new GridCellModule[config.ColumnCount];
+        _gridModules = new GridCellModule[config.ColumnCount][];
         _columns = new CorticalColumn[config.ColumnCount];
+        _totalLocationSize = 0;
+
+        // Compute total location size from the first column's modules
+        for (int m = 0; m < modulesPerCol; m++)
+        {
+            var gc = baseConfigs[m % baseConfigs.Length];
+            _totalLocationSize += gc.TotalCells;
+        }
+
+        // Override column config's LocationSize to match the combined grid output
+        var adjustedColumnConfig = new CorticalColumnConfig
+        {
+            InputSize = config.ColumnConfig.InputSize,
+            LocationSize = _totalLocationSize,
+            ColumnCount = config.ColumnConfig.ColumnCount,
+            CellsPerColumn = config.ColumnConfig.CellsPerColumn,
+            ObjectRepresentationSize = config.ColumnConfig.ObjectRepresentationSize,
+            ObjectActiveBits = config.ColumnConfig.ObjectActiveBits,
+            LateralInfluence = config.ColumnConfig.LateralInfluence,
+        };
 
         for (int i = 0; i < config.ColumnCount; i++)
         {
-            _gridModules[i] = new GridCellModule(
-                gridConfigs[i % gridConfigs.Length], seed: 42 + i);
-            _columns[i] = new CorticalColumn(config.ColumnConfig, seed: 100 + i);
+            _gridModules[i] = new GridCellModule[modulesPerCol];
+            for (int m = 0; m < modulesPerCol; m++)
+            {
+                _gridModules[i][m] = new GridCellModule(
+                    baseConfigs[m % baseConfigs.Length], seed: 42 + i * modulesPerCol + m);
+            }
+            _columns[i] = new CorticalColumn(adjustedColumnConfig, seed: 100 + i);
         }
 
         if (config.UseDisplacementCells)
@@ -3172,15 +3261,17 @@ public sealed class ThousandBrainsEngine
 
         _explorationSteps++;
 
-        // 1. Update grid cell locations via path integration
-        foreach (var module in _gridModules)
-            module.Move(moveDeltaX, moveDeltaY);
+        // 1. Update grid cell locations via path integration (all modules, all columns)
+        for (int i = 0; i < _config.ColumnCount; i++)
+            foreach (var module in _gridModules[i])
+                module.Move(moveDeltaX, moveDeltaY);
 
-        // 2. Each column processes its sensory patch with location
+        // 2. Each column processes its sensory patch with composite location
         var columnOutputs = new CorticalColumnOutput[_config.ColumnCount];
         for (int i = 0; i < _config.ColumnCount; i++)
         {
-            var locationSDR = _gridModules[i].GetCurrentLocation();
+            // Concatenate all grid module outputs into a single location SDR
+            var locationSDR = GetCompositeLocation(i);
             columnOutputs[i] = _columns[i].Compute(
                 sensoryPatches.Length == _config.ColumnCount
                     ? sensoryPatches[i]
@@ -3220,10 +3311,11 @@ public sealed class ThousandBrainsEngine
         }
 
         // 5. Compute displacement predictions if enabled
+        // Uses the first module of the first column as the reference for displacement
         SDR? predictedNextLocation = null;
         if (_displacementModule != null && _explorationSteps > 1 && _prevGridLocations != null)
         {
-            var currentLoc = _gridModules[0].GetCurrentLocation();
+            var currentLoc = _gridModules[0][0].GetCurrentLocation();
             var prevLoc = _prevGridLocations[0];
 
             // Compute the displacement from previous to current location
@@ -3247,10 +3339,10 @@ public sealed class ThousandBrainsEngine
             }
         }
 
-        // Save current grid locations for next step's displacement computation
+        // Save current first-module locations for next step's displacement computation
         _prevGridLocations = new SDR[_config.ColumnCount];
         for (int i = 0; i < _config.ColumnCount; i++)
-            _prevGridLocations[i] = _gridModules[i].GetCurrentLocation();
+            _prevGridLocations[i] = _gridModules[i][0].GetCurrentLocation();
 
         return new ThousandBrainsOutput
         {
@@ -3290,15 +3382,35 @@ public sealed class ThousandBrainsEngine
         _currentDisplacements.Clear();
         foreach (var column in _columns)
             column.ResetObjectRepresentation();
-        foreach (var module in _gridModules)
-            module.SetPosition(0, 0);
+        for (int i = 0; i < _config.ColumnCount; i++)
+            foreach (var module in _gridModules[i])
+                module.SetPosition(0, 0);
     }
 
     /// Anchor grid cells at the current position based on a landmark
     public void AnchorAtLandmark(SDR landmark)
     {
-        foreach (var module in _gridModules)
-            module.Anchor(landmark);
+        for (int i = 0; i < _config.ColumnCount; i++)
+            foreach (var module in _gridModules[i])
+                module.Anchor(landmark);
+    }
+
+    /// Concatenate all grid module outputs for a given column into a single composite location SDR.
+    private SDR GetCompositeLocation(int columnIndex)
+    {
+        var modules = _gridModules[columnIndex];
+        var allBits = new List<int>();
+        int offset = 0;
+
+        foreach (var module in modules)
+        {
+            var modSDR = module.GetCurrentLocation();
+            foreach (int bit in modSDR.ActiveBits)
+                allBits.Add(bit + offset);
+            offset += module.OutputSize;
+        }
+
+        return new SDR(_totalLocationSize, allBits);
     }
 
     public IReadOnlyDictionary<string, SDR> GetObjectLibrary() => _objectLibrary;
