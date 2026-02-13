@@ -1101,9 +1101,11 @@ public sealed record SpatialPoolerConfig
     public InhibitionMode Inhibition { get; init; } = InhibitionMode.Global;
     public int InhibitionRadius { get; init; } = 50;       // For local inhibition
     public BoostingStrategy Boosting { get; init; } = BoostingStrategy.Exponential;
-    public float BoostStrength { get; init; } = 0.0f;   // 0 = disabled (NuPIC default)
+    public float BoostStrength { get; init; } = 3.0f;   // Active boosting (ensures all columns participate)
     public float MinPctOverlapDutyCycles { get; init; } = 0.001f;
     public int DutyCyclePeriod { get; init; } = 1000;
+    public float LearningRateDecay { get; init; } = 1.0f;           // 1.0 = no decay; < 1.0 decays per iteration
+    public int LearningRateDecayStartIteration { get; init; } = 0;  // Iteration at which decay begins
     public int Seed { get; init; } = 42;
 }
 
@@ -1217,7 +1219,7 @@ public sealed class SpatialPooler
 
             foreach (int inputIdx in selected)
             {
-                float perm = _config.ConnectedThreshold + (float)(_rng.NextDouble() * 0.1 - 0.05);
+                float perm = _config.ConnectedThreshold + (float)(_rng.NextDouble() * 0.2 - 0.1);
                 _proximalDendrites[col].AddSynapse(
                     new Synapse(inputIdx, Math.Clamp(perm, 0f, 1f)));
             }
@@ -1244,12 +1246,18 @@ public sealed class SpatialPooler
         // Phase 4: Learning
         if (learn)
         {
+            float decayFactor = (_config.LearningRateDecay < 1.0f && _iteration > _config.LearningRateDecayStartIteration)
+                ? MathF.Pow(_config.LearningRateDecay, _iteration - _config.LearningRateDecayStartIteration)
+                : 1.0f;
+            float effectiveIncrement = _config.PermanenceIncrement * decayFactor;
+            float effectiveDecrement = _config.PermanenceDecrement * decayFactor;
+
             foreach (int col in activeColumns)
             {
                 _proximalDendrites[col].AdaptSynapses(
                     input.ActiveBits.ToArray().ToHashSet(),
-                    _config.PermanenceIncrement,
-                    _config.PermanenceDecrement);
+                    effectiveIncrement,
+                    effectiveDecrement);
             }
 
             UpdateDutyCycles(activeColumns, overlaps);
@@ -1490,6 +1498,8 @@ public sealed class TemporalMemoryConfig
     public float SynapsePruneThreshold { get; init; } = 0.01f;
     public int SegmentCleanupInterval { get; init; } = 1000;   // Cleanup every N iterations
     public int MinSynapsesForViableSegment { get; init; } = 3;
+    public float LearningRateDecay { get; init; } = 1.0f;           // 1.0 = no decay; < 1.0 decays per iteration
+    public int LearningRateDecayStartIteration { get; init; } = 0;  // Iteration at which decay begins
     public int Seed { get; init; } = 42;
 }
 
@@ -1517,6 +1527,10 @@ public sealed class TemporalMemory
 
     private readonly Random _rng;
     private int _iteration;
+
+    // --- Effective learning rates (updated each compute step, supports decay) ---
+    private float _effectiveIncrement;
+    private float _effectiveDecrement;
 
     // --- Outputs ---
     public float Anomaly { get; private set; }
@@ -1605,6 +1619,12 @@ public sealed class TemporalMemory
         // ---- Phase 3: Learning ----
         if (learn)
         {
+            float decayFactor = (_config.LearningRateDecay < 1.0f && _iteration > _config.LearningRateDecayStartIteration)
+                ? MathF.Pow(_config.LearningRateDecay, _iteration - _config.LearningRateDecayStartIteration)
+                : 1.0f;
+            _effectiveIncrement = _config.PermanenceIncrement * decayFactor;
+            _effectiveDecrement = _config.PermanenceDecrement * decayFactor;
+
             LearnOnActiveSegments(newActiveCells);
             LearnOnBurstingColumns(activeColumns, newWinnerCells);
             PunishIncorrectPredictions(activeColumns);
@@ -1749,7 +1769,7 @@ public sealed class TemporalMemory
             foreach (var (segment, _) in segments)
             {
                 segment.AdaptSynapses(_prevActiveCells,
-                    _config.PermanenceIncrement, _config.PermanenceDecrement);
+                    _effectiveIncrement, _effectiveDecrement);
                 segment.LastActivatedIteration = _iteration;
 
                 // Grow new synapses to previously active cells not yet connected
@@ -1792,7 +1812,7 @@ public sealed class TemporalMemory
             {
                 var bestMatch = matches.OrderByDescending(m => m.PotentialActivity).First();
                 bestMatch.Segment.AdaptSynapses(_prevActiveCells,
-                    _config.PermanenceIncrement, _config.PermanenceDecrement);
+                    _effectiveIncrement, _effectiveDecrement);
                 bestMatch.Segment.LastActivatedIteration = _iteration;
                 GrowSynapses(bestMatch.Segment, _prevWinnerCells);
             }
@@ -1850,7 +1870,10 @@ public sealed class TemporalMemory
                 if (segment.ComputeActivity(_prevActiveCells, _config.ConnectedThreshold)
                     >= _config.ActivationThreshold)
                 {
-                    segment.PunishSynapses(_prevActiveCells, _config.PredictedDecrement);
+                    float effectivePunishment = (_config.LearningRateDecay < 1.0f && _iteration > _config.LearningRateDecayStartIteration)
+                        ? _config.PredictedDecrement * MathF.Pow(_config.LearningRateDecay, _iteration - _config.LearningRateDecayStartIteration)
+                        : _config.PredictedDecrement;
+                    segment.PunishSynapses(_prevActiveCells, effectivePunishment);
                 }
             }
         }
@@ -2414,13 +2437,15 @@ public record SdrPrediction
 // ============================================================================
 // SECTION 8: Grid Cell Module
 // ============================================================================
-// Grid cells provide allocentric (world-centered) location reference frames.
-// Each module tiles 2D space with a hexagonal grid at a specific scale and
+// Grid cells provide object-centric (object-relative) location reference frames.
+// In the Thousand Brains Theory, each cortical column maintains its own
+// reference frame relative to the object being sensed, NOT in world coordinates.
+// Each module tiles 2D space with a periodic grid at a specific scale and
 // orientation. Multiple modules at different scales/orientations together
 // provide a unique location code (like Fourier components).
 //
 // The grid cell representation is an SDR where the active bits encode the
-// current position within the module's periodic tiling of space.
+// current position within the module's periodic tiling of the object's surface.
 //
 // Path integration: movement displaces the active bump across the grid.
 // Anchoring: sensory input can reset the grid to a known position.
@@ -2562,7 +2587,7 @@ public sealed class GridCellModule
 // SECTION 9: Displacement Cells
 // ============================================================================
 // Displacement cells encode the relative offset between two locations,
-// enabling the system to represent object-relative (allocentric) structure.
+// enabling the system to represent object-relative structure.
 // For example: "the handle is 5cm to the right of the cup's center."
 //
 // They compute the displacement vector between a "source" grid cell
@@ -3124,6 +3149,11 @@ public sealed class ThousandBrainsEngine
         SDR[] sensoryPatches, float moveDeltaX, float moveDeltaY,
         bool learn = true)
     {
+        if (sensoryPatches.Length != _config.ColumnCount && sensoryPatches.Length != 1)
+            throw new ArgumentException(
+                $"Expected {_config.ColumnCount} sensory patches (one per column) or 1 (broadcast), " +
+                $"got {sensoryPatches.Length}. Each column should process its own sensory patch.");
+
         _explorationSteps++;
 
         // 1. Update grid cell locations via path integration
@@ -3136,7 +3166,9 @@ public sealed class ThousandBrainsEngine
         {
             var locationSDR = _gridModules[i].GetCurrentLocation();
             columnOutputs[i] = _columns[i].Compute(
-                sensoryPatches[i % sensoryPatches.Length],
+                sensoryPatches.Length == _config.ColumnCount
+                    ? sensoryPatches[i]
+                    : sensoryPatches[i % sensoryPatches.Length],
                 locationSDR,
                 learn);
         }
