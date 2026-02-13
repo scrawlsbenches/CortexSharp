@@ -1140,7 +1140,7 @@ public sealed record SpatialPoolerConfig
     public InhibitionMode Inhibition { get; init; } = InhibitionMode.Global;
     public int InhibitionRadius { get; init; } = 50;       // For local inhibition
     public BoostingStrategy Boosting { get; init; } = BoostingStrategy.Exponential;
-    public float BoostStrength { get; init; } = 3.0f;   // Active boosting (ensures all columns participate)
+    public float BoostStrength { get; init; } = 1.0f;   // Active boosting (ensures all columns participate)
     public float MinPctOverlapDutyCycles { get; init; } = 0.001f;
     public int DutyCyclePeriod { get; init; } = 1000;
     public float LearningRateDecay { get; init; } = 1.0f;           // 1.0 = no decay; < 1.0 decays per iteration
@@ -2967,20 +2967,29 @@ public sealed class CorticalColumn
         if (apicalInput != null && apicalInput.ActiveCount > 0)
             apicalInputBits = apicalInput.ActiveBits.ToArray().ToHashSet();
 
-        // Score each L2/3 cell based on distal AND apical depolarization.
-        // Distal segments: match (feature + location) → cell knows this pattern
-        // Apical segments: match top-down feedback → cell is expected/attended
-        // A cell with BOTH distal and apical depolarization is in the
-        // strongest predictive state (biology: proximal + distal + apical).
-        var candidateCells = new List<(int CellIdx, float Score)>();
+        // Score each L2/3 cell using the TM's dual-threshold approach:
+        //   - Connected activity (>= ConnectedThreshold): cell has mature segments → activates
+        //   - Potential activity (all synapses incl. sub-threshold): cell has developing segments
+        //
+        // This three-tier priority ensures cells with developing segments are preferentially
+        // re-selected, allowing permanences to be reinforced across training cycles:
+        //   Tier 1: Cells with connected activity >= ActivationThreshold (known patterns)
+        //   Tier 2: Cells with potential activity >= MinThreshold (developing associations)
+        //   Tier 3: Cells with fewest segments (truly novel — least-used allocation)
+        var tier1Cells = new List<(int CellIdx, float Score)>();  // Mature segments
+        var tier2Cells = new List<(int CellIdx, float Score)>();  // Developing segments
         for (int c = 0; c < _config.ObjectRepresentationSize; c++)
         {
-            // Distal activity: does this cell recognize the (feature, location)?
-            int maxDistalActivity = 0;
+            // Distal connected activity: mature segments with strong synapses
+            int maxConnectedActivity = 0;
+            // Distal potential activity: developing segments (including sub-threshold)
+            int maxPotentialActivity = 0;
             foreach (var segment in _l23Cells[c].Segments)
             {
-                int activity = segment.ComputeActivity(l23InputBits, _config.L23ConnectedThreshold);
-                maxDistalActivity = Math.Max(maxDistalActivity, activity);
+                int connected = segment.ComputeActivity(l23InputBits, _config.L23ConnectedThreshold);
+                int potential = segment.ComputePotentialActivity(l23InputBits);
+                maxConnectedActivity = Math.Max(maxConnectedActivity, connected);
+                maxPotentialActivity = Math.Max(maxPotentialActivity, potential);
             }
 
             // Apical activity: is this cell expected by top-down feedback?
@@ -2995,108 +3004,144 @@ public sealed class CorticalColumn
                 }
             }
 
-            // Cell must meet distal threshold to be a candidate at all.
-            // Apical depolarization boosts priority but cannot activate alone
-            // (matching biology: apical depolarization is modulatory, not driving).
-            if (maxDistalActivity >= _config.L23ActivationThreshold)
+            float apicalBoost = (maxApicalActivity >= _config.ApicalActivationThreshold)
+                ? _config.ApicalBoostFactor : 1.0f;
+
+            // Tier 1: mature segments (connected activity meets threshold)
+            if (maxConnectedActivity >= _config.L23ActivationThreshold)
             {
-                float score = maxDistalActivity;
-                if (maxApicalActivity >= _config.ApicalActivationThreshold)
-                    score *= _config.ApicalBoostFactor;
-                candidateCells.Add((c, score));
+                tier1Cells.Add((c, maxConnectedActivity * apicalBoost));
+            }
+            // Tier 2: developing segments (potential activity meets min threshold)
+            // These cells have segments with the right synapses but permanences
+            // haven't crossed the connection threshold yet. Re-selecting them
+            // allows learning to reinforce their synapses.
+            else if (maxPotentialActivity >= _config.L23MinThreshold)
+            {
+                tier2Cells.Add((c, maxPotentialActivity * apicalBoost));
             }
         }
 
-        // Select active L2/3 cells: competitive inhibition (top-k)
+        // Select active L2/3 cells using tiered priority.
+        //
+        // During LEARNING: Tier 0 (highest) = cells already in the current object
+        // representation. These stay active so they accumulate segments for every
+        // (feature, location) pair of the object being learned. This models the
+        // biological recurrent maintenance of L2/3 object representations — once
+        // cells are activated for an object, they stay active until a new object
+        // is started. Each touch teaches them a new (feature, location) association.
+        //
+        // During RECOGNITION: No Tier 0 bias. Cells activate purely from trained
+        // segments, and evidence accumulation narrows the representation across
+        // touches (as the theory requires for candidate elimination).
         var newL23Active = new HashSet<int>();
-        if (candidateCells.Count > 0)
+        int slotsRemaining = _config.ObjectActiveBits;
+
+        // Tier 0 (learning only): cells already representing the current object
+        if (learn && _currentObjectRepresentation.ActiveCount > 0)
         {
-            foreach (var (cellIdx, _) in candidateCells
+            foreach (int bit in _currentObjectRepresentation.ActiveBits)
+            {
+                if (newL23Active.Count >= _config.ObjectActiveBits) break;
+                newL23Active.Add(bit);
+            }
+            slotsRemaining = _config.ObjectActiveBits - newL23Active.Count;
+        }
+
+        // Tier 1: cells with mature connected segments (highest priority for recognition)
+        if (slotsRemaining > 0 && tier1Cells.Count > 0)
+        {
+            foreach (var (cellIdx, _) in tier1Cells
+                .Where(c => !newL23Active.Contains(c.CellIdx))
                 .OrderByDescending(c => c.Score)
-                .Take(_config.ObjectActiveBits))
+                .Take(slotsRemaining))
             {
                 newL23Active.Add(cellIdx);
             }
+            slotsRemaining = _config.ObjectActiveBits - newL23Active.Count;
         }
-        else
+
+        // Tier 2: cells with developing segments (re-select to reinforce learning)
+        if (slotsRemaining > 0 && tier2Cells.Count > 0)
         {
-            // Novel input: no distal segments match. Activate least-used cells.
-            // Apical depolarization can still bias selection among novel candidates.
+            foreach (var (cellIdx, _) in tier2Cells
+                .Where(c => !newL23Active.Contains(c.CellIdx))
+                .OrderByDescending(c => c.Score)
+                .Take(slotsRemaining))
+            {
+                newL23Active.Add(cellIdx);
+            }
+            slotsRemaining = _config.ObjectActiveBits - newL23Active.Count;
+        }
+
+        // Tier 3: truly novel — no relevant segments at all. Allocate least-used cells.
+        if (slotsRemaining > 0)
+        {
             var available = Enumerable.Range(0, _config.ObjectRepresentationSize)
-                .Select(c =>
-                {
-                    int apicalActivity = 0;
-                    if (apicalInputBits != null)
-                    {
-                        foreach (var seg in _l23ApicalCells[c].Segments)
-                        {
-                            int a = seg.ComputeActivity(
-                                apicalInputBits, _config.ApicalConnectedThreshold);
-                            apicalActivity = Math.Max(apicalActivity, a);
-                        }
-                    }
-                    return (CellIdx: c, SegCount: _l23Cells[c].SegmentCount, Apical: apicalActivity);
-                })
-                .OrderByDescending(c => c.Apical >= _config.ApicalActivationThreshold ? 1 : 0)
-                .ThenBy(c => c.SegCount)
+                .Where(c => !newL23Active.Contains(c))
+                .OrderBy(c => _l23Cells[c].SegmentCount)
                 .ThenBy(_ => _rng.Next())
-                .Take(_config.ObjectActiveBits);
-            foreach (var c in available)
-                newL23Active.Add(c.CellIdx);
+                .Take(slotsRemaining);
+            foreach (int c in available)
+                newL23Active.Add(c);
         }
 
         // ---- L2/3 Learning ----
         if (learn)
         {
-            // Distal learning: reinforce/grow segments for (feature, location) → object
+            // Distal learning: reinforce/grow segments for (feature, location) → object.
+            // Uses ComputePotentialActivity (all synapses including sub-threshold) to find
+            // segments to reinforce — matching the TM's proven dual-threshold approach.
+            // This allows segments with sub-threshold permanences to be found and reinforced,
+            // raising their permanences toward the connection threshold over multiple exposures.
             foreach (int cellIdx in newL23Active)
             {
                 DendriteSegment? bestSegment = null;
-                int bestActivity = 0;
+                int bestPotential = 0;
                 foreach (var segment in _l23Cells[cellIdx].Segments)
                 {
-                    int activity = segment.ComputeActivity(l23InputBits, _config.L23ConnectedThreshold);
-                    if (activity > bestActivity)
+                    int potential = segment.ComputePotentialActivity(l23InputBits);
+                    if (potential > bestPotential)
                     {
-                        bestActivity = activity;
+                        bestPotential = potential;
                         bestSegment = segment;
                     }
                 }
 
-                if (bestSegment != null && bestActivity >= _config.L23MinThreshold)
+                if (bestSegment != null && bestPotential >= _config.L23MinThreshold)
                 {
+                    // Reinforce existing segment: strengthen matching synapses,
+                    // weaken non-matching ones, grow new synapses to uncovered input bits
                     bestSegment.AdaptSynapses(l23InputBits,
                         _config.L23PermanenceIncrement, _config.L23PermanenceDecrement);
                     GrowL23Synapses(bestSegment, l23InputBits);
                 }
                 else
                 {
+                    // No matching segment — create a new one
                     var newSegment = _l23Cells[cellIdx].CreateSegment(cellIdx, 0);
                     GrowL23Synapses(newSegment, l23InputBits);
                 }
             }
 
-            // Apical learning: reinforce/grow segments for top-down → object associations.
-            // Active L2/3 cells learn to recognize the apical context they were active in,
-            // so future top-down feedback can bias them toward being re-selected.
+            // Apical learning: same dual-threshold approach for top-down associations.
             if (apicalInputBits != null)
             {
                 foreach (int cellIdx in newL23Active)
                 {
                     DendriteSegment? bestSegment = null;
-                    int bestActivity = 0;
+                    int bestPotential = 0;
                     foreach (var segment in _l23ApicalCells[cellIdx].Segments)
                     {
-                        int activity = segment.ComputeActivity(
-                            apicalInputBits, _config.ApicalConnectedThreshold);
-                        if (activity > bestActivity)
+                        int potential = segment.ComputePotentialActivity(apicalInputBits);
+                        if (potential > bestPotential)
                         {
-                            bestActivity = activity;
+                            bestPotential = potential;
                             bestSegment = segment;
                         }
                     }
 
-                    if (bestSegment != null && bestActivity >= _config.ApicalMinThreshold)
+                    if (bestSegment != null && bestPotential >= _config.ApicalMinThreshold)
                     {
                         bestSegment.AdaptSynapses(apicalInputBits,
                             _config.ApicalPermanenceIncrement, _config.ApicalPermanenceDecrement);
@@ -3733,6 +3778,10 @@ public sealed class SPRegion : IRegion
     private SDR _input = new(0);
     private SDR _output = new(0);
 
+    /// When true, SP learning is frozen — Compute still produces output but
+    /// does not update synaptic permanences or duty cycles.
+    public bool FreezeLearning { get; set; }
+
     public IReadOnlyList<RegionPort> InputPorts { get; } = new[]
     {
         new RegionPort("bottomUpIn", PortType.SDR),
@@ -3762,7 +3811,7 @@ public sealed class SPRegion : IRegion
     };
 
     public void Compute(bool learn = true)
-        => _output = _sp.Compute(_input, learn);
+        => _output = _sp.Compute(_input, learn && !FreezeLearning);
 
     /// SP has no temporal state to reset. Duty cycles and boost factors are
     /// long-term learning statistics that should persist across sequences.
@@ -4979,6 +5028,9 @@ public sealed class StreamPipeline
     private readonly AnomalyLikelihood _anomalyLikelihood;
     private long _recordsProcessed;
 
+    /// When true, SP learning is frozen — only TM learns during Process.
+    public bool FreezeSPLearning { get; set; }
+
     public long RecordsProcessed => _recordsProcessed;
 
     public StreamPipeline(StreamConfig config)
@@ -5001,7 +5053,7 @@ public sealed class StreamPipeline
         Interlocked.Increment(ref _recordsProcessed);
 
         SDR encoded = _encoder.Encode(data);
-        SDR activeColumns = _sp.Compute(encoded);
+        SDR activeColumns = _sp.Compute(encoded, learn: !FreezeSPLearning);
         var tmOutput = _tm.Compute(activeColumns);
 
         float anomalyLikelihood = _anomalyLikelihood.Compute(tmOutput.Anomaly);
@@ -5024,6 +5076,19 @@ public sealed class StreamPipeline
             ActiveCellCount = tmOutput.ActiveCells.Count,
             PredictiveCellCount = tmOutput.PredictiveCells.Count,
         };
+    }
+
+    /// Train SP only (no TM) on the given data. Call before the main Process
+    /// loop to stabilize column assignments. Sets FreezeSPLearning = true.
+    public void PreTrainSP(IEnumerable<Dictionary<string, object>> data, int cycles = 50)
+    {
+        for (int c = 0; c < cycles; c++)
+            foreach (var record in data)
+            {
+                SDR encoded = _encoder.Encode(record);
+                _sp.Compute(encoded, learn: true);
+            }
+        FreezeSPLearning = true;
     }
 }
 
@@ -5082,6 +5147,13 @@ public sealed class MultiStreamProcessor : IAsyncDisposable
         var pipeline = new StreamPipeline(config);
         if (!_pipelines.TryAdd(config.StreamId, pipeline))
             throw new InvalidOperationException($"Stream '{config.StreamId}' already exists");
+    }
+
+    /// Register a pre-trained pipeline directly (preserves learned SP/TM state)
+    public void AddStream(StreamPipeline pipeline)
+    {
+        if (!_pipelines.TryAdd(pipeline.StreamId, pipeline))
+            throw new InvalidOperationException($"Stream '{pipeline.StreamId}' already exists");
     }
 
     /// Deterministic worker assignment: same StreamId always routes to same worker,
@@ -5486,50 +5558,45 @@ public static class HtmExamples
             {
                 StreamId = $"sensor_{s}",
                 Encoder = encoder,
-                SPConfig = new SpatialPoolerConfig { ColumnCount = 1024 },
-                TMConfig = new TemporalMemoryConfig { ColumnCount = 1024, CellsPerColumn = 16 },
+                SPConfig = new SpatialPoolerConfig { ColumnCount = 2048 },
+                TMConfig = new TemporalMemoryConfig { ColumnCount = 2048, CellsPerColumn = 32 },
             };
         }
 
-        // Phase 1: SP pre-training on each pipeline directly.
-        // This stabilizes column assignments before the async processor runs.
+        // Phase 1: SP-only pre-training on each pipeline.
+        // Train SP columns without TM to avoid TM learning garbage from unstable SP.
+        // After pre-training, SP is frozen — only TM learns in Phase 2.
         Console.Write("\n  Phase 1: SP pre-training (50 cycles)...");
         var pipelines = new StreamPipeline[streamCount];
         for (int s = 0; s < streamCount; s++)
         {
             pipelines[s] = new StreamPipeline(configs[s]);
             var preRng = new Random(42 + s);
-            for (int c = 0; c < 50; c++)
+            var preTrainData = new List<Dictionary<string, object>>();
+            for (int step = 0; step < cycleLength; step++)
             {
-                for (int step = 0; step < cycleLength; step++)
+                double value = 50 + 20 * Math.Sin(2 * Math.PI * step / cycleLength + s * 0.5)
+                              + preRng.NextDouble() * 3;
+                preTrainData.Add(new Dictionary<string, object>
                 {
-                    double value = 50 + 20 * Math.Sin(2 * Math.PI * step / cycleLength + s * 0.5);
-                    value += preRng.NextDouble() * 3;
-                    var data = new Dictionary<string, object>
-                    {
-                        ["value"] = value,
-                        ["phase"] = (double)step,
-                    };
-                    // Process to train SP (and TM gets some exposure too)
-                    pipelines[s].Process(data, DateTime.MinValue.AddHours(step));
-                }
+                    ["value"] = value,
+                    ["phase"] = (double)step,
+                });
             }
+            pipelines[s].PreTrainSP(preTrainData, cycles: 50);
         }
         Console.WriteLine(" done");
 
         // Phase 2: Run via the async MultiStreamProcessor.
-        // The processor creates its own pipelines internally, so we
-        // need to register streams and submit data through the processor.
-        // The pre-training above stabilized our understanding of the
-        // patterns; now we test the async infrastructure itself.
+        // Pass the pre-trained pipelines directly so learned SP/TM state is preserved.
         Console.WriteLine("  Phase 2: Async multi-stream processing\n");
 
         await using var processor = new MultiStreamProcessor(workerCount: 2);
         for (int s = 0; s < streamCount; s++)
-            processor.AddStream(configs[s]);
+            processor.AddStream(pipelines[s]);
 
         var baseTime = new DateTime(2024, 1, 1);
-        int totalSteps = 1000;  // 50 cycles per stream
+        int totalSteps = 2000;  // 100 cycles per stream
         int expectedResults = totalSteps * streamCount;
 
         // Track per-stream anomaly for reporting
@@ -5758,7 +5825,7 @@ public static class HtmExamples
             OutputSize = 1024,
             OutputActiveBits = 40,
             AnomalyResetThreshold = 0.5f,
-            DecayRate = 0.01f,
+            DecayRate = 0.3f,  // Higher decay so TP tracks current subsequence, not entire history
         };
         var network = Network.CreateHierarchicalPipeline(
             inputSize: 400,
@@ -5767,21 +5834,45 @@ public static class HtmExamples
             tpConfig: tpConfig);
 
         // --- Phase 1: SP pre-training on all unique values ---
+        // Train ONLY L1_SP directly — do not run TM/TP/L2 during pre-training,
+        // as TM would learn garbage sequences from the random value ordering.
+        // After pre-training, freeze L1_SP so column assignments stay stable
+        // while TM learns sequences in Phase 2.
         var allValues = subsequences.SelectMany(s => s).Distinct().ToArray();
+        var l1sp = (SPRegion)network.Regions["L1_SP"];
         Console.Write("SP pre-training (50 cycles)...");
         for (int c = 0; c < 50; c++)
         {
             foreach (double v in allValues)
             {
-                network.SetInput("L1_SP", "bottomUpIn", encoder.Encode(v));
-                network.Compute(learn: true);
+                l1sp.SetInput("bottomUpIn", encoder.Encode(v));
+                l1sp.Compute(learn: true);
             }
-            network.Reset();
         }
+        l1sp.FreezeLearning = true;
         Console.WriteLine(" done");
         network.Reset();
 
-        // --- Phase 2: Sequence learning ---
+        // --- Phase 2: L2_SP warm-up on TP output (500 steps) ---
+        // Run the full network so L1_TM converges and TP stabilizes,
+        // giving L2_SP representative input to learn column assignments.
+        var l2sp = (SPRegion)network.Regions["L2_SP"];
+        Console.Write("L2 SP warm-up (500 steps)...");
+        {
+            int warmupStep = 0;
+            for (int cycle = 0; warmupStep < 500; cycle++)
+                for (int s = 0; s < subsequences.Length && warmupStep < 500; s++)
+                    for (int e = 0; e < elementsPerSeq && warmupStep < 500; e++, warmupStep++)
+                    {
+                        network.SetInput("L1_SP", "bottomUpIn", encoder.Encode(subsequences[s][e]));
+                        network.Compute(learn: true);
+                    }
+        }
+        l2sp.FreezeLearning = true;
+        network.Reset();
+        Console.WriteLine(" done");
+
+        // --- Phase 3: Sequence learning (TM-only, both SPs frozen) ---
         int totalSteps = 2000;
         int step = 0;
 
@@ -5821,7 +5912,7 @@ public static class HtmExamples
         }
 
         Console.WriteLine($"\nCompleted {totalSteps} steps ({totalSteps / (elementsPerSeq * subsequences.Length)} full cycles).");
-        Console.WriteLine("Expected: L1 anomaly near 0% after ~2 cycles; L2 anomaly drops over ~10+ cycles.");
+        Console.WriteLine("Expected: L1 anomaly near 0% by step ~100; L2 anomaly drops over ~10+ cycles.");
     }
 
     /// Example 5: Multi-sensor machine monitoring with fault injection
