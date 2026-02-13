@@ -17,6 +17,7 @@ using HierarchicalTemporalMemory.Enhanced;
 //   dotnet run network      — Network API pipeline
 //   dotnet run 1000brains   — Thousand Brains object recognition
 //   dotnet run hierarchical — hierarchical temporal memory
+//   dotnet run gridcells    — grid cells, displacement cells, Thousand Brains
 // ============================================================================
 
 var examples = new (string Name, string Description, Action Run)[]
@@ -28,6 +29,7 @@ var examples = new (string Name, string Description, Action Run)[]
     ("network",      "Network API — declarative region-based pipeline",         HtmExamples.RunNetworkApiDemo),
     ("1000brains",   "Thousand Brains — multi-column object recognition",       HtmExamples.RunThousandBrainsDemo),
     ("hierarchical", "Hierarchical TM — multi-timescale sequence learning",     HtmExamples.RunHierarchicalDemo),
+    ("gridcells",    "Grid Cells — path integration, displacement, 1000 Brains", HtmExamples.RunGridCellDemo),
 };
 
 string selected = args.Length > 0 ? args[0].ToLowerInvariant() : "";
@@ -372,6 +374,18 @@ static void RunSerializationDemo()
 // Example: Hot Gym — Single-stream anomaly detection with two-phase training
 // Phase 1: SP pre-training stabilizes column assignments
 // Phase 2: TM learns sequences on stable columns
+//
+// TODO: This example does not yet converge. Known issues to investigate:
+//   1. DateTimeEncoder encodes hour + day-of-week + month + weekend, making
+//      the effective sequence length 168 steps (weekly cycle), not 24 (daily).
+//      SP pre-training below only covers 24 hours — needs a full 168-hour week.
+//   2. RDSE + noise (0-5 at resolution 0.88) produces ~6 bucket variations per
+//      hour. The SP must generalize across these — pre-training should include
+//      noisy samples, not just clean sinusoid values.
+//   3. Consider whether DateTimeEncoder is too high-dimensional for this demo.
+//      A simpler hourOfDay-only encoder might converge faster and still show
+//      the key HTM behaviors. The monitoring example proves the pipeline works
+//      with RDSE on a fixed cycle.
 // ============================================================================
 static void RunHotGym()
 {
@@ -394,6 +408,7 @@ static void RunHotGym()
     var rng = new Random(42);
     var baseTime = new DateTime(2024, 1, 1);
 
+    // TODO: Expand to 168 hours (full week) and include noisy samples
     // Phase 1: Generate one full day of training data for SP pre-training
     var trainingData = new List<Dictionary<string, object>>();
     for (int i = 0; i < 24; i++)

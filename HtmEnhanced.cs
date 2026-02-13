@@ -2820,11 +2820,14 @@ public sealed class CorticalColumn
         }
     }
 
-    /// Reset object evidence (e.g., when starting to explore a new object)
+    /// Reset object evidence and temporal state (e.g., when starting to explore a new object).
+    /// Clears TM predictions so that sequence context from the previous object
+    /// does not produce spurious predictions on the first touch of the new one.
     public void ResetObjectRepresentation()
     {
         _currentObjectRepresentation = new SDR(_config.ObjectRepresentationSize);
         _confidence = 0;
+        _sequenceTM.Reset();
     }
 
     public SDR GetObjectRepresentation() => _currentObjectRepresentation;
@@ -2854,10 +2857,12 @@ public sealed class CorticalColumn
             objectBits.Add(((hash & 0x7FFFFFFF) % _config.ObjectRepresentationSize));
         }
 
-        // Subsample to maintain target sparsity
+        // Subsample to maintain target sparsity — use deterministic selection
+        // (lowest bit indices) so the same TM cells always produce the same
+        // object SDR regardless of RNG state.
         if (objectBits.Count > _config.ObjectActiveBits)
         {
-            var sampled = objectBits.OrderBy(_ => _rng.Next()).Take(_config.ObjectActiveBits);
+            var sampled = objectBits.OrderBy(b => b).Take(_config.ObjectActiveBits);
             return new SDR(_config.ObjectRepresentationSize, sampled);
         }
 
@@ -2888,7 +2893,9 @@ public sealed class CorticalColumn
         return new SDR(_config.ObjectRepresentationSize, result);
     }
 
-    /// Blend two SDRs: randomly select bits from each based on blendFactor
+    /// Blend two SDRs: select bits from each based on blendFactor.
+    /// Uses deterministic selection (lowest bit indices) so the same
+    /// inputs always produce the same output regardless of RNG state.
     private SDR BlendSDRs(SDR a, SDR b, float bWeight)
     {
         var result = new HashSet<int>();
@@ -2898,8 +2905,8 @@ public sealed class CorticalColumn
         int fromB = (int)(targetBits * bWeight);
         int fromA = targetBits - fromB;
 
-        result.UnionWith(a.ActiveBits.ToArray().OrderBy(_ => _rng.Next()).Take(fromA));
-        result.UnionWith(b.ActiveBits.ToArray().OrderBy(_ => _rng.Next()).Take(fromB));
+        result.UnionWith(a.ActiveBits.ToArray().OrderBy(x => x).Take(fromA));
+        result.UnionWith(b.ActiveBits.ToArray().OrderBy(x => x).Take(fromB));
 
         return new SDR(a.Size, result);
     }
@@ -3203,7 +3210,12 @@ public sealed class ThousandBrainsEngine
             _objectDisplacements[label] = new List<SDR>(_currentDisplacements);
     }
 
-    /// Reset all columns for exploring a new object
+    /// Reset all columns and grid cells for exploring a new object.
+    /// Grid cells are reset to a fixed origin so that the same movement
+    /// sequence during recognition produces the same location SDRs as
+    /// during learning. Without this, grid cells would retain their
+    /// position from the previous object, making (feature + location)
+    /// inputs non-reproducible.
     public void StartNewObject()
     {
         _explorationSteps = 0;
@@ -3211,6 +3223,8 @@ public sealed class ThousandBrainsEngine
         _currentDisplacements.Clear();
         foreach (var column in _columns)
             column.ResetObjectRepresentation();
+        foreach (var module in _gridModules)
+            module.SetPosition(0, 0);
     }
 
     /// Anchor grid cells at the current position based on a landmark
@@ -5488,5 +5502,364 @@ public static class HtmExamples
                           $"Synapses: {tm.TotalSynapseCount:N0}");
         Console.WriteLine("\nExpected: anomaly ≈ 0% during normal operation after ~4 cycles, " +
                           "clear spikes during each fault window.");
+    }
+
+    /// Example 7: Grid Cells, Displacement Cells, and Thousand Brains object recognition
+    ///
+    /// Directly exercises the core Thousand Brains Theory components:
+    ///   1. GridCellModule — path integration, position tracking, anchoring
+    ///   2. DisplacementCellModule — relative offset encoding, target prediction
+    ///   3. Full Thousand Brains pipeline — multi-column learning with grid cells,
+    ///      displacement predictions, and lateral voting for consensus
+    ///
+    /// These are the biological mechanisms proposed by Hawkins et al. (2019) for
+    /// how the neocortex builds object-centric reference frames using grid cell-like
+    /// computations in every cortical column.
+    public static void RunGridCellDemo()
+    {
+        Console.WriteLine("Grid Cells & Displacement Cells — Thousand Brains Theory");
+        Console.WriteLine(new string('=', 72));
+
+        // ================================================================
+        // Section 1: Grid Cell Path Integration
+        // ================================================================
+        Console.WriteLine("\n1. GRID CELL PATH INTEGRATION");
+        Console.WriteLine("   A single grid cell module tracks position on a toroidal surface.");
+        Console.WriteLine("   Movement displaces the active bump; same position → same SDR.\n");
+
+        var gridConfig = new GridCellModuleConfig
+        {
+            ModuleSize = 40,        // 40×40 = 1600 cells
+            ActiveCellCount = 10,   // 10 active cells per bump
+            Scale = 1.0f,
+            Orientation = 0.0f,
+            BumpSigma = 1.5f,
+            PathIntegrationNoise = 0.0f,  // No noise for deterministic testing
+        };
+        var grid = new GridCellModule(gridConfig, seed: 42);
+
+        // Set to a known starting position
+        grid.SetPosition(10.0f, 15.0f);
+        var sdrAtStart = grid.GetCurrentLocation();
+        Console.WriteLine($"   Position (10, 15): {sdrAtStart.ActiveCount} active cells, " +
+                          $"SDR size = {sdrAtStart.Size}");
+
+        // Move right by 5 units
+        grid.Move(5.0f, 0.0f);
+        var pos = grid.GetPosition();
+        var sdrAfterMove = grid.GetCurrentLocation();
+        Console.WriteLine($"   Move (+5, 0) → position ({pos.X:F1}, {pos.Y:F1}): " +
+                          $"overlap with start = {sdrAtStart.Overlap(sdrAfterMove)}");
+
+        // Move back to start
+        grid.Move(-5.0f, 0.0f);
+        pos = grid.GetPosition();
+        var sdrBackAtStart = grid.GetCurrentLocation();
+        int returnOverlap = sdrAtStart.Overlap(sdrBackAtStart);
+        Console.WriteLine($"   Move (-5, 0) → position ({pos.X:F1}, {pos.Y:F1}): " +
+                          $"overlap with start = {returnOverlap}");
+        Console.WriteLine($"   → Return to origin recovers the original SDR: " +
+                          $"{(returnOverlap == sdrAtStart.ActiveCount ? "YES (exact match)" : $"partial ({returnOverlap}/{sdrAtStart.ActiveCount})")}");
+
+        // Demonstrate toroidal wrapping
+        grid.SetPosition(38.0f, 38.0f);
+        grid.Move(5.0f, 5.0f);
+        pos = grid.GetPosition();
+        Console.WriteLine($"\n   Toroidal wrapping: (38, 38) + (5, 5) → ({pos.X:F1}, {pos.Y:F1})");
+        Console.WriteLine($"   → Position wraps around the module boundary (mod 40).");
+
+        // ================================================================
+        // Section 2: Multi-Scale Grid Cells (unique location codes)
+        // ================================================================
+        Console.WriteLine("\n2. MULTI-SCALE GRID CELLS");
+        Console.WriteLine("   Multiple modules at different scales/orientations produce");
+        Console.WriteLine("   unique composite location codes — like Fourier components.\n");
+
+        var modules = new GridCellModule[4];
+        for (int i = 0; i < 4; i++)
+        {
+            modules[i] = new GridCellModule(new GridCellModuleConfig
+            {
+                ModuleSize = 20,
+                ActiveCellCount = 8,
+                Scale = 1.0f + i * 0.7f,
+                Orientation = i * MathF.PI / 6,
+                PathIntegrationNoise = 0.0f,
+            }, seed: 42 + i);
+        }
+
+        // Compute composite location SDRs at several positions
+        var positions = new (float X, float Y)[]
+        {
+            (5, 5), (10, 5), (5, 10), (5, 5),  // Last repeats first
+        };
+
+        Console.WriteLine($"   {"Position",12} | {"Mod0",5} {"Mod1",5} {"Mod2",5} {"Mod3",5} | Composite bits");
+        var compositeSDRs = new SDR[positions.Length];
+        for (int p = 0; p < positions.Length; p++)
+        {
+            // Set all modules to the same physical position
+            foreach (var m in modules)
+                m.SetPosition(positions[p].X, positions[p].Y);
+
+            // Get each module's SDR and concatenate into a composite
+            var allBits = new List<int>();
+            int offset = 0;
+            var perModuleActive = new int[4];
+            for (int m = 0; m < 4; m++)
+            {
+                var modSDR = modules[m].GetCurrentLocation();
+                perModuleActive[m] = modSDR.ActiveCount;
+                foreach (int bit in modSDR.ActiveBits)
+                    allBits.Add(bit + offset);
+                offset += modules[m].OutputSize;
+            }
+            compositeSDRs[p] = new SDR(offset, allBits);
+
+            Console.WriteLine($"   ({positions[p].X,4:F0},{positions[p].Y,4:F0})     | " +
+                              $"{perModuleActive[0],5} {perModuleActive[1],5} {perModuleActive[2],5} {perModuleActive[3],5} | " +
+                              $"{compositeSDRs[p].ActiveCount} active bits");
+        }
+
+        // Check uniqueness: different positions should have low overlap
+        Console.WriteLine($"\n   Overlap (5,5) vs (10,5): {compositeSDRs[0].Overlap(compositeSDRs[1])} " +
+                          $"(different positions → low overlap)");
+        Console.WriteLine($"   Overlap (5,5) vs (5,10): {compositeSDRs[0].Overlap(compositeSDRs[2])} " +
+                          $"(different positions → low overlap)");
+        Console.WriteLine($"   Overlap (5,5) vs (5,5):  {compositeSDRs[0].Overlap(compositeSDRs[3])} " +
+                          $"(same position → exact match)");
+
+        // ================================================================
+        // Section 3: Displacement Cells
+        // ================================================================
+        Console.WriteLine("\n3. DISPLACEMENT CELLS");
+        Console.WriteLine("   Encode the relative offset between two locations.");
+        Console.WriteLine("   Given a displacement + source → predict target location.\n");
+
+        var displacementModule = new DisplacementCellModule(size: 40, activeCells: 10, sigma: 1.5f);
+
+        // Create two grid cell locations at known positions
+        var gridA = new GridCellModule(new GridCellModuleConfig
+        {
+            ModuleSize = 40, ActiveCellCount = 10, Scale = 1.0f,
+            PathIntegrationNoise = 0.0f,
+        }, seed: 42);
+        var gridB = new GridCellModule(new GridCellModuleConfig
+        {
+            ModuleSize = 40, ActiveCellCount = 10, Scale = 1.0f,
+            PathIntegrationNoise = 0.0f,
+        }, seed: 42);
+
+        // Location A at (10, 10), Location B at (20, 15)
+        gridA.SetPosition(10.0f, 10.0f);
+        gridB.SetPosition(20.0f, 15.0f);
+        var locA = gridA.GetCurrentLocation();
+        var locB = gridB.GetCurrentLocation();
+
+        // Compute displacement A → B
+        var dispAB = displacementModule.ComputeDisplacement(locA, locB);
+        Console.WriteLine($"   Location A = (10, 10), Location B = (20, 15)");
+        Console.WriteLine($"   Displacement A→B: {dispAB.ActiveCount} active cells");
+
+        // Predict target B from source A + displacement
+        var predictedB = displacementModule.PredictTarget(locA, dispAB);
+        int predictionOverlap = locB.Overlap(predictedB);
+        Console.WriteLine($"   Predicted B from (A + disp): overlap with actual B = " +
+                          $"{predictionOverlap}/{locB.ActiveCount}");
+        Console.WriteLine($"   → Displacement prediction accuracy: " +
+                          $"{(predictionOverlap >= locB.ActiveCount / 2 ? "GOOD" : "POOR")} " +
+                          $"({100.0 * predictionOverlap / locB.ActiveCount:F0}%)");
+
+        // Predict source A from target B + displacement (reverse direction)
+        var predictedA = displacementModule.PredictSource(locB, dispAB);
+        int reverseOverlap = locA.Overlap(predictedA);
+        Console.WriteLine($"   Predicted A from (B - disp): overlap with actual A = " +
+                          $"{reverseOverlap}/{locA.ActiveCount}");
+
+        // Verify different displacements produce different SDRs
+        gridB.SetPosition(15.0f, 25.0f);
+        var locC = gridB.GetCurrentLocation();
+        var dispAC = displacementModule.ComputeDisplacement(locA, locC);
+        int dispOverlap = dispAB.Overlap(dispAC);
+        Console.WriteLine($"\n   Displacement A→B vs A→C: overlap = {dispOverlap} " +
+                          $"(different offsets → different SDRs)");
+
+        // ================================================================
+        // Section 4: Anchoring — Sensory Landmark Correction
+        // ================================================================
+        Console.WriteLine("\n4. GRID CELL ANCHORING");
+        Console.WriteLine("   Grid cells accumulate path integration error over time.");
+        Console.WriteLine("   Anchoring corrects drift by snapping to a known landmark.\n");
+
+        var driftyGrid = new GridCellModule(new GridCellModuleConfig
+        {
+            ModuleSize = 40, ActiveCellCount = 10,
+            PathIntegrationNoise = 0.05f,  // Moderate noise
+        }, seed: 99);
+
+        driftyGrid.SetPosition(10.0f, 10.0f);
+        var landmark = new SDR(256, Enumerable.Range(0, 256).Where(i => i % 20 < 3));
+
+        // Anchor at this position with a landmark
+        driftyGrid.Anchor(landmark);
+        var anchoredPos = driftyGrid.GetPosition();
+        Console.WriteLine($"   Anchored at ({anchoredPos.X:F1}, {anchoredPos.Y:F1}) with landmark");
+
+        // Move around — noise accumulates
+        for (int i = 0; i < 20; i++)
+            driftyGrid.Move(2.0f, 1.0f);
+        for (int i = 0; i < 20; i++)
+            driftyGrid.Move(-2.0f, -1.0f);
+
+        var driftedPos = driftyGrid.GetPosition();
+        float drift = MathF.Sqrt(
+            MathF.Pow(driftedPos.X - anchoredPos.X, 2) +
+            MathF.Pow(driftedPos.Y - anchoredPos.Y, 2));
+        Console.WriteLine($"   After 40 noisy moves (round trip): ({driftedPos.X:F1}, {driftedPos.Y:F1})");
+        Console.WriteLine($"   Drift from anchored position: {drift:F2} units");
+
+        // Re-anchor using the same landmark
+        driftyGrid.Anchor(landmark);
+        var correctedPos = driftyGrid.GetPosition();
+        float correction = MathF.Sqrt(
+            MathF.Pow(correctedPos.X - anchoredPos.X, 2) +
+            MathF.Pow(correctedPos.Y - anchoredPos.Y, 2));
+        Console.WriteLine($"   After re-anchoring: ({correctedPos.X:F1}, {correctedPos.Y:F1})");
+        Console.WriteLine($"   → Drift corrected: {drift:F2} → {correction:F2} units");
+
+        // ================================================================
+        // Section 5: Full Thousand Brains Object Learning & Recognition
+        // ================================================================
+        Console.WriteLine("\n5. THOUSAND BRAINS: OBJECT LEARNING & RECOGNITION");
+        Console.WriteLine("   Multiple cortical columns each maintain independent models.");
+        Console.WriteLine("   Grid cells provide location; voting produces consensus.\n");
+
+        var tbEngine = new ThousandBrainsEngine(new ThousandBrainsConfig
+        {
+            ColumnCount = 4,
+            ColumnConfig = new CorticalColumnConfig
+            {
+                InputSize = 256,
+                LocationSize = 1600,      // GridCellModule default: 40×40
+                ColumnCount = 512,
+                CellsPerColumn = 8,
+                ObjectRepresentationSize = 2048,
+                ObjectActiveBits = 40,
+            },
+            VotingConfig = new LateralVotingConfig
+            {
+                ConvergenceThreshold = 0.5f,
+                MaxIterations = 5,
+                VoteThreshold = 0.3f,
+            },
+            UseDisplacementCells = true,
+            DisplacementModuleSize = 40,
+        });
+
+        var featureEncoder = new CategoryEncoder(256, 15);
+
+        // --- Define objects ---
+        var cubeFaces = new[] { "flat", "edge", "corner", "flat", "edge", "corner" };
+        var cubeDeltas = new (float X, float Y)[]
+        {
+            (0, 0), (1, 0), (1, 1), (0, 1), (-1, 0), (-1, -1),
+        };
+        var sphereFaces = new[] { "smooth", "smooth", "smooth", "smooth", "seam" };
+        var sphereDeltas = new (float X, float Y)[]
+        {
+            (0, 0), (2, 0), (0, 2), (-2, 0), (0, -2),
+        };
+
+        // Interleave learning: both objects train the SP simultaneously,
+        // so column assignments reflect all inputs. Library SDRs are stored
+        // after all learning is complete, ensuring SP stability.
+        int learningCycles = 30;
+        Console.Write($"   Training both objects ({learningCycles} interleaved cycles)...");
+        for (int c = 0; c < learningCycles; c++)
+        {
+            // Cube
+            tbEngine.StartNewObject();
+            for (int t = 0; t < cubeFaces.Length; t++)
+            {
+                var feature = featureEncoder.Encode(cubeFaces[t]);
+                var patches = Enumerable.Repeat(feature, 4).ToArray();
+                tbEngine.Process(patches, cubeDeltas[t].X, cubeDeltas[t].Y, learn: true);
+            }
+            // Sphere
+            tbEngine.StartNewObject();
+            for (int t = 0; t < sphereFaces.Length; t++)
+            {
+                var feature = featureEncoder.Encode(sphereFaces[t]);
+                var patches = Enumerable.Repeat(feature, 4).ToArray();
+                tbEngine.Process(patches, sphereDeltas[t].X, sphereDeltas[t].Y, learn: true);
+            }
+        }
+        Console.WriteLine(" done");
+
+        // Store library SDRs from one final pass of each object
+        tbEngine.StartNewObject();
+        for (int t = 0; t < cubeFaces.Length; t++)
+        {
+            var feature = featureEncoder.Encode(cubeFaces[t]);
+            var patches = Enumerable.Repeat(feature, 4).ToArray();
+            tbEngine.Process(patches, cubeDeltas[t].X, cubeDeltas[t].Y, learn: false);
+        }
+        tbEngine.LearnObject("cube");
+
+        tbEngine.StartNewObject();
+        for (int t = 0; t < sphereFaces.Length; t++)
+        {
+            var feature = featureEncoder.Encode(sphereFaces[t]);
+            var patches = Enumerable.Repeat(feature, 4).ToArray();
+            tbEngine.Process(patches, sphereDeltas[t].X, sphereDeltas[t].Y, learn: false);
+        }
+        tbEngine.LearnObject("sphere");
+
+        // --- Recognition test: cube ---
+        Console.WriteLine("\n   Recognition test — touching a cube:");
+        tbEngine.StartNewObject();
+        var testTouches = new[] { ("flat", 0f, 0f), ("edge", 1f, 0f), ("corner", 1f, 1f) };
+        for (int t = 0; t < testTouches.Length; t++)
+        {
+            var (feat, dx, dy) = testTouches[t];
+            var feature = featureEncoder.Encode(feat);
+            var patches = Enumerable.Repeat(feature, 4).ToArray();
+            var result = tbEngine.Process(patches, dx, dy, learn: false);
+
+            string recognized = result.RecognizedObject ?? "unknown";
+            Console.WriteLine($"     Touch {t}: '{feat}' → recognized='{recognized}' " +
+                              $"(conf={result.RecognitionConfidence:P0}, " +
+                              $"converged={result.Converged}, " +
+                              $"iters={result.VotingIterations}, " +
+                              $"disp_pred={result.PredictedNextLocation != null})");
+        }
+
+        // --- Recognition test: sphere ---
+        Console.WriteLine("\n   Recognition test — touching a sphere:");
+        tbEngine.StartNewObject();
+        var sphereTest = new[] { ("smooth", 0f, 0f), ("smooth", 2f, 0f), ("seam", 0f, 2f) };
+        for (int t = 0; t < sphereTest.Length; t++)
+        {
+            var (feat, dx, dy) = sphereTest[t];
+            var feature = featureEncoder.Encode(feat);
+            var patches = Enumerable.Repeat(feature, 4).ToArray();
+            var result = tbEngine.Process(patches, dx, dy, learn: false);
+
+            string recognized = result.RecognizedObject ?? "unknown";
+            Console.WriteLine($"     Touch {t}: '{feat}' → recognized='{recognized}' " +
+                              $"(conf={result.RecognitionConfidence:P0}, " +
+                              $"converged={result.Converged}, " +
+                              $"iters={result.VotingIterations})");
+        }
+
+        // --- Summary: object library ---
+        var library = tbEngine.GetObjectLibrary();
+        Console.WriteLine($"\n   Object library: {library.Count} objects learned");
+        foreach (var (name, sdr) in library)
+            Console.WriteLine($"     '{name}': {sdr.ActiveCount} active bits in consensus SDR");
+
+        Console.WriteLine("\n   The Thousand Brains Theory: each cortical column maintains its own");
+        Console.WriteLine("   complete model of every object, using grid cell reference frames for");
+        Console.WriteLine("   location. Recognition emerges from consensus across columns.");
     }
 }
