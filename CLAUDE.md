@@ -12,25 +12,14 @@ This project targets **.NET 8** (C# 12). You need the .NET 8 SDK installed.
 
 ### Ubuntu 24.04
 
+The .NET 8 SDK is available in Ubuntu 24.04's default `noble-updates/main` repository. No additional package sources are needed.
+
 ```bash
 # Install the .NET 8 SDK
-sudo apt-get update
-sudo apt-get install -y dotnet-sdk-8.0
+apt-get install -y dotnet-sdk-8.0
 
 # Verify installation
 dotnet --version
-```
-
-If the package isn't available in your distribution's default feed:
-
-```bash
-# Add Microsoft's package repository
-wget https://packages.microsoft.com/config/ubuntu/24.04/packages-microsoft-prod.deb -O packages-microsoft-prod.deb
-sudo dpkg -i packages-microsoft-prod.deb
-rm packages-microsoft-prod.deb
-
-sudo apt-get update
-sudo apt-get install -y dotnet-sdk-8.0
 ```
 
 ### Building
