@@ -442,7 +442,7 @@ public sealed class ScalarEncoder : IEncoder<double>
         for (int i = 0; i < ActiveBits; i++)
             active[i] = (startBit + i) % OutputSize; // Wrap for periodic
 
-        return new SDR(OutputSize, (IEnumerable<int>)active);
+        return new SDR(OutputSize, (ReadOnlySpan<int>)active);
     }
 }
 
@@ -473,7 +473,7 @@ public sealed class RandomDistributedScalarEncoder : IEncoder<double>
     public SDR Encode(double value)
     {
         int bucket = (int)Math.Floor(value / Resolution);
-        return new SDR(OutputSize, (IEnumerable<int>)GetOrCreateBucket(bucket));
+        return new SDR(OutputSize, (ReadOnlySpan<int>)GetOrCreateBucket(bucket));
     }
 
     private int[] GetOrCreateBucket(int bucket)
@@ -636,7 +636,7 @@ public sealed class CategoryEncoder : IEncoder<string>
     {
         if (!_categoryBits.ContainsKey(value))
             AddCategory(value);
-        return new SDR(OutputSize, (IEnumerable<int>)_categoryBits[value]);
+        return new SDR(OutputSize, (ReadOnlySpan<int>)_categoryBits[value]);
     }
 
     /// Encode with explicit similarity: `similar` categories share additional bits.
@@ -664,7 +664,7 @@ public sealed class CategoryEncoder : IEncoder<string>
         }
 
         var result = valueBits.OrderBy(x => x).ToArray();
-        return new SDR(OutputSize, (IEnumerable<int>)result);
+        return new SDR(OutputSize, (ReadOnlySpan<int>)result);
     }
 }
 
@@ -4020,7 +4020,7 @@ public static class HtmSerializer
         for (int i = 0; i < activeCount; i++)
             bits[i] = br.ReadInt32();
 
-        return new SDR(size, (IEnumerable<int>)bits);
+        return new SDR(size, (ReadOnlySpan<int>)bits);
     }
 
     /// Serialize a segment's synapses
