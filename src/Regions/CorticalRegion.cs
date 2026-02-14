@@ -42,6 +42,7 @@ public class CorticalRegion : ICorticalRegion
     private readonly CorticalRegionConfig _config;
     private readonly ICorticalColumn[] _columns;
     private readonly ILateralVoting _voting;
+    private readonly ParallelOptions _parallelOptions;
 
     private SDR _consensus;
     private bool _hasConverged;
@@ -60,6 +61,10 @@ public class CorticalRegion : ICorticalRegion
         _config = config;
         _columns = columns;
         _voting = voting;
+        _parallelOptions = new ParallelOptions
+        {
+            MaxDegreeOfParallelism = config.MaxDegreeOfParallelism,
+        };
         _consensus = new SDR(config.ColumnConfig.L23CellCount);
         _lastColumnOutputs = Array.Empty<ColumnOutput>();
     }
@@ -84,8 +89,7 @@ public class CorticalRegion : ICorticalRegion
         // Phase 1: Independent column computation (ONCE)
         // =================================================================
         // Each column runs its full L6 → L4 → L2/3 pipeline independently.
-        // This is embarrassingly parallel in biology — each column operates
-        // on its own sensory patch without waiting for neighbors.
+        // Columns don't share mutable state — thread safety is structural.
 
         // Distribute hierarchical feedback to all columns before computing
         if (_hierarchicalFeedback != null)
@@ -96,11 +100,11 @@ public class CorticalRegion : ICorticalRegion
         }
 
         var columnOutputs = new ColumnOutput[_columns.Length];
-        for (int i = 0; i < _columns.Length; i++)
+        Parallel.For(0, _columns.Length, _parallelOptions, i =>
         {
             var input = inputs.Length == 1 ? inputs[0] : inputs[i];
             columnOutputs[i] = _columns[i].Compute(input, learn);
-        }
+        });
 
         _lastColumnOutputs = columnOutputs;
 
@@ -184,8 +188,10 @@ public class CorticalRegion : ICorticalRegion
                 for (int i = 0; i < _columns.Length; i++)
                     allRepresentations[i] = _columns[i].ObjectRepresentation;
 
-                // Apply lateral narrowing to each column
-                for (int i = 0; i < _columns.Length; i++)
+                // Apply lateral narrowing to each column.
+                // Each column reads from the shared allRepresentations snapshot
+                // (immutable at this point) and writes only its own internal state.
+                Parallel.For(0, _columns.Length, _parallelOptions, i =>
                 {
                     // Build peer representations (all columns except this one)
                     var peers = new SDR[_columns.Length - 1];
@@ -196,7 +202,7 @@ public class CorticalRegion : ICorticalRegion
                             peers[peerIdx++] = allRepresentations[j];
                     }
                     _columns[i].ApplyLateralNarrowing(peers);
-                }
+                });
 
                 // Collect updated representations after narrowing
                 var updated = new SDR[_columns.Length];

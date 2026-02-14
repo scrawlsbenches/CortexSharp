@@ -181,4 +181,14 @@ public record CorticalRegionConfig
 
     /// <summary>Enable displacement modules for structural prediction.</summary>
     public bool EnableDisplacementCells { get; init; } = true;
+
+    // --- Parallelism ---
+
+    /// <summary>
+    /// Maximum degree of parallelism for column computation and lateral narrowing.
+    /// -1 = let the runtime decide (default, uses all available cores).
+    /// 1 = sequential execution (deterministic, useful for testing/debugging).
+    /// N = use at most N threads.
+    /// </summary>
+    public int MaxDegreeOfParallelism { get; init; } = -1;
 }
